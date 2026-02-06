@@ -156,7 +156,8 @@ def belief_to_barycentric_evolution(probs, belief_states):
 class Mess3HMM:
     """Hidden Markov Model for the Mess3 process with 3 states and 3 tokens."""
 
-    def __init__(self, vocab_mapping=None):
+    def __init__(self, vocab_mapping=None, seed=42):
+        self.seed = seed
         self.tokens = ['A', 'B', 'C']
         self.states = ['1', '2', '3']
         self.num_states = len(self.states)
@@ -217,17 +218,38 @@ class Mess3HMM:
         self.T_3d_matrix = T
         return T
 
-    def generate_dataset(self, num_sequences, seq_length):
-        """Generate sequences from the HMM."""
+    def generate_dataset(self, num_sequences, seq_length, return_states=False):
+        """Generate sequences from the HMM.
+        
+        Args:
+            num_sequences: Number of sequences to generate.
+            seq_length: Length of each sequence.
+            return_states: If True, also return hidden states.
+            
+        Returns:
+            tokens, tokens_y if return_states=False
+            tokens, tokens_y, states if return_states=True
+        """
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+
         vocab_size, n_states, _ = self.T_3d_matrix.shape
         prior = torch.ones(n_states, dtype=torch.float, device=device) / n_states
 
         tokens = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
         tokens_y = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
+        if return_states:
+            states = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
         state_idx = torch.multinomial(prior, num_sequences, replacement=True)
         # print(state_idx)
 
         for i in range(seq_length + 1):
+            # Store current state before transition
+            if return_states and i < seq_length:
+                states[:, i] = state_idx
+
             # T_3d_matrix[:, :, state] not T_3d_matrix[:, state, :]
             test = self.T_3d_matrix[:, :, state_idx].T.unsqueeze(0).reshape(num_sequences, -1)
             test_pairs = torch.multinomial(test, 1, replacement=True).squeeze()
@@ -239,7 +261,9 @@ class Mess3HMM:
                 # y is shifted by one: x = [0, 1, 2] -> y = [1, 2, next]
                 tokens_y[:, i - 1] = test_pairs % vocab_size
 
-        return tokens, tokens_y
+        if return_states:
+            return tokens, tokens_y, states
+        return tokens, tokens_y, None
 
     def compute_belief_state(self, tokens, initial_belief=None):
         """Compute belief states given a sequence of tokens."""
