@@ -12,3 +12,7 @@ scikit-learn>=0.24.2
 torch>=2.0.0
 transformers>=4.40.0
 accelerate>=0.27.0
+
+# Computational mechanics / HMM generation (requires Python >=3.12)
+# Install from GitHub: pip install "simplexity @ git+https://github.com/Astera-org/simplexity.git"
+simplexity @ git+https://github.com/Astera-org/simplexity.git
