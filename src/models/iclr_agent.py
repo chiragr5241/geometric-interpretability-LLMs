@@ -100,9 +100,6 @@ class ICLRAgent:
         # Generate context (using numbers as strings for semantic meaning)
         context = [str(i) for i in range(context_size)]
 
-        print(context)
-        print("Test new change!!!!!!!!")
-        
         # Process context and reorganize representations
         # representations, energy, analysis = self.reorganize_representations(context, graph)
         
