@@ -14,5 +14,7 @@ transformers>=4.40.0
 accelerate>=0.27.0
 
 # Computational mechanics / HMM generation (requires Python >=3.12)
+jax>=0.4.0
+jaxlib>=0.4.0
 # Install from GitHub: pip install "simplexity @ git+https://github.com/Astera-org/simplexity.git"
 simplexity @ git+https://github.com/Astera-org/simplexity.git
