@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+whenever you write code that sets the pytorch device, have it check if cuda is available, else if mps is available, else cpu
