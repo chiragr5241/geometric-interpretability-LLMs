@@ -286,3 +286,31 @@ class Mess3HMM:
             beliefs[:, i + 1] = beliefs[:, i + 1] / beliefs[:, i + 1].sum(-1, keepdim=True) # normalize it for the n states
 
         return beliefs
+
+    def emission_matrix(self):
+        """Emission matrix (n_states, vocab_size): P(token | state)."""
+        em = self.T_3d_matrix.sum(dim=2).T  # (n_states, vocab_size)
+        return em / em.sum(dim=1, keepdim=True)
+
+    def observation_probability_distribution(self, belief):
+        """P(symbol | belief) for each symbol. belief: (n_states,) or (batch, n_states)."""
+        em = self.emission_matrix()
+        if belief.dim() == 1:
+            return (belief.unsqueeze(0) @ em).squeeze(0)
+        return belief @ em
+
+    def log_probability(self, seq):
+        """Log P(sequence) under the HMM. seq: 1D tensor of token indices (length L)."""
+        if seq.dim() == 2:
+            seq = seq.squeeze(0)
+        seq = seq.to(device)
+        belief = torch.ones(self.num_states, device=device) / self.num_states
+        em = self.emission_matrix()
+        log_p = 0.0
+        for t in range(seq.size(0)):
+            obs_probs = belief @ em  # (vocab_size,)
+            log_p = log_p + torch.log(obs_probs[seq[t]] + 1e-10)
+            # Update belief given observation
+            belief = (self.T_3d_matrix[seq[t]] @ belief.unsqueeze(-1)).squeeze(-1)
+            belief = belief / belief.sum()
+        return log_p
