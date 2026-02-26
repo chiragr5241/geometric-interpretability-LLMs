@@ -354,11 +354,14 @@ def main() -> None:
     model_probs = get_model_probs(logits, first_tok_id, mid_tok_ids, L)   # (L, n_tokens)
     optimal_probs = compute_optimal_probs(seq_beliefs, emit)               # (L, n_tokens)
 
-    kl_t: int = find_kl_threshold(model_probs, optimal_probs, **config.kl_params)
-    logger.info(f"KL threshold t* = {kl_t} / {L}")
+    kl_t, kl_crossed = find_kl_threshold(model_probs, optimal_probs, **config.kl_params)
+    if kl_crossed:
+        logger.info(f"KL threshold t* = {kl_t} / {L}  (crossed epsilon={config.kl_params['epsilon']})")
+    else:
+        logger.warning(f"KL threshold t* = {kl_t} / {L}  (fallback: epsilon={config.kl_params['epsilon']} never crossed, using argmin)")
 
     with open(out_dir / "kl_threshold.json", "w") as f:
-        json.dump({"kl_threshold": kl_t, "seq_length": L}, f, indent=2)
+        json.dump({"kl_threshold": kl_t, "seq_length": L, "epsilon_crossed": kl_crossed}, f, indent=2)
 
     # ── Per-layer probes ───────────────────────────────────────────────────────
     # Residual at LLM position j encodes b_j (belief after seeing t_{j-1}).

@@ -14,10 +14,11 @@ def find_kl_threshold(
     model_probs: np.ndarray,
     optimal_probs: np.ndarray,
     epsilon: float,
-) -> int:
+) -> tuple[int, bool]:
     """
-    Returns the first token index where KL(model || optimal) drops below epsilon.
-    Falls back to the index of minimum KL if the threshold is never crossed.
+    Returns (t*, crossed) where t* is the threshold token index and crossed
+    indicates whether KL genuinely dropped below epsilon (True) or whether
+    the fallback argmin was used (False).
 
     model_probs:   (seq_len, vocab_size) — LLM next-token probabilities
     optimal_probs: (seq_len, vocab_size) — Bayesian-optimal next-token probabilities
@@ -32,8 +33,8 @@ def find_kl_threshold(
     )
     below = np.where(kl < epsilon)[0]
     if len(below) > 0:
-        return int(below[0])
-    return int(np.argmin(kl))
+        return int(below[0]), True
+    return int(np.argmin(kl)), False
 
 
 def _column_cosine_similarity(W_a: np.ndarray, W_b: np.ndarray) -> np.ndarray:
