@@ -5,7 +5,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def _get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+device = _get_device()
 
 
 def belief_to_hex(belief):
