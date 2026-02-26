@@ -35,55 +35,116 @@ This repo follows a minimal-intervention strategy: start with prompting, then es
 ```
 geometric_interpretability_LLMs/
 ├── README.md
-├── requirements.txt
+├── pyproject.toml
 ├── [SPAR] Context-induced belief geometry in LLMs.pdf   # Project proposal
-├── src/
-│   ├── models/          # LLM interfaces and ICLR-style agents
-│   │   ├── llm_interface.py   # Llama + OpenAI backends
-│   │   └── iclr_agent.py      # Graph-based context, Dirichlet energy
-│   ├── metrics/         # Representation and phase-transition metrics
-│   │   └── performance_metrics.py
-│   └── hmm/             # HMM and belief-state geometry (e.g. Mess3)
-│       └── hmm.py       # Mess3HMM, barycentric / MSP visualization
-└── experiments/
-    ├── accuracy_vs_context_HMM.ipynb   # Accuracy vs context length (HMM)
-    └── ICLR/
-        ├── accuracy_vs_context.ipynb   # Grid / ring graph context
-        └── recreate_ICLR.ipynb        # Park et al. replication
+│
+├── src/                        # Shared infrastructure — importable modules
+│   ├── probes.py               # Probe, ProbeResult, train_probe
+│   ├── experiment.py           # ExperimentConfig, load_config, setup_output_dir
+│   ├── experiment_utils.py     # Shared helpers (model loading, logging, etc.)
+│   ├── hmm/
+│   │   └── hmm.py              # Mess3HMM, barycentric / MSP visualisation
+│   ├── metrics/
+│   │   └── probe_metrics.py    # find_kl_threshold, compare_probes, cross_mse_matrix
+│   └── models/
+│       ├── llm_interface.py    # Llama + OpenAI backends
+│       └── iclr_agent.py       # Graph-based context, Dirichlet energy
+│
+├── experiments/                # Runnable experiment scripts + notebooks
+│   ├── configs/                # One YAML config per experiment script
+│   │   └── <experiment_name>.yaml
+│   ├── <experiment_name>.py    # Experiment scripts (paired with configs/)
+│   └── dani ICLR/              # Exploratory notebooks
+│
+├── outputs/                    # All raw experiment outputs — gitignored
+│   └── dani/
+│       └── YYYYMMDD_HHMMSS_<experiment_name>/
+│           ├── config.json     # Copy of the config used
+│           ├── experiment.log
+│           ├── results.npz / results.pkl
+│           └── figures/
+│
+└── results/                    # Curated, significant outputs — tracked in git
+    └── YYYYMMDD_HHMMSS_<experiment_name>/
+        ├── config.yaml         # Config used (copied from experiments/configs/)
+        ├── experiment.log
+        ├── *.json              # Lightweight metrics (no large arrays)
+        └── figures/
 ```
+
+### `outputs/` vs `results/`
+
+- **`outputs/`** is gitignored. Every experiment run writes here automatically via `setup_output_dir()`. Treat it as a scratch space — runs accumulate freely, large arrays (`.npz`, `.pkl`) live only here.
+- **`results/`** is tracked in git. When a run produces results worth keeping (a milestone, a key baseline, something you want to reference in a report), manually copy the lightweight artifacts — config, log, metrics JSONs, figures — into a new `results/TIMESTAMP_<name>/` folder. Do **not** copy large binary files here.
 
 ## Setup
 
 ```bash
-cd geometric_interpretability_LLMs
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+uv venv -p python3.12
+source .venv/bin/activate
+uv sync
 ```
 
-- **Hugging Face:** For Llama/Gemma, set `HF_TOKEN` (e.g. in `.env`).
-- **OpenAI (optional):** For `LLMInterface` embedding/analysis, set `OPENAI_API_KEY`.
+Set environment variables in a `.env` file:
+
+```
+HF_TOKEN=...          # required for Llama / Gemma models
+OPENAI_API_KEY=...    # optional, for OpenAI interface
+```
 
 ## Running experiments
 
-Run Jupyter from the repo root; notebooks under `experiments/` add the repo root to `sys.path` so `from src.hmm.hmm import ...` and `from src.models...` work.
+Experiment scripts live in `experiments/` and are paired with a config in `experiments/configs/`. They add `src/` to `sys.path`, so imports are written relative to `src/` (e.g. `from probes import ...`, `from metrics.probe_metrics import ...`).
 
-| Notebook | Purpose |
-|----------|--------|
-| `experiments/accuracy_vs_context_HMM.ipynb` | HMM setting: `Mess3HMM`, accuracy vs context length, linear probes. |
-| `experiments/ICLR/accuracy_vs_context.ipynb` | Grid/ring graph context, `ICLRAgent`, representation metrics. |
-| `experiments/ICLR/recreate_ICLR.ipynb` | Replication and ablations for Park et al. (ICLR). |
+```bash
+# from the repo root
+python experiments/probes_full_seq_vs_kl_threshold.py experiments/configs/probes_full_seq_vs_kl_threshold.yaml
+```
 
-## Main components
+Output is written to `outputs/dani/YYYYMMDD_HHMMSS_<experiment_name>/`.
 
-| Component | Role |
-|----------|------|
-| `LlamaInterface` | Load Llama/Gemma; extract layer-wise hidden states; generation. |
-| `LLMInterface` (OpenAI) | Embeddings and semantic analysis for graph/context experiments. |
-| `ICLRAgent` | Graph tracing (grid/ring), Dirichlet energy, PCA, semantic priors. |
-| `Mess3HMM` | 3-state HMM (Mess3), emission/transition matrices, belief-state trajectories. |
-| `PerformanceMetrics` | Representation–graph alignment, Dirichlet quotient, phase-transition metrics. |
-| `hmm` (barycentric/MSP) | Belief-to-hex, barycentric coordinates, evolution plots for belief states. |
+Exploratory notebooks live under `experiments/dani ICLR/` and add the **repo root** to `sys.path` (so imports are `from src.hmm.hmm import ...`).
+
+### Config schema
+
+Configs are YAML files. `ExperimentConfig` in `src/experiment.py` defines the base fields; each experiment script subclasses it with its own additions. Load with `load_config(path, MyConfigClass)`.
+
+**Base — `ExperimentConfig`**
+
+| Field | Description |
+|---|---|
+| `experiment_name` | Short slug, used in output directory name |
+| `model_name` | TransformerLens / HuggingFace model identifier |
+| `hmm.process_name` | Simplexity HMM type (`mess3`, `coin`, …) |
+| `hmm.process_params` | Dict of HMM parameters passed to `build_hidden_markov_model` |
+
+**`ProbesFullSeqVsKLThresholdConfig`** (Experiment 1)
+
+| Field | Description |
+|---|---|
+| `layer_indices` | List of layer indices to probe |
+| `seq_length` | Sequence length per forward pass |
+| `kl_params` | Kwargs for `find_kl_threshold` (e.g. `epsilon: 0.05`) |
+| `vocab_mapping` | Maps HMM token string → HMM output index (e.g. `A: 0, B: 1, C: 2`) |
+
+**`ProbesCrossSequenceAlignmentConfig`** (Experiment 2)
+
+Inherits all fields from Experiment 1, plus:
+
+| Field | Description |
+|---|---|
+| `n_sequences` | Number of sequences to generate and compare |
+
+## Key components
+
+| Component | Location | Role |
+|---|---|---|
+| `Probe` / `ProbeResult` / `train_probe` | `src/probes.py` | Linear probe trained per sequence; stores activations, belief states, token predictions |
+| `ExperimentConfig` / `load_config` / `setup_output_dir` | `src/experiment.py` | YAML config loading (subclass-aware via `cls` arg) and output directory management |
+| `find_kl_threshold` | `src/metrics/probe_metrics.py` | Detect when model converges to Bayesian-optimal predictions |
+| `compare_probes` | `src/metrics/probe_metrics.py` | Cross-MSE and principal angles between two probes |
+| `cross_mse_matrix` | `src/metrics/probe_metrics.py` | N×N cross-evaluation MSE matrix across probes |
+| `Mess3HMM` | `src/hmm/hmm.py` | 3-state Mess3 HMM; sequence generation, belief-state computation, barycentric visualisation |
 
 ## Reference
 
