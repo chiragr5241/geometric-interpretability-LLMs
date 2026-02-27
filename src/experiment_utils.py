@@ -21,6 +21,7 @@ def get_device() -> torch.device:
 def setup_logging(out_dir: Path, name: str = "exp") -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     fmt = logging.Formatter("%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
