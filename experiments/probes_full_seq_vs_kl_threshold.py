@@ -29,11 +29,15 @@ class ProbesFullSeqVsKLThresholdConfig(ExperimentConfig):
     vocab_mapping: dict[str, int]
     n_runs: int = 1
     max_probes_per_batch: int = 200
+    n_ctx_override: int | None = None
+    save_probes: bool = False
+
 from experiment_utils import (
     build_emission_matrix,
     compute_optimal_probs,
     get_device,
     get_model_probs,
+    get_model_probs_projected,
     load_model,
     resolve_hmm_token_ids,
     setup_logging,
@@ -54,14 +58,16 @@ def plot_kl_over_sequence(
     smooth_window: int,
     path: Path,
     min_position: int = 0,
+    include_junk: bool = False,
 ) -> None:
     import plotly.graph_objects as go
 
-    kl_raw, kl_smooth = compute_kl(model_probs, optimal_probs, smooth_window)
+    kl_raw, kl_smooth = compute_kl(model_probs, optimal_probs, smooth_window, include_junk=include_junk)
 
-    kl_search = kl_smooth[min_position:]
-    kl_min, kl_max = kl_search.min(), kl_search.max()
+    kl_min, kl_max = kl_smooth.min(), kl_smooth.max()
     threshold_val = kl_min + fraction * (kl_max - kl_min)
+    kl_search = kl_smooth[min_position:]
+    kl_argmin = int(np.argmin(kl_search)) + min_position
 
     positions = np.arange(len(kl_raw))
 
@@ -93,15 +99,21 @@ def plot_kl_over_sequence(
             annotation_position="top right",
         )
     fig.add_vline(
+        x=kl_argmin,
+        line=dict(color="purple", dash="dash", width=1.5),
+        annotation_text=f"argmin KL={kl_argmin}",
+        annotation_position="top left",
+    )
+    fig.add_vline(
         x=kl_t,
         line=dict(color="orange", dash="dot", width=1.5),
         annotation_text=f"t*={kl_t}",
         annotation_position="top left",
     )
     fig.update_layout(
-        title="KL divergence over sequence with threshold",
+        title="KL(optimal ‖ model) over sequence (run 0) with threshold",
         xaxis_title="Sequence position",
-        yaxis_title="KL(model ‖ optimal)",
+        yaxis_title="KL(optimal ‖ model)",
         legend=dict(x=0.7, y=0.95),
     )
     fig.write_image(str(Path(path).with_suffix(".png")))
@@ -260,7 +272,14 @@ def main() -> None:
     seq_seeds: list[int] = [int(torch.randint(2**31, (1,)).item()) for _ in range(n_runs)]
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = load_model(config.model_name, device, logger)
+    model = load_model(config.model_name, device, logger, n_ctx=config.n_ctx_override)
+
+    n_ctx = model.cfg.n_ctx
+    if config.seq_length >= n_ctx:
+        raise ValueError(
+            f"seq_length={config.seq_length} >= model n_ctx={n_ctx}. "
+            f"Set seq_length < {n_ctx} (accounting for BOS token)."
+        )
 
     # ── HMM ───────────────────────────────────────────────────────────────────
     hmm = Mess3HMM()
@@ -276,6 +295,9 @@ def main() -> None:
     first_tok_id, mid_tok_ids = resolve_hmm_token_ids(
         model, idx_to_token, n_hmm_tokens, logger
     )
+
+    use_projected: bool = bool(config.kl_params.get("include_junk", False))
+    logger.info(f"KL variant  : {'projected (include_junk=True)' if use_projected else 'standard (include_junk=False)'} — KL(optimal ‖ model)")
 
     L = config.seq_length
     hook_names = [f"blocks.{l}.hook_resid_post" for l in config.layer_indices]
@@ -301,7 +323,7 @@ def main() -> None:
         seq_beliefs: np.ndarray = beliefs_batch[0].cpu().numpy()
 
         text = " ".join(idx_to_token[int(t)] for t in seq_tokens)
-        llm_tokens = model.to_tokens(text, prepend_bos=True)
+        llm_tokens = model.to_tokens(text, prepend_bos=True, truncate=False)
         assert llm_tokens.shape[1] == L + 1, (
             f"Expected {L+1} LLM tokens, got {llm_tokens.shape[1]}. "
             "Check that every HMM token maps to a single LLM token."
@@ -314,10 +336,15 @@ def main() -> None:
                 return_type="logits",
             )
 
-        model_probs = get_model_probs(logits, first_tok_id, mid_tok_ids, L)
+        if use_projected:
+            model_probs = get_model_probs_projected(logits, first_tok_id, mid_tok_ids, L)
+        else:
+            model_probs = get_model_probs(logits, first_tok_id, mid_tok_ids, L)
         optimal_probs = compute_optimal_probs(seq_beliefs, emit)
 
-        kl_t, kl_crossed = find_kl_threshold(model_probs, optimal_probs, **config.kl_params)
+        kl_t, kl_crossed = find_kl_threshold(
+            model_probs, optimal_probs, **config.kl_params, logger=logger,
+        )
         if kl_crossed:
             logger.info(f"  KL threshold t* = {kl_t} / {L}")
         else:
@@ -410,11 +437,14 @@ def main() -> None:
     }
 
     # ── Save ProbeResults ─────────────────────────────────────────────────────
-    logger.info("Saving ProbeResults ...")
-    for layer in config.layer_indices:
-        for run_idx in range(n_runs):
-            full_probes[layer][run_idx].save(out_dir / "probes" / f"layer_{layer}_run_{run_idx}_full")
-            post_probes[layer][run_idx].save(out_dir / "probes" / f"layer_{layer}_run_{run_idx}_post")
+    if config.save_probes:
+        logger.info("Saving ProbeResults ...")
+        for layer in config.layer_indices:
+            for run_idx in range(n_runs):
+                full_probes[layer][run_idx].save(out_dir / "probes" / f"layer_{layer}_run_{run_idx}_full")
+                post_probes[layer][run_idx].save(out_dir / "probes" / f"layer_{layer}_run_{run_idx}_post")
+    else:
+        logger.info("Skipping ProbeResults save (save_probes=False)")
 
     mse_serialisable = {
         str(l): {
@@ -476,16 +506,16 @@ def main() -> None:
         out_dir / "figures" / "mse_comparison.png",
     )
 
-    if n_runs == 1:
-        plot_kl_over_sequence(
-            all_model_probs[0],
-            all_optimal_probs[0],
-            all_kl_thresholds[0],
-            fraction=config.kl_params["fraction"],
-            smooth_window=config.kl_params["smooth_window"],
-            path=out_dir / "figures" / "kl_over_sequence.png",
-            min_position=config.kl_params.get("min_position", 0),
-        )
+    plot_kl_over_sequence(
+        all_model_probs[0],
+        all_optimal_probs[0],
+        all_kl_thresholds[0],
+        fraction=config.kl_params["fraction"],
+        smooth_window=config.kl_params["smooth_window"],
+        path=out_dir / "figures" / "kl_over_sequence.png",
+        min_position=config.kl_params.get("min_position", 0),
+        include_junk=use_projected,
+    )
 
     plot_column_cosine_similarity(
         compare_results,

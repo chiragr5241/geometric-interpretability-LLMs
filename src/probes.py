@@ -61,6 +61,7 @@ class ProbeResult:
     probe: Probe
     train_mse_curve: list[float]
     test_mse: float
+    test_split_idx: int
     train_tokens: np.ndarray
     activations: np.ndarray
     gt_next_token_preds: np.ndarray
@@ -87,6 +88,7 @@ class ProbeResult:
                 {
                     "train_mse_curve": self.train_mse_curve,
                     "test_mse": self.test_mse,
+                    "test_split_idx": self.test_split_idx,
                     "kl_threshold": self.kl_threshold,
                     "d_model": int(self.activations.shape[1]),
                     "n_states": int(self.gt_belief_states.shape[1]),
@@ -110,6 +112,7 @@ class ProbeResult:
             probe=probe,
             train_mse_curve=meta["train_mse_curve"],
             test_mse=meta["test_mse"],
+            test_split_idx=meta["test_split_idx"],
             kl_threshold=meta["kl_threshold"],
             train_tokens=arrays["train_tokens"],
             activations=arrays["activations"],
@@ -288,6 +291,7 @@ def _train_probes_batched_impl(
             probe=probe,
             train_mse_curve=train_mse_curves[i],
             test_mse=test_mses[i].item(),
+            test_split_idx=split_indices[i],
             train_tokens=inp.tokens,
             activations=inp.activations,
             gt_next_token_preds=inp.gt_next_token_preds,

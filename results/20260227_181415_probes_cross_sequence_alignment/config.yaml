@@ -1,4 +1,4 @@
-experiment_name: probes_full_seq_vs_kl_threshold
+experiment_name: probes_cross_sequence_alignment
 hmm:
   process_name: mess3
   process_params:
@@ -34,13 +34,17 @@ layer_indices:
 - 25
 - 26
 - 27
-seq_length: 500
+seq_length: 5000
 kl_params:
-  fraction: 0.05
+  fraction: 0.02
   smooth_window: 5
-  min_position: 40
+  min_position: 20
+  include_junk: true
 vocab_mapping:
   A: 0
   B: 1
   C: 2
-n_runs: 20
+n_sequences: 10
+max_probes_per_batch: 80
+n_ctx_override: 10000
+save_probes: false

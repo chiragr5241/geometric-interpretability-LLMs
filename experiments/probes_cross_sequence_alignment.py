@@ -32,6 +32,7 @@ from experiment_utils import (
     compute_optimal_probs,
     get_device,
     get_model_probs,
+    get_model_probs_projected,
     load_model,
     resolve_hmm_token_ids,
     setup_logging,
@@ -49,6 +50,8 @@ class ProbesCrossSequenceAlignmentConfig(ExperimentConfig):
     vocab_mapping: dict[str, int]
     n_sequences: int
     max_probes_per_batch: int = 200
+    n_ctx_override: int | None = None
+    save_probes: bool = False
 
 # ── Plotting helpers ───────────────────────────────────────────────────────────
 
@@ -175,7 +178,14 @@ def main() -> None:
     seq_seeds: list[int] = [int(torch.randint(2**31, (1,)).item()) for _ in range(M)]
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = load_model(config.model_name, device, logger)
+    model = load_model(config.model_name, device, logger, n_ctx=config.n_ctx_override)
+
+    n_ctx = model.cfg.n_ctx
+    if config.seq_length is not None and config.seq_length >= n_ctx:
+        raise ValueError(
+            f"seq_length={config.seq_length} >= model n_ctx={n_ctx}. "
+            f"Set seq_length < {n_ctx} (accounting for BOS token)."
+        )
 
     # ── HMM ───────────────────────────────────────────────────────────────────
     hmm = Mess3HMM()
@@ -191,6 +201,9 @@ def main() -> None:
     first_tok_id, mid_tok_ids = resolve_hmm_token_ids(
         model, idx_to_token, n_hmm_tokens, logger
     )
+
+    use_projected: bool = bool(config.kl_params.get("include_junk", False))
+    logger.info(f"KL variant  : {'projected (include_junk=True)' if use_projected else 'standard (include_junk=False)'} — KL(optimal ‖ model)")
 
     L = config.seq_length
     hook_names = [f"blocks.{l}.hook_resid_post" for l in config.layer_indices]
@@ -217,7 +230,7 @@ def main() -> None:
         seq_beliefs: np.ndarray = beliefs_batch[0].cpu().numpy()
 
         text = " ".join(idx_to_token[int(t)] for t in seq_tokens)
-        llm_tokens = model.to_tokens(text, prepend_bos=True)
+        llm_tokens = model.to_tokens(text, prepend_bos=True, truncate=False)
         assert llm_tokens.shape[1] == L + 1, (
             f"Expected {L + 1} LLM tokens, got {llm_tokens.shape[1]}."
         )
@@ -229,10 +242,15 @@ def main() -> None:
                 return_type="logits",
             )
 
-        model_probs = get_model_probs(logits, first_tok_id, mid_tok_ids, L)
+        if use_projected:
+            model_probs = get_model_probs_projected(logits, first_tok_id, mid_tok_ids, L)
+        else:
+            model_probs = get_model_probs(logits, first_tok_id, mid_tok_ids, L)
         optimal_probs = compute_optimal_probs(seq_beliefs, emit)
 
-        kl_t, kl_crossed = find_kl_threshold(model_probs, optimal_probs, **config.kl_params)
+        kl_t, kl_crossed = find_kl_threshold(
+            model_probs, optimal_probs, **config.kl_params, logger=logger,
+        )
         if kl_crossed:
             logger.info(f"  KL threshold t* = {kl_t} / {L}  (fraction={config.kl_params['fraction']}, smooth_window={config.kl_params['smooth_window']}, min_position={config.kl_params.get('min_position', 0)})")
         else:
@@ -321,13 +339,14 @@ def main() -> None:
 
         full_cross = cross_mse_matrix(
             full_prs,
-            [pr.activations for pr in full_prs],
-            [pr.gt_belief_states for pr in full_prs],
+            [pr.activations[pr.test_split_idx:] for pr in full_prs],
+            [pr.gt_belief_states[pr.test_split_idx:] for pr in full_prs],
         )
+
         post_cross = cross_mse_matrix(
             post_prs,
-            [pr.activations for pr in post_prs],
-            [pr.gt_belief_states for pr in post_prs],
+            [pr.activations[pr.test_split_idx:] for pr in post_prs],
+            [pr.gt_belief_states[pr.test_split_idx:] for pr in post_prs],
         )
         full_sim = pairwise_cosine_sim_matrix(full_prs)
         post_sim = pairwise_cosine_sim_matrix(post_prs)
@@ -360,13 +379,16 @@ def main() -> None:
         )
 
     # ── Save probes ───────────────────────────────────────────────────────────
-    logger.info("Saving ProbeResults ...")
-    for layer in config.layer_indices:
-        for seq_idx, (full_pr, post_pr) in enumerate(
-            zip(full_probes_done[layer], post_probes_done[layer])
-        ):
-            full_pr.save(out_dir / "probes" / f"layer_{layer}_seq_{seq_idx}_full")
-            post_pr.save(out_dir / "probes" / f"layer_{layer}_seq_{seq_idx}_post")
+    if config.save_probes:
+        logger.info("Saving ProbeResults ...")
+        for layer in config.layer_indices:
+            for seq_idx, (full_pr, post_pr) in enumerate(
+                zip(full_probes_done[layer], post_probes_done[layer])
+            ):
+                full_pr.save(out_dir / "probes" / f"layer_{layer}_seq_{seq_idx}_full")
+                post_pr.save(out_dir / "probes" / f"layer_{layer}_seq_{seq_idx}_post")
+    else:
+        logger.info("Skipping ProbeResults save (save_probes=False)")
 
     # ── Save scalar results ───────────────────────────────────────────────────
     serialisable = {
@@ -417,7 +439,7 @@ def main() -> None:
         config.layer_indices,
         title="Subspace similarity (full-sequence probes) — mean |diag cosine sim| per probe pair",
         path=fig_dir / "subspace_sim_full",
-        colorscale="RdBu",
+        colorscale="Blues",
         zrange=(0.0, 1.0),
     )
 
@@ -426,7 +448,7 @@ def main() -> None:
         config.layer_indices,
         title="Subspace similarity (post-threshold probes) — mean |diag cosine sim| per probe pair",
         path=fig_dir / "subspace_sim_post",
-        colorscale="RdBu",
+        colorscale="Blues",
         zrange=(0.0, 1.0),
     )
 

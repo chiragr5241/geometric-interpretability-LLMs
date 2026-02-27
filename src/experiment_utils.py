@@ -32,7 +32,43 @@ def setup_logging(out_dir: Path, name: str = "exp") -> logging.Logger:
     return logger
 
 
-def load_model(model_name: str, device: torch.device, logger: logging.Logger):
+def _extend_model_context(model, n_ctx: int) -> None:
+    """Extend a loaded HookedTransformer to support longer sequences.
+
+    Patches model.cfg.n_ctx and recomputes the registered buffers that are
+    pre-allocated at load time based on the original n_ctx:
+      - rotary_sin / rotary_cos  (one pair per attention layer, RoPE models)
+      - mask                     (causal mask, one per attention layer)
+    """
+    model.cfg.n_ctx = n_ctx
+    for block in model.blocks:
+        attn = block.attn
+        device = attn.IGNORE.device
+
+        if hasattr(attn, "rotary_sin"):
+            sin, cos = attn.calculate_sin_cos_rotary(
+                model.cfg.rotary_dim,
+                n_ctx,
+                base=model.cfg.rotary_base,
+                dtype=model.cfg.dtype,
+            )
+            attn.rotary_sin = sin.to(device)
+            attn.rotary_cos = cos.to(device)
+
+        if hasattr(attn, "mask"):
+            causal_mask = torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.bool, device=device))
+            window_size = getattr(model.cfg, "window_size", None)
+            if window_size is not None:
+                causal_mask = torch.triu(causal_mask, 1 - window_size)
+            attn.mask = causal_mask
+
+
+def load_model(
+    model_name: str,
+    device: torch.device,
+    logger: logging.Logger,
+    n_ctx: int | None = None,
+):
     import transformers
     if not hasattr(transformers, "TRANSFORMERS_CACHE"):
         from huggingface_hub.constants import HF_HUB_CACHE
@@ -47,11 +83,13 @@ def load_model(model_name: str, device: torch.device, logger: logging.Logger):
         dtype=dtype,
         device=str(device),
     )
+    if n_ctx is not None:
+        _extend_model_context(model, n_ctx)
     model.eval()
     elapsed = time.time() - t0
     logger.info(
         f"Model loaded in {elapsed:.1f}s  |  "
-        f"layers={model.cfg.n_layers}  d_model={model.cfg.d_model}"
+        f"layers={model.cfg.n_layers}  d_model={model.cfg.d_model}  n_ctx={model.cfg.n_ctx}"
     )
     return model
 
@@ -92,18 +130,20 @@ def resolve_hmm_token_ids(
     """
     ordered = [idx_to_token[i] for i in range(n_tokens)]
 
-    sample_text = " ".join(ordered)
-    mid_ids = model.to_tokens(sample_text, prepend_bos=False)[0].tolist()
-    assert len(mid_ids) == n_tokens, (
-        f"HMM tokens {ordered!r} tokenise to {len(mid_ids)} LLM tokens "
-        f"(expected {n_tokens}): {model.to_str_tokens(sample_text, prepend_bos=False)}"
-    )
-
     first_text = ordered[0]
     first_ids = model.to_tokens(first_text, prepend_bos=False)[0].tolist()
     assert len(first_ids) == 1, (
         f"First HMM token '{first_text}' tokenises to >1 LLM tokens: {first_ids}"
     )
+
+    mid_ids: list[int] = []
+    for token_str in ordered:
+        spaced = " " + token_str
+        tids = model.to_tokens(spaced, prepend_bos=False)[0].tolist()
+        assert len(tids) == 1, (
+            f"Space-prefixed HMM token {spaced!r} tokenises to >1 LLM tokens: {tids}"
+        )
+        mid_ids.append(tids[0])
 
     logger.info(
         f"HMM vocab -> LLM token IDs: "
@@ -142,5 +182,44 @@ def get_model_probs(
     if seq_len > 1:
         mid = probs_full[1:seq_len, :][:, mid_tok_ids].cpu().numpy()
         out[1:] = mid / (mid.sum(axis=-1, keepdims=True) + 1e-10)
+
+    return out
+
+
+def get_model_probs_projected(
+    logits: torch.Tensor,
+    first_tok_id: int,
+    mid_tok_ids: list[int],
+    seq_len: int,
+) -> np.ndarray:
+    """
+    Project next-token probabilities onto a (n_hmm_tokens + 1)-simplex.
+
+    Returns (seq_len, n_hmm_tokens + 1) where the last column is junk mass
+    (all probability not assigned to any emission token).  Probabilities are
+    NOT renormalised — they sum to 1 with junk absorbing the remainder.
+
+    logits shape: (1, llm_seq_len, vocab_size)
+
+    Position 0: uses first_tok_id for emission 0 (no leading space).
+    Positions 1+: uses mid_tok_ids (space-prefixed) for all emissions.
+    """
+    n = len(mid_tok_ids)
+    with torch.no_grad():
+        probs_full = F.softmax(logits[0, :seq_len, :].float(), dim=-1)   # (seq_len, vocab_size)
+
+    out = np.empty((seq_len, n + 1), dtype=np.float32)
+
+    emission_ids_pos0 = list(mid_tok_ids)
+    if first_tok_id not in mid_tok_ids:
+        emission_ids_pos0[0] = first_tok_id
+    p0 = probs_full[0, emission_ids_pos0].cpu().numpy().copy()
+    out[0, :n] = p0
+    out[0, n] = max(0.0, 1.0 - float(p0.sum()))
+
+    if seq_len > 1:
+        mid = probs_full[1:seq_len, :][:, mid_tok_ids].cpu().numpy()
+        out[1:, :n] = mid
+        out[1:, n] = np.clip(1.0 - mid.sum(axis=-1), 0.0, None)
 
     return out

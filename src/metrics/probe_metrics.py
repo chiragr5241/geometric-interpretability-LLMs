@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,20 +15,48 @@ def compute_kl(
     model_probs: np.ndarray,
     optimal_probs: np.ndarray,
     smooth_window: int = 5,
+    include_junk: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute per-position KL(model ‖ optimal) and its smoothed version.
+    Compute per-position KL divergence and its smoothed version.
+
+    Both modes compute KL(optimal ‖ model).
+
+    Standard mode (include_junk=False):
+        Both arrays are (seq_len, n_emissions). Computes KL(optimal || model).
+
+    Projected mode (include_junk=True):
+        model_probs is (seq_len, n_emissions + 1) — last column is junk mass.
+        optimal_probs is (seq_len, n_emissions) — ground-truth over emissions only.
+        Computes KL(optimal || model_projected) where model_projected is the
+        (n_emissions + 1)-vector from model_probs and the augmented ground truth
+        has a zero junk entry.  The junk term drops out of the sum since
+        optimal_gt[junk] = 0, so the result equals
+            sum_e optimal[e] * log(optimal[e] / model[e])
+        which naturally penalises junk mass through reduced model[e] probability.
 
     Returns (kl_raw, kl_smooth), both of shape (seq_len,).
     """
-    kl_raw = np.sum(
-        np.where(
-            model_probs > 0,
-            model_probs * np.log(model_probs / np.clip(optimal_probs, 1e-10, None)),
-            0.0,
-        ),
-        axis=-1,
-    )
+    if include_junk:
+        p = optimal_probs                                        # (seq_len, n_emissions)
+        q = model_probs[:, : optimal_probs.shape[-1]]           # emission columns only
+        kl_raw = np.sum(
+            np.where(
+                p > 0,
+                p * np.log(p / np.clip(q, 1e-10, None)),
+                0.0,
+            ),
+            axis=-1,
+        )
+    else:
+        kl_raw = np.sum(
+            np.where(
+                model_probs > 0,
+                model_probs * np.log(model_probs / np.clip(optimal_probs, 1e-10, None)),
+                0.0,
+            ),
+            axis=-1,
+        )
 
     if smooth_window > 1:
         half = smooth_window // 2
@@ -46,6 +75,8 @@ def find_kl_threshold(
     fraction: float = 0.2,
     smooth_window: int = 5,
     min_position: int = 0,
+    include_junk: bool = False,
+    logger: logging.Logger | None = None,
 ) -> tuple[int, bool]:
     """
     Returns (t*, crossed) where t* is the first position (>= min_position) where
@@ -54,19 +85,32 @@ def find_kl_threshold(
     Falls back to the argmin of the smoothed KL (within [min_position:]) with
     crossed=False.  The returned index is always absolute (into the full sequence).
 
-    model_probs:   (seq_len, vocab_size) — LLM next-token probabilities
+    model_probs:   (seq_len, vocab_size) or (seq_len, n_emissions+1) when include_junk=True
     optimal_probs: (seq_len, vocab_size) — Bayesian-optimal next-token probabilities
     fraction:      threshold = min + fraction * (max - min); e.g. 0.2 means
                    "first time KL is within the bottom 20% of its total swing"
     smooth_window: rolling-mean window size applied before thresholding
     min_position:  ignore positions before this index when detecting the threshold
+    include_junk:  if True, use projected KL(optimal || model_projected); see compute_kl
+    logger:        optional logger; if provided, logs the KL variant and junk mass stats
     """
-    _, kl_smooth = compute_kl(model_probs, optimal_probs, smooth_window)
+    variant = "projected (include_junk=True)" if include_junk else "standard (include_junk=False)"
+    if logger is not None:
+        logger.info(f"  compute_kl variant : {variant}")
+        if include_junk:
+            junk_col = model_probs[:, -1]
+            logger.info(
+                f"  junk mass          : mean={junk_col.mean():.4f}"
+                f"  std={junk_col.std():.4f}"
+                f"  max={junk_col.max():.4f}"
+            )
 
-    kl_search = kl_smooth[min_position:]
-    kl_min, kl_max = kl_search.min(), kl_search.max()
+    _, kl_smooth = compute_kl(model_probs, optimal_probs, smooth_window, include_junk=include_junk)
+
+    kl_min, kl_max = kl_smooth.min(), kl_smooth.max()
     threshold = kl_min + fraction * (kl_max - kl_min)
 
+    kl_search = kl_smooth[min_position:]
     below = np.where(kl_search <= threshold)[0]
     if len(below) > 0:
         return int(below[0]) + min_position, True
