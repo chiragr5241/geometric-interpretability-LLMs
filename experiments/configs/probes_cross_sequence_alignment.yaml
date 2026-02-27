@@ -1,6 +1,7 @@
-experiment_name: probes_full_seq_vs_kl_threshold
+experiment_name: probes_cross_sequence_alignment
 
-n_runs: 20  # number of independent sequences to average over (set to 20 for final run)
+n_sequences: 5
+max_probes_per_batch: 200
 
 hmm:
   process_name: mess3
@@ -18,7 +19,7 @@ seq_length: 500
 
 # All kwargs passed directly to find_kl_threshold()
 kl_params:
-  fraction: 0.05
+  fraction: 0.1
   smooth_window: 5
   min_position: 40  # only consider positions >= this when detecting the threshold
 

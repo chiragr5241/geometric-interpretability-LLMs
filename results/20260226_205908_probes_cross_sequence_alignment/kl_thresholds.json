@@ -1,0 +1,27 @@
+{
+  "thresholds": [
+    40,
+    43,
+    69,
+    44,
+    49
+  ],
+  "crossed": [
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "mean": 49.0,
+  "seq_length": 500,
+  "fraction": 0.1,
+  "smooth_window": 5,
+  "seq_seeds": [
+    422184563,
+    459691945,
+    474385346,
+    1800005238,
+    40691528
+  ]
+}

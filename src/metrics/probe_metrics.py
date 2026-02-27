@@ -10,20 +10,17 @@ except ImportError:
     from probes import ProbeResult
 
 
-def find_kl_threshold(
+def compute_kl(
     model_probs: np.ndarray,
     optimal_probs: np.ndarray,
-    epsilon: float,
-) -> tuple[int, bool]:
+    smooth_window: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Returns (t*, crossed) where t* is the threshold token index and crossed
-    indicates whether KL genuinely dropped below epsilon (True) or whether
-    the fallback argmin was used (False).
+    Compute per-position KL(model ‖ optimal) and its smoothed version.
 
-    model_probs:   (seq_len, vocab_size) — LLM next-token probabilities
-    optimal_probs: (seq_len, vocab_size) — Bayesian-optimal next-token probabilities
+    Returns (kl_raw, kl_smooth), both of shape (seq_len,).
     """
-    kl = np.sum(
+    kl_raw = np.sum(
         np.where(
             model_probs > 0,
             model_probs * np.log(model_probs / np.clip(optimal_probs, 1e-10, None)),
@@ -31,10 +28,49 @@ def find_kl_threshold(
         ),
         axis=-1,
     )
-    below = np.where(kl < epsilon)[0]
+
+    if smooth_window > 1:
+        half = smooth_window // 2
+        kl_padded = np.pad(kl_raw, (half, half), mode="edge")
+        kernel = np.ones(smooth_window) / smooth_window
+        kl_smooth = np.convolve(kl_padded, kernel, mode="valid")[: len(kl_raw)]
+    else:
+        kl_smooth = kl_raw
+
+    return kl_raw, kl_smooth
+
+
+def find_kl_threshold(
+    model_probs: np.ndarray,
+    optimal_probs: np.ndarray,
+    fraction: float = 0.2,
+    smooth_window: int = 5,
+    min_position: int = 0,
+) -> tuple[int, bool]:
+    """
+    Returns (t*, crossed) where t* is the first position (>= min_position) where
+    the smoothed KL drops into the bottom `fraction` of its (max - min) range
+    computed over [min_position:], and crossed=True.
+    Falls back to the argmin of the smoothed KL (within [min_position:]) with
+    crossed=False.  The returned index is always absolute (into the full sequence).
+
+    model_probs:   (seq_len, vocab_size) — LLM next-token probabilities
+    optimal_probs: (seq_len, vocab_size) — Bayesian-optimal next-token probabilities
+    fraction:      threshold = min + fraction * (max - min); e.g. 0.2 means
+                   "first time KL is within the bottom 20% of its total swing"
+    smooth_window: rolling-mean window size applied before thresholding
+    min_position:  ignore positions before this index when detecting the threshold
+    """
+    _, kl_smooth = compute_kl(model_probs, optimal_probs, smooth_window)
+
+    kl_search = kl_smooth[min_position:]
+    kl_min, kl_max = kl_search.min(), kl_search.max()
+    threshold = kl_min + fraction * (kl_max - kl_min)
+
+    below = np.where(kl_search <= threshold)[0]
     if len(below) > 0:
-        return int(below[0]), True
-    return int(np.argmin(kl)), False
+        return int(below[0]) + min_position, True
+    return int(np.argmin(kl_search)) + min_position, False
 
 
 def _column_cosine_similarity(W_a: np.ndarray, W_b: np.ndarray) -> np.ndarray:
@@ -106,4 +142,25 @@ def cross_mse_matrix(
             bs = torch.tensor(belief_states[j], dtype=torch.float32, device=device)
             with torch.no_grad():
                 matrix[i, j] = F.mse_loss(pr.probe(act), bs).item()
+    return matrix
+
+
+def pairwise_cosine_sim_matrix(probes: list[ProbeResult]) -> np.ndarray:
+    """
+    Compute an N×N matrix where entry [i, j] is the mean absolute diagonal
+    cosine similarity between probe i and probe j's weight matrices.
+
+    Entry [i, j] = mean(|diag(column_cosine_sim(W_i, W_j))|)
+
+    A value near 1 indicates the two probes learned the same directions per
+    belief component; near 0 indicates uncorrelated subspaces.
+    """
+    n = len(probes)
+    matrix = np.zeros((n, n))
+    for i in range(n):
+        W_i = probes[i].probe.W.detach().cpu().numpy()
+        for j in range(n):
+            W_j = probes[j].probe.W.detach().cpu().numpy()
+            cos_sim = _column_cosine_similarity(W_i, W_j)
+            matrix[i, j] = float(np.abs(np.diag(cos_sim)).mean())
     return matrix
