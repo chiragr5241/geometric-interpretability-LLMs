@@ -1,0 +1,254 @@
+{
+  "0": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_0",
+    "test_mse": 0.001683474751189351,
+    "mean_cross_mse_to_others": 0.0015915187670745784,
+    "vanilla_cosine_to_others_mean": 0.8902314040395949,
+    "mahalanobis_cosine_to_others_mean": 0.8315674742137231,
+    "mean_principal_angle_to_others_deg": 29.561034944322373
+  },
+  "1": {
+    "seq_idx": 6,
+    "save_path": "probes/canonical/layer_1",
+    "test_mse": 0.00024142631446011364,
+    "mean_cross_mse_to_others": 0.0002654710907437321,
+    "vanilla_cosine_to_others_mean": 0.7894711295763651,
+    "mahalanobis_cosine_to_others_mean": 0.6453941669642731,
+    "mean_principal_angle_to_others_deg": 41.310540517171226
+  },
+  "2": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_2",
+    "test_mse": 0.00024531048256903887,
+    "mean_cross_mse_to_others": 0.00020298562109625587,
+    "vanilla_cosine_to_others_mean": 0.722320040067037,
+    "mahalanobis_cosine_to_others_mean": 0.561438356604798,
+    "mean_principal_angle_to_others_deg": 47.63153839111328
+  },
+  "3": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_3",
+    "test_mse": 0.00023478767252527177,
+    "mean_cross_mse_to_others": 0.00018984784643786648,
+    "vanilla_cosine_to_others_mean": 0.6996910770734152,
+    "mahalanobis_cosine_to_others_mean": 0.537988784155829,
+    "mean_principal_angle_to_others_deg": 50.26093080308702
+  },
+  "4": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_4",
+    "test_mse": 0.0002591662632767111,
+    "mean_cross_mse_to_others": 0.00020864155926069038,
+    "vanilla_cosine_to_others_mean": 0.6872272822591994,
+    "mahalanobis_cosine_to_others_mean": 0.5273321640515345,
+    "mean_principal_angle_to_others_deg": 52.00720681084527
+  },
+  "5": {
+    "seq_idx": 2,
+    "save_path": "probes/canonical/layer_5",
+    "test_mse": 0.0002686525695025921,
+    "mean_cross_mse_to_others": 0.00025918486224125244,
+    "vanilla_cosine_to_others_mean": 0.7083472609519958,
+    "mahalanobis_cosine_to_others_mean": 0.5512147379495301,
+    "mean_principal_angle_to_others_deg": 50.88186899820963
+  },
+  "6": {
+    "seq_idx": 8,
+    "save_path": "probes/canonical/layer_6",
+    "test_mse": 0.00030133422114886343,
+    "mean_cross_mse_to_others": 0.00032626017410722043,
+    "vanilla_cosine_to_others_mean": 0.6971534821722243,
+    "mahalanobis_cosine_to_others_mean": 0.5239256758700596,
+    "mean_principal_angle_to_others_deg": 52.724876403808594
+  },
+  "7": {
+    "seq_idx": 7,
+    "save_path": "probes/canonical/layer_7",
+    "test_mse": 0.00041072972817346454,
+    "mean_cross_mse_to_others": 0.0004403514224880685,
+    "vanilla_cosine_to_others_mean": 0.6940445105234782,
+    "mahalanobis_cosine_to_others_mean": 0.5354286118136534,
+    "mean_principal_angle_to_others_deg": 53.14978239271376
+  },
+  "8": {
+    "seq_idx": 2,
+    "save_path": "probes/canonical/layer_8",
+    "test_mse": 0.0006216370384208858,
+    "mean_cross_mse_to_others": 0.0006143111386336386,
+    "vanilla_cosine_to_others_mean": 0.6885196169217428,
+    "mahalanobis_cosine_to_others_mean": 0.5264111623070737,
+    "mean_principal_angle_to_others_deg": 54.03317133585612
+  },
+  "9": {
+    "seq_idx": 8,
+    "save_path": "probes/canonical/layer_9",
+    "test_mse": 0.0007103182142600417,
+    "mean_cross_mse_to_others": 0.0008126263467905422,
+    "vanilla_cosine_to_others_mean": 0.6697408689392937,
+    "mahalanobis_cosine_to_others_mean": 0.5004362240568974,
+    "mean_principal_angle_to_others_deg": 55.33707936604818
+  },
+  "10": {
+    "seq_idx": 9,
+    "save_path": "probes/canonical/layer_10",
+    "test_mse": 0.0008933164062909782,
+    "mean_cross_mse_to_others": 0.001052820809288985,
+    "vanilla_cosine_to_others_mean": 0.6372720334264967,
+    "mahalanobis_cosine_to_others_mean": 0.4712084469449509,
+    "mean_principal_angle_to_others_deg": 57.77433395385742
+  },
+  "11": {
+    "seq_idx": 2,
+    "save_path": "probes/canonical/layer_11",
+    "test_mse": 0.0011028638109564781,
+    "mean_cross_mse_to_others": 0.0012083531797139181,
+    "vanilla_cosine_to_others_mean": 0.5762134260601468,
+    "mahalanobis_cosine_to_others_mean": 0.41952260717615625,
+    "mean_principal_angle_to_others_deg": 61.194642808702255
+  },
+  "12": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_12",
+    "test_mse": 0.0010355307022109628,
+    "mean_cross_mse_to_others": 0.0011739266467177207,
+    "vanilla_cosine_to_others_mean": 0.5554895069864061,
+    "mahalanobis_cosine_to_others_mean": 0.4021900108048872,
+    "mean_principal_angle_to_others_deg": 62.862959967719185
+  },
+  "13": {
+    "seq_idx": 9,
+    "save_path": "probes/canonical/layer_13",
+    "test_mse": 0.0009411608916707337,
+    "mean_cross_mse_to_others": 0.001171020881479813,
+    "vanilla_cosine_to_others_mean": 0.5036762820349799,
+    "mahalanobis_cosine_to_others_mean": 0.35851683942109824,
+    "mean_principal_angle_to_others_deg": 65.10556920369466
+  },
+  "14": {
+    "seq_idx": 8,
+    "save_path": "probes/canonical/layer_14",
+    "test_mse": 0.0008413617615588009,
+    "mean_cross_mse_to_others": 0.0011246860699935092,
+    "vanilla_cosine_to_others_mean": 0.5056659446822273,
+    "mahalanobis_cosine_to_others_mean": 0.3702585575454259,
+    "mean_principal_angle_to_others_deg": 65.36216990152995
+  },
+  "15": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_15",
+    "test_mse": 0.00111385656055063,
+    "mean_cross_mse_to_others": 0.0011206173674306935,
+    "vanilla_cosine_to_others_mean": 0.5132360557715098,
+    "mahalanobis_cosine_to_others_mean": 0.3827899986987457,
+    "mean_principal_angle_to_others_deg": 64.63412645128038
+  },
+  "16": {
+    "seq_idx": 1,
+    "save_path": "probes/canonical/layer_16",
+    "test_mse": 0.0007842906634323299,
+    "mean_cross_mse_to_others": 0.0009513945357563595,
+    "vanilla_cosine_to_others_mean": 0.5209942393832736,
+    "mahalanobis_cosine_to_others_mean": 0.3911110008901793,
+    "mean_principal_angle_to_others_deg": 64.32263904147678
+  },
+  "17": {
+    "seq_idx": 1,
+    "save_path": "probes/canonical/layer_17",
+    "test_mse": 0.0008293301216326654,
+    "mean_cross_mse_to_others": 0.0010266199953750605,
+    "vanilla_cosine_to_others_mean": 0.5307736661699083,
+    "mahalanobis_cosine_to_others_mean": 0.41185153835401395,
+    "mean_principal_angle_to_others_deg": 63.564498053656685
+  },
+  "18": {
+    "seq_idx": 1,
+    "save_path": "probes/canonical/layer_18",
+    "test_mse": 0.0008239216404035687,
+    "mean_cross_mse_to_others": 0.0009650729932925767,
+    "vanilla_cosine_to_others_mean": 0.5149019526110755,
+    "mahalanobis_cosine_to_others_mean": 0.38993820130955403,
+    "mean_principal_angle_to_others_deg": 64.84836535983615
+  },
+  "19": {
+    "seq_idx": 0,
+    "save_path": "probes/canonical/layer_19",
+    "test_mse": 0.0009666620171628892,
+    "mean_cross_mse_to_others": 0.0010470293669237031,
+    "vanilla_cosine_to_others_mean": 0.4946831166744232,
+    "mahalanobis_cosine_to_others_mean": 0.3770253758999521,
+    "mean_principal_angle_to_others_deg": 65.57942199707031
+  },
+  "20": {
+    "seq_idx": 6,
+    "save_path": "probes/canonical/layer_20",
+    "test_mse": 0.000829509983304888,
+    "mean_cross_mse_to_others": 0.0010623627005972797,
+    "vanilla_cosine_to_others_mean": 0.5065074463685354,
+    "mahalanobis_cosine_to_others_mean": 0.39950477029856446,
+    "mean_principal_angle_to_others_deg": 64.90527004665799
+  },
+  "21": {
+    "seq_idx": 8,
+    "save_path": "probes/canonical/layer_21",
+    "test_mse": 0.0007995509076863527,
+    "mean_cross_mse_to_others": 0.0009560288939004143,
+    "vanilla_cosine_to_others_mean": 0.4518918858634101,
+    "mahalanobis_cosine_to_others_mean": 0.340197018353733,
+    "mean_principal_angle_to_others_deg": 67.35214063856337
+  },
+  "22": {
+    "seq_idx": 9,
+    "save_path": "probes/canonical/layer_22",
+    "test_mse": 0.0007514104363508523,
+    "mean_cross_mse_to_others": 0.0009552458003680739,
+    "vanilla_cosine_to_others_mean": 0.40946948528289795,
+    "mahalanobis_cosine_to_others_mean": 0.3001449956359078,
+    "mean_principal_angle_to_others_deg": 69.89213562011719
+  },
+  "23": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_23",
+    "test_mse": 0.00111014349386096,
+    "mean_cross_mse_to_others": 0.0010521365329623222,
+    "vanilla_cosine_to_others_mean": 0.3920929763052199,
+    "mahalanobis_cosine_to_others_mean": 0.29150562890248605,
+    "mean_principal_angle_to_others_deg": 70.48833889431424
+  },
+  "24": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_24",
+    "test_mse": 0.0010653386125341058,
+    "mean_cross_mse_to_others": 0.001046605938528147,
+    "vanilla_cosine_to_others_mean": 0.37953762544525993,
+    "mahalanobis_cosine_to_others_mean": 0.28616510572997345,
+    "mean_principal_angle_to_others_deg": 71.29341295030382
+  },
+  "25": {
+    "seq_idx": 4,
+    "save_path": "probes/canonical/layer_25",
+    "test_mse": 0.001312101143412292,
+    "mean_cross_mse_to_others": 0.0011871038910208477,
+    "vanilla_cosine_to_others_mean": 0.33918972810109455,
+    "mahalanobis_cosine_to_others_mean": 0.2528661477736458,
+    "mean_principal_angle_to_others_deg": 72.75375874837239
+  },
+  "26": {
+    "seq_idx": 5,
+    "save_path": "probes/canonical/layer_26",
+    "test_mse": 0.0012015234678983688,
+    "mean_cross_mse_to_others": 0.0014149269813464747,
+    "vanilla_cosine_to_others_mean": 0.2857235074043274,
+    "mahalanobis_cosine_to_others_mean": 0.21893972616330362,
+    "mean_principal_angle_to_others_deg": 75.27359602186415
+  },
+  "27": {
+    "seq_idx": 9,
+    "save_path": "probes/canonical/layer_27",
+    "test_mse": 0.001826049410738051,
+    "mean_cross_mse_to_others": 0.001989087788388133,
+    "vanilla_cosine_to_others_mean": 0.18235094348589578,
+    "mahalanobis_cosine_to_others_mean": 0.13987930933438467,
+    "mean_principal_angle_to_others_deg": 80.26713307698567
+  }
+}

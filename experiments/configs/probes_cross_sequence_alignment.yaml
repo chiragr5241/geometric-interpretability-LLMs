@@ -2,7 +2,8 @@ experiment_name: probes_cross_sequence_alignment
 
 n_sequences: 10
 max_probes_per_batch: 80
-save_probes: false  # set to true to persist probe weights to disk
+save_probes: false
+mahalanobis_shrinkage: 0.1
 
 hmm:
   process_name: mess3

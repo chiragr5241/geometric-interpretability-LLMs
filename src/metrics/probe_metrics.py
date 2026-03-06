@@ -208,3 +208,97 @@ def pairwise_cosine_sim_matrix(probes: list[ProbeResult]) -> np.ndarray:
             cos_sim = _column_cosine_similarity(W_i, W_j)
             matrix[i, j] = float(np.abs(np.diag(cos_sim)).mean())
     return matrix
+
+
+def compute_activation_covariance(
+    activations_list: list[np.ndarray],
+    shrinkage: float = 0.1,
+) -> np.ndarray:
+    """
+    Pool activations and compute a Ledoit-Wolf-style shrinkage-regularized
+    covariance matrix.
+
+    activations_list: list of (seq_len, d_model) float32 arrays
+    shrinkage: alpha in (1-alpha)*Sigma + alpha*(tr(Sigma)/d)*I
+
+    Returns: (d_model, d_model) float64 regularized covariance
+    """
+    pooled = np.concatenate(activations_list, axis=0).astype(np.float64)
+    sigma = np.cov(pooled.T, ddof=1)
+    d = sigma.shape[0]
+    target = (np.trace(sigma) / d) * np.eye(d)
+    return (1.0 - shrinkage) * sigma + shrinkage * target
+
+
+def pairwise_principal_angles(
+    probes: list[ProbeResult],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute principal angles between probe weight subspaces.
+
+    For each probe, QR-decomposes W ∈ R^(d_model, n_states) to obtain an
+    orthonormal basis Q ∈ R^(d_model, n_states). For each pair (i, j) the
+    singular values of Q_i^T Q_j equal cos(theta_k) for the n_states
+    principal angles, returned in ascending order (theta_1 ≤ theta_2 ≤ ...).
+
+    Returns:
+        angles_deg:          (N, N, n_states) principal angles in degrees
+        mean_angle_matrix:   (N, N) mean of all n_states principal angles per pair
+        mean_angle_2_matrix: (N, N) mean of the first two (smallest) principal angles
+    """
+    n = len(probes)
+    n_states = probes[0].probe.W.shape[1]
+
+    bases: list[np.ndarray] = []
+    for pr in probes:
+        W = pr.probe.W.detach().cpu().numpy()
+        Q, _ = np.linalg.qr(W)
+        bases.append(Q[:, :n_states])
+
+    angles_deg = np.zeros((n, n, n_states))
+    mean_angle_matrix = np.zeros((n, n))
+    mean_angle_2_matrix = np.zeros((n, n))
+
+    for i in range(n):
+        for j in range(n):
+            M = bases[i].T @ bases[j]
+            sv = np.linalg.svd(M, compute_uv=False)
+            sv = np.clip(sv, -1.0, 1.0)
+            angles = np.sort(np.degrees(np.arccos(sv)))
+            angles_deg[i, j] = angles
+            mean_angle_matrix[i, j] = float(angles.mean())
+            mean_angle_2_matrix[i, j] = float(angles[:2].mean())
+
+    return angles_deg, mean_angle_matrix, mean_angle_2_matrix
+
+
+def pairwise_mahalanobis_cosine_sim(
+    probes: list[ProbeResult],
+    sigma: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute pairwise cosine similarity between probe weight directions in the
+    Mahalanobis (whitened) space defined by sigma.
+
+    Whitens each probe's weight matrix as W' = Sigma^{-1/2} W, then computes
+    the same mean |diag| cosine similarity as pairwise_cosine_sim_matrix.
+
+    sigma: (d_model, d_model) regularized activation covariance (float64)
+    Returns: (N, N) matrix
+    """
+    eigvals, eigvecs = np.linalg.eigh(sigma)
+    eigvals = np.clip(eigvals, 1e-10, None)
+    sigma_inv_sqrt = (eigvecs * (1.0 / np.sqrt(eigvals))) @ eigvecs.T
+
+    n = len(probes)
+    whitened: list[np.ndarray] = []
+    for pr in probes:
+        W = pr.probe.W.detach().cpu().numpy().astype(np.float64)
+        whitened.append(sigma_inv_sqrt @ W)
+
+    matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            cos_sim = _column_cosine_similarity(whitened[i], whitened[j])
+            matrix[i, j] = float(np.abs(np.diag(cos_sim)).mean())
+    return matrix

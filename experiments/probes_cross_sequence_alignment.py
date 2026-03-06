@@ -38,7 +38,14 @@ from experiment_utils import (
     setup_logging,
 )
 from hmm.hmm import Mess3HMM
-from metrics.probe_metrics import cross_mse_matrix, find_kl_threshold, pairwise_cosine_sim_matrix
+from metrics.probe_metrics import (
+    compute_activation_covariance,
+    cross_mse_matrix,
+    find_kl_threshold,
+    pairwise_cosine_sim_matrix,
+    pairwise_mahalanobis_cosine_sim,
+    pairwise_principal_angles,
+)
 from probes import ProbeInput, ProbeResult, train_probes_batched
 from visualization import plot_belief_grid
 
@@ -52,6 +59,7 @@ class ProbesCrossSequenceAlignmentConfig(ExperimentConfig):
     max_probes_per_batch: int = 200
     n_ctx_override: int | None = None
     save_probes: bool = False
+    mahalanobis_shrinkage: float = 0.1
 
 # ── Plotting helpers ───────────────────────────────────────────────────────────
 
@@ -151,6 +159,106 @@ def plot_diag_vs_offdiag(
         title="Diagonal vs. off-diagonal cross-MSE per layer",
         yaxis_title="MSE",
         showlegend=True,
+    )
+    fig.write_image(str(Path(path).with_suffix(".png")))
+
+
+def plot_alignment_comparison(
+    results: dict[int, dict],
+    layer_indices: list[int],
+    path: Path,
+) -> None:
+    layers = [str(l) for l in layer_indices]
+    full_vanilla = [results[l]["full_off_diag_sim_mean"] for l in layer_indices]
+    full_mahal = [results[l]["full_off_diag_mahal_mean"] for l in layer_indices]
+    full_ratio = [results[l]["full_ratio"] for l in layer_indices]
+    post_ratio = [results[l]["post_ratio"] for l in layer_indices]
+    diff = [m - v for m, v in zip(full_mahal, full_vanilla)]
+
+    mask = ~np.eye(results[layer_indices[0]]["full_principal_angles_deg"].shape[0], dtype=bool)
+    theta1 = [float(results[l]["full_principal_angles_deg"][mask][:, 0].mean()) for l in layer_indices]
+    theta2 = [float(results[l]["full_principal_angles_deg"][mask][:, 1].mean()) for l in layer_indices]
+    theta3 = [float(results[l]["full_principal_angles_deg"][mask][:, 2].mean()) for l in layer_indices]
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=[
+            "Cosine similarity — off-diag mean (full probes)",
+            "Mahalanobis − vanilla cosine (full probes)",
+            "Principal angles — off-diag mean (full probes)",
+            "Cross-MSE ratio (full vs post)",
+        ],
+        vertical_spacing=0.18,
+        horizontal_spacing=0.12,
+    )
+
+    fig.add_trace(go.Scatter(x=layers, y=full_vanilla, name="Vanilla cosine", mode="lines+markers"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=layers, y=full_mahal, name="Mahalanobis cosine", mode="lines+markers"), row=1, col=1)
+
+    fig.add_trace(
+        go.Scatter(
+            x=layers, y=diff, name="Δ (Mahal − vanilla)",
+            mode="lines+markers", line=dict(color="purple"),
+        ),
+        row=1, col=2,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=layers, y=[0.0] * len(layers), mode="lines",
+            line=dict(color="gray", dash="dash", width=1), showlegend=False,
+        ),
+        row=1, col=2,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=layers, y=theta1, name="θ₁ mean (°)",
+            mode="lines+markers", line=dict(color="green"),
+        ),
+        row=2, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=layers, y=theta2, name="θ₂ mean (°)",
+            mode="lines+markers", line=dict(color="green", dash="dash"),
+        ),
+        row=2, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=layers, y=theta3, name="θ₃ mean (°)",
+            mode="lines+markers", line=dict(color="red", dash="dot"),
+        ),
+        row=2, col=1,
+    )
+
+    fig.add_trace(go.Scatter(x=layers, y=full_ratio, name="Full MSE ratio", mode="lines+markers"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=layers, y=post_ratio, name="Post MSE ratio", mode="lines+markers"), row=2, col=2)
+    fig.add_trace(
+        go.Scatter(
+            x=layers, y=[1.0] * len(layers), mode="lines",
+            line=dict(color="gray", dash="dash", width=1), showlegend=False,
+        ),
+        row=2, col=2,
+    )
+
+    fig.update_yaxes(title_text="Similarity [0–1]", row=1, col=1)
+    fig.update_yaxes(title_text="Δ similarity", row=1, col=2)
+    fig.update_yaxes(title_text="Angle (°)", row=2, col=1)
+    fig.update_yaxes(title_text="Off-diag / diag", row=2, col=2)
+    for c in [1, 2]:
+        fig.update_xaxes(title_text="Layer", row=2, col=c)
+
+    fig.update_layout(
+        title=(
+            "Alignment metric comparison per layer<br>"
+            "<sup>Full-probe off-diagonal means; small angle and high cosine = better alignment</sup>"
+        ),
+        height=700,
+        width=1000,
+        showlegend=True,
+        margin=dict(t=110, b=40, l=60, r=40),
     )
     fig.write_image(str(Path(path).with_suffix(".png")))
 
@@ -332,6 +440,8 @@ def main() -> None:
 
     # ── Phase 3: Cross-MSE and subspace similarity matrices ───────────────────
     results: dict[int, dict] = {}
+    alignment_summary: dict[str, dict] = {}
+    canonical_metrics: dict[str, dict] = {}
 
     for layer in config.layer_indices:
         full_prs = full_probes_done[layer]
@@ -342,7 +452,6 @@ def main() -> None:
             [pr.activations[pr.test_split_idx:] for pr in full_prs],
             [pr.gt_belief_states[pr.test_split_idx:] for pr in full_prs],
         )
-
         post_cross = cross_mse_matrix(
             post_prs,
             [pr.activations[pr.test_split_idx:] for pr in post_prs],
@@ -351,11 +460,29 @@ def main() -> None:
         full_sim = pairwise_cosine_sim_matrix(full_prs)
         post_sim = pairwise_cosine_sim_matrix(post_prs)
 
+        full_angles_deg, full_mean_angles, full_mean_angles_2 = pairwise_principal_angles(full_prs)
+        post_angles_deg, post_mean_angles, post_mean_angles_2 = pairwise_principal_angles(post_prs)
+
+        logger.info(f"  Layer {layer}: computing activation covariance + Mahalanobis ...")
+        sigma = compute_activation_covariance(
+            [pr.activations for pr in post_prs],
+            shrinkage=config.mahalanobis_shrinkage,
+        )
+        full_mahal_sim = pairwise_mahalanobis_cosine_sim(full_prs, sigma)
+        post_mahal_sim = pairwise_mahalanobis_cosine_sim(post_prs, sigma)
+        del sigma
+
         mask = ~np.eye(M, dtype=bool)
         full_diag = float(np.diag(full_cross).mean())
         full_off = float(full_cross[mask].mean())
         post_diag = float(np.diag(post_cross).mean())
         post_off = float(post_cross[mask].mean())
+
+        row_off_diag = np.array([full_cross[i][mask[i]].mean() for i in range(M)])
+        canonical_idx = int(np.argmin(row_off_diag))
+
+        off_angles_full = full_angles_deg[mask]   # (N*(N-1), n_states)
+        off_angles_post = post_angles_deg[mask]
 
         results[layer] = {
             "full_cross_mse": full_cross,
@@ -368,6 +495,70 @@ def main() -> None:
             "post_diag_mean": post_diag,
             "post_off_diag_mean": post_off,
             "post_ratio": post_off / (post_diag + 1e-10),
+            "full_mean_angle": full_mean_angles,
+            "post_mean_angle": post_mean_angles,
+            "full_mean_angle_2": full_mean_angles_2,
+            "post_mean_angle_2": post_mean_angles_2,
+            "full_principal_angles_deg": full_angles_deg,
+            "post_principal_angles_deg": post_angles_deg,
+            "full_mahal_sim": full_mahal_sim,
+            "post_mahal_sim": post_mahal_sim,
+            "canonical_idx": canonical_idx,
+            "full_off_diag_sim_mean": float(full_sim[mask].mean()),
+            "full_off_diag_mahal_mean": float(full_mahal_sim[mask].mean()),
+            "full_off_diag_mean_angle_deg": float(full_mean_angles[mask].mean()),
+            "full_off_diag_mean_angle_2_deg": float(full_mean_angles_2[mask].mean()),
+            "post_off_diag_sim_mean": float(post_sim[mask].mean()),
+            "post_off_diag_mahal_mean": float(post_mahal_sim[mask].mean()),
+            "post_off_diag_mean_angle_deg": float(post_mean_angles[mask].mean()),
+            "post_off_diag_mean_angle_2_deg": float(post_mean_angles_2[mask].mean()),
+        }
+
+        alignment_summary[str(layer)] = {
+            "full": {
+                "theta1_off_diag_mean_deg": float(off_angles_full[:, 0].mean()),
+                "theta1_off_diag_std_deg": float(off_angles_full[:, 0].std()),
+                "theta2_off_diag_mean_deg": float(off_angles_full[:, 1].mean()),
+                "theta2_off_diag_std_deg": float(off_angles_full[:, 1].std()),
+                "theta3_off_diag_mean_deg": float(off_angles_full[:, 2].mean()),
+                "theta3_off_diag_std_deg": float(off_angles_full[:, 2].std()),
+                "mean_2_angle_off_diag_deg": float(off_angles_full[:, :2].mean()),
+                "mean_3_angle_off_diag_deg": float(full_mean_angles[mask].mean()),
+                "vanilla_cosine_off_diag_mean": float(full_sim[mask].mean()),
+                "vanilla_cosine_off_diag_std": float(full_sim[mask].std()),
+                "mahalanobis_cosine_off_diag_mean": float(full_mahal_sim[mask].mean()),
+                "mahalanobis_cosine_off_diag_std": float(full_mahal_sim[mask].std()),
+                "mahalanobis_minus_vanilla_off_diag_mean": float((full_mahal_sim - full_sim)[mask].mean()),
+                "cross_mse_ratio": results[layer]["full_ratio"],
+            },
+            "post": {
+                "theta1_off_diag_mean_deg": float(off_angles_post[:, 0].mean()),
+                "theta1_off_diag_std_deg": float(off_angles_post[:, 0].std()),
+                "theta2_off_diag_mean_deg": float(off_angles_post[:, 1].mean()),
+                "theta2_off_diag_std_deg": float(off_angles_post[:, 1].std()),
+                "theta3_off_diag_mean_deg": float(off_angles_post[:, 2].mean()),
+                "theta3_off_diag_std_deg": float(off_angles_post[:, 2].std()),
+                "mean_2_angle_off_diag_deg": float(off_angles_post[:, :2].mean()),
+                "mean_3_angle_off_diag_deg": float(post_mean_angles[mask].mean()),
+                "vanilla_cosine_off_diag_mean": float(post_sim[mask].mean()),
+                "vanilla_cosine_off_diag_std": float(post_sim[mask].std()),
+                "mahalanobis_cosine_off_diag_mean": float(post_mahal_sim[mask].mean()),
+                "mahalanobis_cosine_off_diag_std": float(post_mahal_sim[mask].std()),
+                "mahalanobis_minus_vanilla_off_diag_mean": float((post_mahal_sim - post_sim)[mask].mean()),
+                "cross_mse_ratio": results[layer]["post_ratio"],
+            },
+        }
+
+        canonical_pr = full_probes_done[layer][canonical_idx]
+        canonical_mask_row = mask[canonical_idx]
+        canonical_metrics[str(layer)] = {
+            "seq_idx": canonical_idx,
+            "save_path": str(Path("probes") / "canonical" / f"layer_{layer}"),
+            "test_mse": float(canonical_pr.test_mse),
+            "mean_cross_mse_to_others": float(row_off_diag[canonical_idx]),
+            "vanilla_cosine_to_others_mean": float(full_sim[canonical_idx][canonical_mask_row].mean()),
+            "mahalanobis_cosine_to_others_mean": float(full_mahal_sim[canonical_idx][canonical_mask_row].mean()),
+            "mean_principal_angle_to_others_deg": float(full_mean_angles[canonical_idx][canonical_mask_row].mean()),
         }
 
         logger.info(
@@ -375,7 +566,15 @@ def main() -> None:
             f"full ratio={results[layer]['full_ratio']:.3f} "
             f"(diag={full_diag:.4f}, off={full_off:.4f})  |  "
             f"post ratio={results[layer]['post_ratio']:.3f} "
-            f"(diag={post_diag:.4f}, off={post_off:.4f})"
+            f"(diag={post_diag:.4f}, off={post_off:.4f})  |  "
+            f"vanilla_cos={results[layer]['full_off_diag_sim_mean']:.3f}  "
+            f"mahal_cos={results[layer]['full_off_diag_mahal_mean']:.3f}  "
+            f"θ₁={float(off_angles_full[:, 0].mean()):.1f}° "
+            f"θ₂={float(off_angles_full[:, 1].mean()):.1f}° "
+            f"θ₃={float(off_angles_full[:, 2].mean()):.1f}° "
+            f"mean₂={results[layer]['full_off_diag_mean_angle_2_deg']:.1f}° "
+            f"mean₃={results[layer]['full_off_diag_mean_angle_deg']:.1f}°  "
+            f"canonical_seq={canonical_idx}"
         )
 
     # ── Save probes ───────────────────────────────────────────────────────────
@@ -390,20 +589,55 @@ def main() -> None:
     else:
         logger.info("Skipping ProbeResults save (save_probes=False)")
 
+    # ── Always save canonical probes ──────────────────────────────────────────
+    logger.info("Saving canonical probes ...")
+    for layer in config.layer_indices:
+        canonical_idx = results[layer]["canonical_idx"]
+        canonical_pr = full_probes_done[layer][canonical_idx]
+        canonical_pr.save(out_dir / "probes" / "canonical" / f"layer_{layer}")
+
     # ── Save scalar results ───────────────────────────────────────────────────
-    serialisable = {
-        str(l): {
+    serialisable: dict[str, dict] = {}
+    for l in config.layer_indices:
+        mask = ~np.eye(M, dtype=bool)
+        off_full = results[l]["full_principal_angles_deg"][mask]
+        off_post = results[l]["post_principal_angles_deg"][mask]
+        serialisable[str(l)] = {
             "full_diag_mean": results[l]["full_diag_mean"],
             "full_off_diag_mean": results[l]["full_off_diag_mean"],
             "full_ratio": results[l]["full_ratio"],
             "post_diag_mean": results[l]["post_diag_mean"],
             "post_off_diag_mean": results[l]["post_off_diag_mean"],
             "post_ratio": results[l]["post_ratio"],
+            "full_principal_angles": {
+                "theta_1_mean": float(off_full[:, 0].mean()),
+                "theta_1_std": float(off_full[:, 0].std()),
+                "theta_2_mean": float(off_full[:, 1].mean()),
+                "theta_2_std": float(off_full[:, 1].std()),
+                "theta_3_mean": float(off_full[:, 2].mean()),
+                "theta_3_std": float(off_full[:, 2].std()),
+                "mean_2_angle": float(off_full[:, :2].mean()),
+                "mean_3_angle": float(off_full.mean()),
+            },
+            "post_principal_angles": {
+                "theta_1_mean": float(off_post[:, 0].mean()),
+                "theta_1_std": float(off_post[:, 0].std()),
+                "theta_2_mean": float(off_post[:, 1].mean()),
+                "theta_2_std": float(off_post[:, 1].std()),
+                "theta_3_mean": float(off_post[:, 2].mean()),
+                "theta_3_std": float(off_post[:, 2].std()),
+                "mean_2_angle": float(off_post[:, :2].mean()),
+                "mean_3_angle": float(off_post.mean()),
+            },
         }
-        for l in config.layer_indices
-    }
     with open(out_dir / "compare_results.json", "w") as f:
         json.dump(serialisable, f, indent=2)
+
+    with open(out_dir / "alignment_summary.json", "w") as f:
+        json.dump(alignment_summary, f, indent=2)
+
+    with open(out_dir / "canonical_probes.json", "w") as f:
+        json.dump(canonical_metrics, f, indent=2)
 
     # ── Save matrices ─────────────────────────────────────────────────────────
     np.savez(
@@ -412,6 +646,14 @@ def main() -> None:
         **{f"layer_{l}_post_cross_mse": results[l]["post_cross_mse"] for l in config.layer_indices},
         **{f"layer_{l}_full_similarity": results[l]["full_similarity"] for l in config.layer_indices},
         **{f"layer_{l}_post_similarity": results[l]["post_similarity"] for l in config.layer_indices},
+        **{f"layer_{l}_full_mean_angle": results[l]["full_mean_angle"] for l in config.layer_indices},
+        **{f"layer_{l}_post_mean_angle": results[l]["post_mean_angle"] for l in config.layer_indices},
+        **{f"layer_{l}_full_mean_angle_2": results[l]["full_mean_angle_2"] for l in config.layer_indices},
+        **{f"layer_{l}_post_mean_angle_2": results[l]["post_mean_angle_2"] for l in config.layer_indices},
+        **{f"layer_{l}_full_principal_angles": results[l]["full_principal_angles_deg"] for l in config.layer_indices},
+        **{f"layer_{l}_post_principal_angles": results[l]["post_principal_angles_deg"] for l in config.layer_indices},
+        **{f"layer_{l}_full_mahal_sim": results[l]["full_mahal_sim"] for l in config.layer_indices},
+        **{f"layer_{l}_post_mahal_sim": results[l]["post_mahal_sim"] for l in config.layer_indices},
     )
 
     # ── Plots ─────────────────────────────────────────────────────────────────
@@ -454,6 +696,52 @@ def main() -> None:
 
     plot_mse_ratio(results, config.layer_indices, fig_dir / "mse_ratio_per_layer")
     plot_diag_vs_offdiag(results, config.layer_indices, fig_dir / "diag_vs_offdiag_per_layer")
+
+    _heatmap_grid(
+        {l: results[l]["full_mean_angle"] for l in config.layer_indices},
+        config.layer_indices,
+        title="Mean principal angle (θ₁,θ₂,θ₃) — full probes",
+        path=fig_dir / "principal_angles_full",
+        colorscale="Viridis",
+    )
+    _heatmap_grid(
+        {l: results[l]["post_mean_angle"] for l in config.layer_indices},
+        config.layer_indices,
+        title="Mean principal angle (θ₁,θ₂,θ₃) — post-threshold probes",
+        path=fig_dir / "principal_angles_post",
+        colorscale="Viridis",
+    )
+    _heatmap_grid(
+        {l: results[l]["full_mean_angle_2"] for l in config.layer_indices},
+        config.layer_indices,
+        title="Mean principal angle (θ₁,θ₂) — full probes",
+        path=fig_dir / "principal_angles_2_full",
+        colorscale="Viridis",
+    )
+    _heatmap_grid(
+        {l: results[l]["post_mean_angle_2"] for l in config.layer_indices},
+        config.layer_indices,
+        title="Mean principal angle (θ₁,θ₂) — post-threshold probes",
+        path=fig_dir / "principal_angles_2_post",
+        colorscale="Viridis",
+    )
+    _heatmap_grid(
+        {l: results[l]["full_mahal_sim"] for l in config.layer_indices},
+        config.layer_indices,
+        title="Mahalanobis cosine similarity (full-sequence probes) — entry [i,j]: mean |diag| in whitened space",
+        path=fig_dir / "mahalanobis_cosine_full",
+        colorscale="Blues",
+        zrange=(0.0, 1.0),
+    )
+    _heatmap_grid(
+        {l: results[l]["post_mahal_sim"] for l in config.layer_indices},
+        config.layer_indices,
+        title="Mahalanobis cosine similarity (post-threshold probes) — entry [i,j]: mean |diag| in whitened space",
+        path=fig_dir / "mahalanobis_cosine_post",
+        colorscale="Blues",
+        zrange=(0.0, 1.0),
+    )
+    plot_alignment_comparison(results, config.layer_indices, fig_dir / "alignment_comparison")
 
     # Belief geometry: show every 4th layer + last to keep plot size manageable
     plot_layers = sorted(set(config.layer_indices[::4] + [config.layer_indices[-1]]))
