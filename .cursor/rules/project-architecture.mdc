@@ -1,0 +1,15 @@
+---
+description: Project architecture, experiment conventions, and output structure
+alwaysApply: true
+---
+
+# Project Architecture
+
+Read `README.md` before writing any new experiment scripts or src modules. It documents the full repository layout, import conventions, config schema, and the `outputs/` vs `results/` distinction.
+
+Key points:
+
+- `src/` contains shared infrastructure. Experiment scripts add `src/` to `sys.path` and import directly (e.g. `from probes import ...`, `from metrics.probe_metrics import ...`).
+- Experiment scripts live in `experiments/` and are paired 1:1 with a config YAML in `experiments/configs/`.
+- Raw outputs go to `outputs/dani/YYYYMMDD_HHMMSS_<name>/` (gitignored). Use `setup_output_dir()` from `src/experiment.py`.
+- Significant results are manually copied (config, log, JSONs, figures — no large binaries) into `results/YYYYMMDD_HHMMSS_<name>/` which is tracked in git.
