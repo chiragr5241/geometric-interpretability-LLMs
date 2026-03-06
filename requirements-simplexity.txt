@@ -1,0 +1,6 @@
+# Simplexity and JAX (requires Python >= 3.12).
+# Use only after: pip install -r requirements.txt
+# Then: pip install -r requirements-simplexity.txt  (with Python 3.12+)
+jax>=0.4.0
+jaxlib>=0.4.0
+simplexity @ git+https://github.com/Astera-org/simplexity.git
