@@ -77,9 +77,9 @@ Thumbs.db
 
 # Output files
 outputs/*
-*.png
-*.jpg
-*.jpeg
+# *.png
+# *.jpg
+# *.jpeg
 
 # Logs
 *.log
