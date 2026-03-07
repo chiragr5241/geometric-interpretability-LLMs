@@ -76,7 +76,7 @@ Thumbs.db
 *.safetensors
 
 # Output files
-outputs/
+outputs/*
 *.png
 *.jpg
 *.jpeg
