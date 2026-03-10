@@ -1,0 +1,15 @@
+experiment_name: token_probability_diagnostic
+hmm:
+  process_name: mess3
+  process_params:
+    x: 0.05
+    alpha: 0.9
+model_name: meta-llama/Llama-3.2-3B
+n_sequences: 50
+seq_length: 500
+vocab_mapping:
+  A: 0
+  B: 1
+  C: 2
+top_k_report: 50
+top_k_heatmap: 20

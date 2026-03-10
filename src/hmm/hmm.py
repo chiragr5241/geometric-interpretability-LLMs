@@ -5,7 +5,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def _get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+device = _get_device()
 
 
 def belief_to_hex(belief):
@@ -158,6 +167,10 @@ class Mess3HMM:
 
     def __init__(self, vocab_mapping=None, seed=42):
         self.seed = seed
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
         self.tokens = ['A', 'B', 'C']
         self.states = ['1', '2', '3']
         self.num_states = len(self.states)
@@ -230,11 +243,6 @@ class Mess3HMM:
             tokens, tokens_y if return_states=False
             tokens, tokens_y, states if return_states=True
         """
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(self.seed)
-
         vocab_size, n_states, _ = self.T_3d_matrix.shape
         prior = torch.ones(n_states, dtype=torch.float, device=device) / n_states
 

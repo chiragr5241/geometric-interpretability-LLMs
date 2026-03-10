@@ -76,10 +76,10 @@ Thumbs.db
 *.safetensors
 
 # Output files
-outputs/
-*.png
-*.jpg
-*.jpeg
+outputs/*
+# *.png
+# *.jpg
+# *.jpeg
 
 # Logs
 *.log
