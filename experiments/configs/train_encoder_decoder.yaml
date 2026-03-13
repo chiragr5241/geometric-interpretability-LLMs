@@ -1,0 +1,38 @@
+experiment_name: train_encoder_decoder
+
+n_train_sequences: 15
+n_eval_sequences: 5
+seq_length: 400
+post_convergence_start: 100
+pooled_probes: true
+
+hmm:
+  process_name: mess3
+  process_params:
+    x: 0.05
+    alpha: 0.9
+
+model_name: "meta-llama/Llama-3.2-3B"
+n_ctx_override: 10000
+
+# Layers 0–15 (every layer) + sparse upper layers
+layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 19, 21, 23, 25, 27]
+
+encoder_params:
+  lr: 1.0e-3
+  epochs: 1000
+
+decoder_params:
+  lr: 1.0e-3
+  epochs: 3000
+
+max_probes_per_batch: 22
+max_decoders_per_batch: 4
+
+vocab_mapping:
+  "A": 0
+  "B": 1
+  "C": 2
+
+# Layers for which to generate simplex scatter plots (eval data)
+simplex_layers: [0, 3, 5, 10, 15, 27]
