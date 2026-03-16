@@ -360,28 +360,32 @@ def main() -> None:
         )
 
     # ── Phase 3: Train encoders ─────────────────────────────────────────────
-    enc_p = config.encoder_params
+    encoder_params = config.encoder_params
     logger.info(
-        f"Phase 3: training encoders (lr={enc_p.get('lr', 1e-3)}, "
-        f"epochs={enc_p.get('epochs', 1000)}) ..."
+        f"Phase 3: training encoders (lr={encoder_params.get('lr', 1e-3)}, "
+        f"epochs={encoder_params.get('epochs', 1000)}) ..."
     )
     pooled_encoder_results: dict[int, ProbeResult] = train_probes_batched(
         pooled_encoder_inputs,
-        lr=enc_p.get("lr", 1e-3),
-        epochs=enc_p.get("epochs", 1000),
+        lr=encoder_params.get("lr", 1e-3),
+        epochs=encoder_params.get("epochs", 1000),
         max_probes_per_batch=config.max_probes_per_batch,
     )
 
     # ── Phase 4: Train decoders ─────────────────────────────────────────────
-    dec_p = config.decoder_params
+    decoder_params = config.decoder_params
     logger.info(
-        f"Phase 4: training decoders (lr={dec_p.get('lr', 1e-3)}, "
-        f"epochs={dec_p.get('epochs', 1000)}) ..."
+        f"Phase 4: training decoders (lr={decoder_params.get('lr', 1e-3)}, "
+        f"max_epochs={decoder_params.get('max_epochs', 1000)}, "
+        f"patience={decoder_params.get('patience', 200)}, "
+        f"min_relative_improvement={decoder_params.get('min_relative_improvement', 1e-3)}) ..."
     )
     pooled_decoder_results: dict[int, DecoderResult] = train_decoders_batched(
         pooled_decoder_inputs,
-        lr=dec_p.get("lr", 1e-3),
-        epochs=dec_p.get("epochs", 1000),
+        lr=decoder_params.get("lr", 1e-3),
+        max_epochs=decoder_params.get("max_epochs", 1000),
+        patience=decoder_params.get("patience", 200),
+        min_relative_improvement=decoder_params.get("min_relative_improvement", 1e-3),
         max_decoders_per_batch=config.max_decoders_per_batch,
     )
 
