@@ -99,6 +99,7 @@ Experiment scripts live in `experiments/` and are paired with a config in `exper
 ```bash
 # from the repo root
 python experiments/probes_full_seq_vs_kl_threshold.py experiments/configs/probes_full_seq_vs_kl_threshold.yaml
+python experiments/activation_steering.py experiments/configs/activation_steering.yaml
 ```
 
 Output is written to `outputs/dani/YYYYMMDD_HHMMSS_<experiment_name>/`.
@@ -134,6 +135,20 @@ Inherits all fields from Experiment 1, plus:
 | Field | Description |
 |---|---|
 | `n_sequences` | Number of sequences to generate and compare |
+
+**`ActivationSteeringConfig`**
+
+| Field | Description |
+|---|---|
+| `encoder_decoder_dir` | Directory containing pooled encoder/decoder artifacts from `train_encoder_decoder.py` |
+| `layer_indices` | Layers at which to add steering vectors |
+| `seq_length` | Sequence length per forward pass |
+| `n_sequences` | Number of source sequences to evaluate |
+| `batch_size` | Batch size for clean and steered forward passes |
+| `n_donors` | Number of donor sequences sampled per source for past-consistent and garbage-valid conditions |
+| `n_random_samples` | Number of random simplex targets per source for garbage-random steering |
+| `k_values` | Suffix lengths used for past-consistent multi-position steering |
+| `vocab_mapping` | Maps HMM token string -> HMM output index |
 
 ## Key components
 
