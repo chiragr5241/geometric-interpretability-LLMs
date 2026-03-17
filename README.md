@@ -57,7 +57,7 @@ geometric_interpretability_LLMs/
 │   └── dani ICLR/              # Exploratory notebooks
 │
 ├── outputs/                    # All raw experiment outputs — gitignored
-│   └── dani/
+│   └── chirag/
 │       └── YYYYMMDD_HHMMSS_<experiment_name>/
 │           ├── config.json     # Copy of the config used
 │           ├── experiment.log

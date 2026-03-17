@@ -75,13 +75,15 @@ def load_model(
         transformers.TRANSFORMERS_CACHE = HF_HUB_CACHE
     from transformer_lens import HookedTransformer
 
-    dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
-    logger.info(f"Loading '{model_name}' on {device} with dtype={dtype} ...")
+    dtype = torch.float32 if device.type == "cpu" else torch.float16
+    n_devices = min(torch.cuda.device_count(), 4) if device.type == "cuda" else 1
+    logger.info(f"Loading '{model_name}' on {device} with dtype={dtype}, n_devices={n_devices} ...")
     t0 = time.time()
     model = HookedTransformer.from_pretrained(
         model_name,
         dtype=dtype,
         device=str(device),
+        n_devices=n_devices,
     )
     if n_ctx is not None:
         _extend_model_context(model, n_ctx)

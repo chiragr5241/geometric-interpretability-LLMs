@@ -34,7 +34,7 @@ def load_config(path: str, cls: type[C]) -> C:
 
 def setup_output_dir(config: ExperimentConfig) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path("outputs") / "dani" / f"{timestamp}_{config.experiment_name}"
+    out_dir = Path("outputs") / "chirag" / f"{timestamp}_{config.experiment_name}" # Name needs to be dynamically generated
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "probes").mkdir(exist_ok=True)
     with open(out_dir / "config.yaml", "w") as f:
