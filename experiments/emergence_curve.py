@@ -36,7 +36,12 @@ from experiment_utils import (
     setup_logging,
 )
 from hmm.hmm import Mess3HMM
-from metrics.probe_metrics import compute_kl, find_kl_threshold
+from metrics.probe_metrics import (
+    compute_auc_quantile_positions,
+    compute_kl,
+    compute_r2_kl_ccf,
+    find_kl_threshold,
+)
 from probes import Probe, ProbeResult
 
 
@@ -54,7 +59,16 @@ class EmergenceCurveConfig(ExperimentConfig):
     simplex_positions: list[int]
     kl_params: dict
     vocab_mapping: dict[str, int]
+    ccf_max_lag: int = 200
+    ccf_smooth_window: int = 15
+    ccf_n_tokens: int = 150
+    auc_quantiles: list[float] = None
     n_ctx_override: int | None = None
+    strip_bos: bool = True
+
+    def __post_init__(self) -> None:
+        if self.auc_quantiles is None:
+            self.auc_quantiles = [0.50, 0.90, 0.95, 0.99]
 
 
 # ── Computation helpers ──────────────────────────────────────────────────────────
@@ -321,6 +335,265 @@ def _plot_lag_summary(
     fig.write_image(str(path.with_suffix(".png")))
 
 
+def _layer_colors(layer_indices: list[int]) -> list[str]:
+    import plotly.colors as pc
+    n = len(layer_indices)
+    return pc.sample_colorscale("Plasma", [i / max(n - 1, 1) for i in range(n)])
+
+
+_SYMLOG_TICK_VALS: list[float] = [-1000, -100, -10, -1, 0, 1]
+
+
+def _symlog(x: np.ndarray) -> np.ndarray:
+    return np.sign(x) * np.log10(1.0 + np.abs(x))
+
+
+def _symlog_ticks() -> tuple[list[float], list[str]]:
+    positions = [float(np.sign(v) * np.log10(1.0 + abs(v))) for v in _SYMLOG_TICK_VALS]
+    labels = [str(int(v)) for v in _SYMLOG_TICK_VALS]
+    return positions, labels
+
+
+def _plot_auc_curves(
+    n_tok: int,
+    layer_indices: list[int],
+    r2_raw_mean: dict[int, np.ndarray],
+    r2_raw_std: dict[int, np.ndarray],
+    r2_norm_mean: dict[int, np.ndarray],
+    r2_norm_std: dict[int, np.ndarray],
+    kl_raw_mean: np.ndarray,
+    kl_raw_std: np.ndarray,
+    kl_norm_mean: np.ndarray,
+    kl_norm_std: np.ndarray,
+    path: Path,
+) -> None:
+    """2-panel figure: unnormalized (top) and [0,1]-normalized (bottom) convergence curves.
+
+    Shows R² per layer and −KL (shared) over the first n_tok tokens.
+    These are the raw inputs to the AUC quantile computation.
+    The unnormalized panel uses a symlog y-axis (sign(x)*log10(1+|x|)) so that
+    the deep-negative transient is compressed without hiding positive values.
+    """
+    colors = _layer_colors(layer_indices)
+    tokens = np.arange(1, n_tok + 1)
+    kl_color = "firebrick"
+    symlog_tick_pos, symlog_tick_lab = _symlog_ticks()
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        subplot_titles=["Unnormalized (symlog y)", "Normalized [0, 1]"],
+        vertical_spacing=0.10,
+    )
+
+    for panel, (r2_means, r2_stds, kl_m, kl_s) in enumerate([
+        (r2_raw_mean, r2_raw_std, kl_raw_mean, kl_raw_std),
+        (r2_norm_mean, r2_norm_std, kl_norm_mean, kl_norm_std),
+    ], start=1):
+        use_symlog = panel == 1
+        _t = _symlog if use_symlog else (lambda x: x)
+
+        # KL band + mean (dashed, no legend duplication)
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([tokens, tokens[::-1]]),
+            y=np.concatenate([_t(kl_m + kl_s), _t((kl_m - kl_s))[::-1]]),
+            fill="toself",
+            fillcolor="rgba(180,34,34,0.10)",
+            line=dict(width=0),
+            showlegend=False, hoverinfo="skip", mode="lines",
+        ), row=panel, col=1)
+        fig.add_trace(go.Scatter(
+            x=tokens, y=_t(kl_m),
+            name="−KL",
+            line=dict(color=kl_color, width=2, dash="dash"),
+            mode="lines",
+            showlegend=(panel == 1),
+            legendgroup="kl",
+        ), row=panel, col=1)
+
+        # R² per layer
+        for color, layer in zip(colors, layer_indices):
+            m = r2_means[layer]
+            s = r2_stds[layer]
+            fig.add_trace(go.Scatter(
+                x=np.concatenate([tokens, tokens[::-1]]),
+                y=np.concatenate([_t(m + s), _t((m - s))[::-1]]),
+                fill="toself",
+                fillcolor=color.replace("rgb", "rgba").replace(")", ",0.10)"),
+                line=dict(width=0),
+                showlegend=False, hoverinfo="skip", mode="lines",
+            ), row=panel, col=1)
+            fig.add_trace(go.Scatter(
+                x=tokens, y=_t(m),
+                name=f"Layer {layer}",
+                line=dict(color=color, width=1.6),
+                mode="lines",
+                showlegend=(panel == 1),
+                legendgroup=str(layer),
+            ), row=panel, col=1)
+
+    fig.update_xaxes(title_text="Position (tokens)", row=2, col=1)
+    fig.update_yaxes(
+        title_text="Value (symlog)",
+        tickvals=symlog_tick_pos,
+        ticktext=symlog_tick_lab,
+        row=1, col=1,
+    )
+    fig.update_yaxes(title_text="Normalized value", row=2, col=1)
+    fig.update_layout(
+        title=(
+            f"AUC convergence curves — first {n_tok} tokens<br>"
+            "<sup>R² per layer (solid) and −KL (dashed); "
+            "shaded = ±1 std across sequences</sup>"
+        ),
+        height=650, width=900,
+        margin=dict(t=90, b=60, l=70, r=40),
+        legend=dict(
+            orientation="v", x=1.02, xanchor="left",
+            y=1.0, yanchor="top",
+            bgcolor="rgba(255,255,255,0.0)",
+        ),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
+def _plot_cross_correlation_by_layer(
+    lags: np.ndarray,
+    layer_indices: list[int],
+    ccf_raw_mean: dict[int, np.ndarray],
+    ccf_raw_std: dict[int, np.ndarray],
+    ccf_deriv_mean: dict[int, np.ndarray],
+    ccf_deriv_std: dict[int, np.ndarray],
+    path: Path,
+) -> None:
+    """2-panel CCF figure: raw signals (top), derivatives (bottom), one series per layer."""
+    colors = _layer_colors(layer_indices)
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        subplot_titles=["CCF — raw signals (R² vs −KL)", "CCF — derivatives"],
+        vertical_spacing=0.12,
+    )
+
+    for color, layer in zip(colors, layer_indices):
+        raw_m = ccf_raw_mean[layer]
+        raw_s = ccf_raw_std[layer]
+        deriv_m = ccf_deriv_mean[layer]
+        deriv_s = ccf_deriv_std[layer]
+
+        show_legend = True
+        for row, (m, s) in enumerate([(raw_m, raw_s), (deriv_m, deriv_s)], start=1):
+            # Shaded band
+            fig.add_trace(go.Scatter(
+                x=np.concatenate([lags, lags[::-1]]),
+                y=np.concatenate([m + s, (m - s)[::-1]]),
+                fill="toself",
+                fillcolor=color.replace("rgb", "rgba").replace(")", ",0.12)"),
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+                mode="lines",
+            ), row=row, col=1)
+            # Mean curve
+            fig.add_trace(go.Scatter(
+                x=lags, y=m,
+                name=f"Layer {layer}",
+                line=dict(color=color, width=1.8),
+                mode="lines",
+                showlegend=show_legend,
+                legendgroup=str(layer),
+            ), row=row, col=1)
+            show_legend = False
+
+    fig.add_vline(x=0, line_color="black", line_width=1, line_dash="dot", row="all", col=1)
+
+    fig.update_xaxes(title_text="Lag τ (tokens)", row=2, col=1)
+    fig.update_yaxes(title_text="CCF", row=1, col=1)
+    fig.update_yaxes(title_text="CCF (deriv)", row=2, col=1)
+    fig.update_layout(
+        title=(
+            "Cross-correlation R²(t) vs −KL(t) per layer<br>"
+            "<sup>Positive peak τ → geometry lags KL; negative → geometry leads</sup>"
+        ),
+        height=600, width=900,
+        margin=dict(t=90, b=60, l=70, r=40),
+        legend=dict(
+            orientation="v", x=1.02, xanchor="left",
+            y=1.0, yanchor="top",
+            bgcolor="rgba(255,255,255,0.0)",
+        ),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
+def _plot_combined_lag(
+    layer_indices: list[int],
+    ccf_peak_lags: list[float],
+    auc_lag_means: dict[int, np.ndarray],
+    auc_lag_stds: dict[int, np.ndarray],
+    auc_quantiles: list[float],
+    path: Path,
+) -> None:
+    """Multi-series lag plot: CCF peak lag + AUC-quantile lags per layer."""
+    x_labels = [str(l) for l in layer_indices]
+
+    series_colors = ["black", "steelblue", "darkorange", "seagreen", "firebrick"]
+    series_names = ["CCF peak"] + [f"AUC-{int(q * 100)}" for q in auc_quantiles]
+
+    ccf_y = ccf_peak_lags
+    auc_ys = [
+        [float(auc_lag_means[l][i]) for l in layer_indices]
+        for i in range(len(auc_quantiles))
+    ]
+    auc_errs = [
+        [float(auc_lag_stds[l][i]) for l in layer_indices]
+        for i in range(len(auc_quantiles))
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x_labels, y=ccf_y,
+        name=series_names[0],
+        mode="lines+markers",
+        line=dict(color=series_colors[0], width=2),
+        marker=dict(size=7),
+    ))
+    for i, (name, color, ys, errs) in enumerate(
+        zip(series_names[1:], series_colors[1:], auc_ys, auc_errs)
+    ):
+        fig.add_trace(go.Scatter(
+            x=x_labels, y=ys,
+            name=name,
+            mode="lines+markers",
+            line=dict(color=color, width=2),
+            marker=dict(size=7),
+            error_y=dict(type="data", array=errs, visible=True,
+                         color=color, thickness=1.2, width=4),
+        ))
+
+    fig.add_hline(y=0, line_color="black", line_width=1)
+    fig.update_layout(
+        title=(
+            "Lag per layer — threshold-free metrics<br>"
+            "<sup>Positive = geometry lags KL; Negative = geometry leads KL</sup>"
+        ),
+        xaxis_title="Layer",
+        yaxis_title="Lag (tokens)",
+        height=700, width=820,
+        margin=dict(t=80, b=80, l=70, r=40),
+        legend=dict(
+            orientation="h",
+            x=0.0, xanchor="left",
+            y=-0.12, yanchor="top",
+            bgcolor="rgba(255,255,255,0.0)",
+        ),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
 # ── Simplex trajectory helpers ───────────────────────────────────────────────────
 
 def _to_barycentric(b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -472,8 +745,16 @@ def main() -> None:
 
     first_tok_id, mid_tok_ids = resolve_hmm_token_ids(model, idx_to_token, n_hmm_tokens, logger)
 
-    # Clip simplex positions to valid range
-    valid_simplex_pos: list[int] = [p for p in config.simplex_positions if 0 <= p <= L]
+    # Precompute simplex snapshot positions.
+    # Config positions are 1-indexed HMM token positions.
+    # simplex_positions_valid: the position labels used in plots.
+    # simplex_indices: the array indices used to index into acts/beliefs arrays.
+    if config.strip_bos:
+        simplex_positions_valid: list[int] = [p for p in config.simplex_positions if 1 <= p <= L]
+        simplex_indices: list[int] = [p - 1 for p in simplex_positions_valid]
+    else:
+        simplex_positions_valid = [p for p in config.simplex_positions if 0 <= p <= L]
+        simplex_indices = simplex_positions_valid
 
     # ── Per-sequence storage ──────────────────────────────────────────────────
     per_seq_cum_r2: dict[int, list[np.ndarray]] = {l: [] for l in config.layer_indices}
@@ -482,6 +763,17 @@ def main() -> None:
     t_r2_per_seq: dict[int, list[int | None]] = {l: [] for l in config.layer_indices}
     t_kl_per_seq: list[int] = []
     per_seq_kl_smooth: list[np.ndarray] = []
+
+    # CCF per sequence per layer: {layer: list of (ccf_raw, ccf_deriv)}
+    per_seq_ccf: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {
+        l: [] for l in config.layer_indices
+    }
+    # AUC quantile token positions: r2 is per-layer, kl is shared across layers
+    per_seq_auc_r2: dict[int, list[np.ndarray]] = {l: [] for l in config.layer_indices}
+    per_seq_auc_kl: list[np.ndarray] = []
+    # [0,1] normalized curves used for AUC: r2 is per-layer, kl is shared
+    per_seq_r2_norm: dict[int, list[np.ndarray]] = {l: [] for l in config.layer_indices}
+    per_seq_kl_norm: list[np.ndarray] = []
 
     # Simplex trajectory data: [seq_idx] -> {layer: (n_pos, n_states)}
     simplex_preds_all: list[dict[int, np.ndarray]] = []
@@ -526,6 +818,8 @@ def main() -> None:
                 else get_model_probs(logits[b : b + 1], first_tok_id, mid_tok_ids, L)
             )
             optimal_probs = compute_optimal_probs(seq_beliefs, emit)  # (L, n_tokens)
+            if config.strip_bos:
+                seq_beliefs = seq_beliefs[1:]  # (L, n_states) — drop prior/BOS position
 
             _, kl_smooth = compute_kl(
                 model_probs, optimal_probs,
@@ -547,8 +841,18 @@ def main() -> None:
                 simplex_preds_seq: dict[int, np.ndarray] = {}
                 simplex_beliefs_seq: dict[int, np.ndarray] = {}
 
+            # KL truncation and AUC computed once per sequence (shared across layers)
+            n_tok = config.ccf_n_tokens
+            kl_trunc = kl_smooth[:n_tok]   # shape (n_tok,)
+            auc_kl, kl_norm = compute_auc_quantile_positions(-kl_trunc, config.auc_quantiles)
+            per_seq_auc_kl.append(auc_kl)
+            per_seq_kl_norm.append(kl_norm)
+
             for layer in config.layer_indices:
                 acts = cache[f"blocks.{layer}.hook_resid_post"][b].float().cpu().numpy()
+                if config.strip_bos:
+                    acts = acts[1:]  # (L, d_model) — drop BOS position
+
                 se, preds = _apply_probe(probes[layer].probe, acts, seq_beliefs)
                 cum_r2 = _cumulative_r2(se, seq_beliefs)
                 sw_r2 = _sliding_r2(se, seq_beliefs, config.sliding_window)
@@ -559,14 +863,27 @@ def main() -> None:
                 per_seq_mse[layer].append(se)
                 t_r2_per_seq[layer].append(t_r2)
 
+                r2_aligned = sw_r2[:n_tok]   # shape (n_tok,)
+                _, ccf_raw, ccf_deriv = compute_r2_kl_ccf(
+                    r2_aligned, kl_trunc,
+                    max_lag=config.ccf_max_lag,
+                    smooth_window=config.ccf_smooth_window,
+                )
+                per_seq_ccf[layer].append((ccf_raw, ccf_deriv))
+
+                # AUC quantile positions and normalized curve for R²
+                auc_r2, r2_norm = compute_auc_quantile_positions(r2_aligned, config.auc_quantiles)
+                per_seq_auc_r2[layer].append(auc_r2)
+                per_seq_r2_norm[layer].append(r2_norm)
+
                 logger.info(
                     f"  Seq {seq_idx + 1} Layer {layer}: t_R²={t_r2}  "
                     f"sw_r2@t_kl={sw_r2[t_kl]:.3f}  cum_r2@t_kl={cum_r2[t_kl]:.3f}"
                 )
 
                 if seq_idx < config.simplex_n_sequences:
-                    simplex_preds_seq[layer] = preds[valid_simplex_pos]
-                    simplex_beliefs_seq[layer] = seq_beliefs[valid_simplex_pos]
+                    simplex_preds_seq[layer] = preds[simplex_indices]
+                    simplex_beliefs_seq[layer] = seq_beliefs[simplex_indices]
 
             if seq_idx < config.simplex_n_sequences:
                 simplex_preds_all.append(simplex_preds_seq)
@@ -596,6 +913,29 @@ def main() -> None:
     lag_means: list[float | None] = []
     lag_stds: list[float | None] = []
     t_r2_reps: list[int | None] = []
+
+    # CCF summary: lags shared, per-layer mean/std arrays
+    ccf_lags: np.ndarray | None = None
+    ccf_raw_mean: dict[int, np.ndarray] = {}
+    ccf_raw_std: dict[int, np.ndarray] = {}
+    ccf_deriv_mean: dict[int, np.ndarray] = {}
+    ccf_deriv_std: dict[int, np.ndarray] = {}
+    ccf_peak_lags: list[float] = []
+
+    # AUC lag summary: {layer: (n_quantiles,) mean lag array}
+    auc_lag_means: dict[int, np.ndarray] = {}
+    auc_lag_stds: dict[int, np.ndarray] = {}
+
+    # AUC curve aggregates for plotting: {layer: (n_tok,) arrays}
+    r2_raw_mean: dict[int, np.ndarray] = {}
+    r2_raw_std: dict[int, np.ndarray] = {}
+    r2_norm_mean: dict[int, np.ndarray] = {}
+    r2_norm_std: dict[int, np.ndarray] = {}
+    # KL curves are layer-independent; computed once after the loop
+    kl_raw_mean: np.ndarray | None = None
+    kl_raw_std: np.ndarray | None = None
+    kl_norm_mean: np.ndarray | None = None
+    kl_norm_std: np.ndarray | None = None
 
     # ── Per-layer metrics + plots ─────────────────────────────────────────────
     logger.info("Computing per-layer metrics ...")
@@ -632,6 +972,35 @@ def main() -> None:
         t_r2_rep = int(np.round(np.mean(valid_t_r2))) if valid_t_r2 else None
         t_r2_reps.append(t_r2_rep)
 
+        # CCF aggregation (actual lag range may be shorter than ccf_max_lag
+        # because compute_cross_correlation clamps to T-1)
+        ccf_raws = np.stack([pair[0] for pair in per_seq_ccf[layer]])   # (N, 2*actual_lag+1)
+        ccf_derivs = np.stack([pair[1] for pair in per_seq_ccf[layer]])
+        actual_half = (ccf_raws.shape[1] - 1) // 2
+        ccf_lags = np.arange(-actual_half, actual_half + 1)
+        ccf_raw_mean[layer] = ccf_raws.mean(axis=0)
+        ccf_raw_std[layer] = ccf_raws.std(axis=0)
+        ccf_deriv_mean[layer] = ccf_derivs.mean(axis=0)
+        ccf_deriv_std[layer] = ccf_derivs.std(axis=0)
+        ccf_peak_lags.append(float(ccf_lags[int(ccf_raw_mean[layer].argmax())]))
+
+        # AUC quantile lag aggregation (kl is shared across layers)
+        auc_r2_stacked = np.stack(per_seq_auc_r2[layer])  # (N, n_quantiles)
+        auc_kl_stacked = np.stack(per_seq_auc_kl)          # (N, n_quantiles)
+        auc_lag_arr = auc_r2_stacked - auc_kl_stacked       # (N, n_quantiles)
+        auc_lag_means[layer] = auc_lag_arr.mean(axis=0)
+        auc_lag_stds[layer] = auc_lag_arr.std(axis=0)
+
+        # AUC curve aggregation for plotting
+        r2_raw_arr = np.stack(
+            [sw_r2[:config.ccf_n_tokens] for sw_r2 in per_seq_sw_r2[layer]]
+        )  # (N, n_tok)
+        r2_norm_arr = np.stack(per_seq_r2_norm[layer])  # (N, n_tok)
+        r2_raw_mean[layer] = r2_raw_arr.mean(axis=0)
+        r2_raw_std[layer] = r2_raw_arr.std(axis=0)
+        r2_norm_mean[layer] = r2_norm_arr.mean(axis=0)
+        r2_norm_std[layer] = r2_norm_arr.std(axis=0)
+
         metrics_out["layers"][str(layer)] = {
             "t_r2_per_seq": t_r2_list,
             "t_r2_mean": float(np.mean(valid_t_r2)) if valid_t_r2 else None,
@@ -639,6 +1008,15 @@ def main() -> None:
             "lag_mean": lag_mean,
             "lag_std": lag_std,
             "n_r2_reached": len(valid_lags),
+            "ccf_peak_lag": ccf_peak_lags[-1],
+            "auc_quantile_lags": {
+                str(q): float(auc_lag_means[layer][i])
+                for i, q in enumerate(config.auc_quantiles)
+            },
+            "auc_quantile_lag_stds": {
+                str(q): float(auc_lag_stds[layer][i])
+                for i, q in enumerate(config.auc_quantiles)
+            },
         }
 
         if lag_mean is not None:
@@ -662,14 +1040,60 @@ def main() -> None:
             r2_threshold=config.r2_threshold,
             sliding_window=config.sliding_window,
             min_report=config.min_reporting_position,
-            path=fig_dir / f"emergence_curve_layer_{layer}_zoom100",
-            max_pos=100,
+            path=fig_dir / f"emergence_curve_layer_{layer}_zoom150",
+            max_pos=150,
         )
 
-    # ── Lag summary ───────────────────────────────────────────────────────────
+    # ── KL curve aggregation (layer-independent) ─────────────────────────────
+    kl_raw_arr = np.stack(
+        [-kl[:config.ccf_n_tokens] for kl in per_seq_kl_smooth]
+    )  # (N, n_tok), using −KL so it increases like R²
+    kl_norm_arr = np.stack(per_seq_kl_norm)  # (N, n_tok)
+    kl_raw_mean = kl_raw_arr.mean(axis=0)
+    kl_raw_std = kl_raw_arr.std(axis=0)
+    kl_norm_mean = kl_norm_arr.mean(axis=0)
+    kl_norm_std = kl_norm_arr.std(axis=0)
+
+    # ── Lag summary (hard-threshold) ──────────────────────────────────────────
     _plot_lag_summary(
         config.layer_indices, lag_means, lag_stds,
         config.r2_threshold, fig_dir / "lag_summary",
+    )
+
+    # ── AUC convergence curves figure ────────────────────────────────────────
+    logger.info("Generating AUC convergence curves figure ...")
+    _plot_auc_curves(
+        n_tok=config.ccf_n_tokens,
+        layer_indices=config.layer_indices,
+        r2_raw_mean=r2_raw_mean, r2_raw_std=r2_raw_std,
+        r2_norm_mean=r2_norm_mean, r2_norm_std=r2_norm_std,
+        kl_raw_mean=kl_raw_mean, kl_raw_std=kl_raw_std,
+        kl_norm_mean=kl_norm_mean, kl_norm_std=kl_norm_std,
+        path=fig_dir / "auc_curves",
+    )
+
+    # ── Cross-correlation figure ──────────────────────────────────────────────
+    if ccf_lags is not None:
+        logger.info("Generating cross-correlation figure ...")
+        _plot_cross_correlation_by_layer(
+            lags=ccf_lags,
+            layer_indices=config.layer_indices,
+            ccf_raw_mean=ccf_raw_mean,
+            ccf_raw_std=ccf_raw_std,
+            ccf_deriv_mean=ccf_deriv_mean,
+            ccf_deriv_std=ccf_deriv_std,
+            path=fig_dir / "ccf_by_layer",
+        )
+
+    # ── Combined lag figure (threshold-free) ─────────────────────────────────
+    logger.info("Generating combined lag figure ...")
+    _plot_combined_lag(
+        layer_indices=config.layer_indices,
+        ccf_peak_lags=ccf_peak_lags,
+        auc_lag_means=auc_lag_means,
+        auc_lag_stds=auc_lag_stds,
+        auc_quantiles=config.auc_quantiles,
+        path=fig_dir / "lag_combined",
     )
 
     # ── Simplex trajectory plots ──────────────────────────────────────────────
@@ -677,7 +1101,7 @@ def main() -> None:
         logger.info("Generating simplex trajectory plots ...")
         _plot_simplex_trajectories(
             simplex_preds_all, simplex_beliefs_all,
-            valid_simplex_pos, config.layer_indices, fig_dir,
+            simplex_positions_valid, config.layer_indices, fig_dir,
         )
 
     # ── Save JSON metrics ─────────────────────────────────────────────────────
@@ -686,6 +1110,9 @@ def main() -> None:
 
     lag_summary = {
         "r2_threshold": config.r2_threshold,
+        "ccf_max_lag": config.ccf_max_lag,
+        "ccf_smooth_window": config.ccf_smooth_window,
+        "auc_quantiles": config.auc_quantiles,
         "t_kl_mean": float(t_kl_arr.mean()),
         "t_kl_std": float(t_kl_arr.std()),
         "per_layer": {
@@ -695,6 +1122,9 @@ def main() -> None:
                 "lag_mean": metrics_out["layers"][str(l)]["lag_mean"],
                 "lag_std": metrics_out["layers"][str(l)]["lag_std"],
                 "n_r2_reached": metrics_out["layers"][str(l)]["n_r2_reached"],
+                "ccf_peak_lag": metrics_out["layers"][str(l)]["ccf_peak_lag"],
+                "auc_quantile_lags": metrics_out["layers"][str(l)]["auc_quantile_lags"],
+                "auc_quantile_lag_stds": metrics_out["layers"][str(l)]["auc_quantile_lag_stds"],
             }
             for l in config.layer_indices
         },

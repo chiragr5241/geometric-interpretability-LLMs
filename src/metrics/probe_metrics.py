@@ -272,6 +272,89 @@ def pairwise_principal_angles(
     return angles_deg, mean_angle_matrix, mean_angle_2_matrix
 
 
+def compute_cross_correlation(
+    a: np.ndarray,
+    b: np.ndarray,
+    max_lag: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize both signals to zero mean and unit variance, then compute
+    CCF(τ) = (1/T) Σ_t ã(t) · b̃(t + τ) for τ ∈ [-max_lag, max_lag].
+
+    Positive peak τ means b leads a (a lags b).
+    Returns (lags, ccf) where lags has shape (2*max_lag+1,).
+    """
+    T = len(a)
+    max_lag = min(max_lag, T - 1)
+    a_norm = (a - a.mean()) / (a.std() + 1e-10)
+    b_norm = (b - b.mean()) / (b.std() + 1e-10)
+    full_corr = np.correlate(a_norm, b_norm, mode="full") / T
+    center = len(full_corr) // 2
+    lags = np.arange(-max_lag, max_lag + 1)
+    ccf = full_corr[center - max_lag : center + max_lag + 1]
+    return lags, ccf
+
+
+def compute_r2_kl_ccf(
+    r2: np.ndarray,
+    kl: np.ndarray,
+    max_lag: int,
+    smooth_window: int = 10,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute cross-correlation between R²(t) and −KL(t), and between their derivatives.
+
+    Applies pre-smoothing (smooth_window) before both the raw CCF and derivative CCF
+    to reduce noise before differencing.
+
+    Returns (lags, ccf_raw, ccf_deriv).
+    - Positive peak lag → R² lags KL (geometry follows output convergence)
+    - Negative peak lag → R² leads KL (geometry precedes output convergence)
+    """
+    def _smooth(x: np.ndarray, w: int) -> np.ndarray:
+        if w <= 1:
+            return x
+        kernel = np.ones(w) / w
+        half = w // 2
+        padded = np.pad(x, (half, half), mode="edge")
+        return np.convolve(padded, kernel, mode="valid")[: len(x)]
+
+    neg_kl = -kl
+    r2_s = _smooth(r2, smooth_window)
+    neg_kl_s = _smooth(neg_kl, smooth_window)
+
+    lags, ccf_raw = compute_cross_correlation(r2_s, neg_kl_s, max_lag)
+
+    dr2 = np.gradient(r2_s)
+    d_neg_kl = np.gradient(neg_kl_s)
+    _, ccf_deriv = compute_cross_correlation(dr2, d_neg_kl, max_lag)
+
+    return lags, ccf_raw, ccf_deriv
+
+
+def compute_auc_quantile_positions(
+    curve: np.ndarray,
+    quantiles: list[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find token positions where the cumulative AUC fraction of `curve` reaches each quantile.
+
+    1. Normalize curve to [0, 1].
+    2. F(t) = cumsum(normalized)[t] / sum(normalized)
+    3. Return first t where F(t) >= q for each q in quantiles.
+
+    If a quantile is never reached, returns len(curve) - 1.
+    Returns (positions, c_norm) where positions has shape (len(quantiles),) and
+    c_norm is the [0, 1] normalized curve of shape (len(curve),).
+    """
+    c_min, c_max = curve.min(), curve.max()
+    c_norm = (curve - c_min) / (c_max - c_min + 1e-10)
+    cum = np.cumsum(c_norm)
+    F = cum / (cum[-1] + 1e-10)
+    positions = np.empty(len(quantiles), dtype=int)
+    for i, q in enumerate(quantiles):
+        above = np.where(F >= q)[0]
+        positions[i] = int(above[0]) if len(above) > 0 else len(curve) - 1
+    return positions, c_norm
+
+
 def pairwise_mahalanobis_cosine_sim(
     probes: list[ProbeResult],
     sigma: np.ndarray,
