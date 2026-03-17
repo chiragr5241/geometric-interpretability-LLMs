@@ -1,4 +1,5 @@
 experiment_name: activation_patching
+output_user: dani
 
 encoder_decoder_dir: "outputs/dani/20260316_155024_train_encoder_decoder"
 

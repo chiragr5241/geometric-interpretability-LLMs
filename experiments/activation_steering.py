@@ -23,7 +23,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from decoder import Decoder, DecoderResult
-from experiment import ExperimentConfig, load_config, setup_output_dir
+from experiment import ExperimentConfig, apply_runtime_overrides, load_config, setup_output_dir
 from experiment_utils import (
     build_emission_matrix,
     get_device,
@@ -268,6 +268,34 @@ def _aggregate(
     return agg_to_target, agg_to_factual, agg_unsteered_to_target, baseline
 
 
+def _compute_steering_flat(
+    specs: list[SteeringSpec],
+    decoder: Decoder,
+    device: torch.device,
+    model_dtype: torch.dtype,
+) -> torch.Tensor:
+    target_flat = torch.from_numpy(np.concatenate([spec.target_beliefs for spec in specs], axis=0)).float().to(device)
+    source_flat = torch.from_numpy(np.concatenate([spec.source_beliefs for spec in specs], axis=0)).float().to(device)
+    with torch.no_grad():
+        return decoder(target_flat).to(dtype=model_dtype) - decoder(source_flat).to(dtype=model_dtype)
+
+
+def _steering_norm_records(
+    specs: list[SteeringSpec],
+    steering_flat: torch.Tensor,
+) -> list[tuple[str, int, int, float]]:
+    norms = torch.linalg.vector_norm(steering_flat.float(), dim=-1).cpu().numpy()
+    records: list[tuple[str, int, int, float]] = []
+    offset = 0
+    for spec in specs:
+        n_positions = len(spec.positions)
+        series_key = _series_key(spec.condition, spec.k)
+        for value in norms[offset : offset + n_positions]:
+            records.append((series_key, spec.seq_idx, spec.sub_idx, float(value)))
+        offset += n_positions
+    return records
+
+
 def _run_batch(
     model,
     llm_tokens: list[torch.Tensor],
@@ -278,16 +306,13 @@ def _run_batch(
     mid_tok_ids: list[int],
     device: torch.device,
     model_dtype: torch.dtype,
+    steering_flat: torch.Tensor | None = None,
 ) -> np.ndarray:
     tokens_batch = torch.cat([llm_tokens[spec.seq_idx] for spec in specs], dim=0).to(device)
     seq_len = int(tokens_batch.shape[1])
     batch_size = len(specs)
-
-    target_flat = torch.from_numpy(np.concatenate([spec.target_beliefs for spec in specs], axis=0)).float().to(device)
-    source_flat = torch.from_numpy(np.concatenate([spec.source_beliefs for spec in specs], axis=0)).float().to(device)
-
-    with torch.no_grad():
-        steering_flat = decoder(target_flat).to(dtype=model_dtype) - decoder(source_flat).to(dtype=model_dtype)
+    if steering_flat is None:
+        steering_flat = _compute_steering_flat(specs, decoder, device, model_dtype)
 
     delta = torch.zeros(
         (batch_size, seq_len, steering_flat.shape[-1]),
@@ -430,6 +455,60 @@ def _plot_k_sweep(
         height=max(380, 280 * n_rows + 80),
         width=760,
         margin=dict(t=85, b=60, l=70, r=40),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
+def _plot_steering_norm_vs_layer(
+    agg: dict[str, dict[int, dict]],
+    k_values: list[int],
+    layer_indices: list[int],
+    path: Path,
+) -> None:
+    layers_str = [str(layer) for layer in layer_indices]
+    fig = go.Figure()
+
+    for k in k_values:
+        series_key = f"past_consistent_k{k}"
+        line_color, fill_color = _series_colors(series_key)
+        means = [agg[series_key][layer]["mean"] for layer in layer_indices]
+        stderrs = [agg[series_key][layer]["stderr"] for layer in layer_indices]
+        upper = [mean + stderr for mean, stderr in zip(means, stderrs)]
+        lower = [max(mean - stderr, 0.0) for mean, stderr in zip(means, stderrs)]
+
+        fig.add_trace(
+            go.Scatter(
+                x=layers_str + layers_str[::-1],
+                y=upper + lower[::-1],
+                fill="toself",
+                fillcolor=fill_color,
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+                mode="lines",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=layers_str,
+                y=means,
+                name=_series_label(series_key),
+                mode="lines+markers",
+                line=dict(color=line_color, width=2),
+            )
+        )
+
+    fig.update_layout(
+        title=(
+            "Average steering-vector norm vs layer"
+            "<br><sup>Past-consistent steering, mean +/- stderr across sequences</sup>"
+        ),
+        xaxis_title="Layer",
+        yaxis_title="Average vector norm",
+        height=520,
+        width=900,
+        margin=dict(t=85, b=60, l=75, r=40),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_image(str(path.with_suffix(".png")))
@@ -696,12 +775,7 @@ def _run_cached_batch(
     tokens_batch = torch.cat([llm_tokens[spec.seq_idx] for spec in specs], dim=0).to(device)
     seq_len = int(tokens_batch.shape[1])
     batch_size = len(specs)
-
-    target_flat = torch.from_numpy(np.concatenate([spec.target_beliefs for spec in specs], axis=0)).float().to(device)
-    source_flat = torch.from_numpy(np.concatenate([spec.source_beliefs for spec in specs], axis=0)).float().to(device)
-
-    with torch.no_grad():
-        steering_flat = decoder(target_flat).to(dtype=model_dtype) - decoder(source_flat).to(dtype=model_dtype)
+    steering_flat = _compute_steering_flat(specs, decoder, device, model_dtype)
 
     delta = torch.zeros(
         (batch_size, seq_len, steering_flat.shape[-1]),
@@ -938,6 +1012,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Activation steering experiment")
     parser.add_argument("config", type=str, help="Path to YAML config file")
     parser.add_argument(
+        "--output-user",
+        type=str,
+        default=None,
+        help="Override output_user from the config file",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -948,6 +1028,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config, ActivationSteeringConfig)
+    apply_runtime_overrides(config, output_user=args.output_user)
     if not config.pooled_probes:
         raise ValueError("Activation steering currently expects pooled probes/decoders")
 
@@ -1095,6 +1176,10 @@ def main() -> None:
         series_key: {layer: [] for layer in config.layer_indices}
         for series_key in series_keys
     }
+    steering_norm_data: dict[str, dict[int, list[tuple[int, int, float]]]] = {
+        _series_key("past_consistent", k): {layer: [] for layer in config.layer_indices}
+        for k in config.k_values
+    }
     unsteered_to_target_data: dict[str, list[tuple[int, int, float]]] = {series_key: [] for series_key in series_keys}
     raw_records: list[dict[str, object]] = []
 
@@ -1114,6 +1199,7 @@ def main() -> None:
         for batch_idx in range(n_batches):
             start = batch_idx * config.batch_size
             specs_batch = all_specs[start : start + config.batch_size]
+            steering_flat = _compute_steering_flat(specs_batch, decoder, device, model_dtype)
             p_steered = _run_batch(
                 model,
                 llm_tokens,
@@ -1124,12 +1210,19 @@ def main() -> None:
                 mid_tok_ids,
                 device,
                 model_dtype,
+                steering_flat=steering_flat,
             )
+            norm_records = _steering_norm_records(specs_batch, steering_flat)
 
             target_probs = np.stack([spec.final_target_belief for spec in specs_batch], axis=0) @ emit.T
             factual_probs = np.stack([p_opt_factual[spec.seq_idx] for spec in specs_batch], axis=0)
             kl_to_target = _kl(p_steered, target_probs)
             kl_to_factual = _kl(p_steered, factual_probs)
+
+            for series_key, seq_idx, sub_idx, value in norm_records:
+                if series_key not in steering_norm_data:
+                    continue
+                steering_norm_data[series_key][layer].append((seq_idx, sub_idx, value))
 
             for item_idx, spec in enumerate(specs_batch):
                 series_key = _series_key(spec.condition, spec.k)
@@ -1157,14 +1250,22 @@ def main() -> None:
             series_key: np.mean([value for _, _, value in kl_to_target_data[series_key][layer]])
             for series_key in series_keys
         }
+        layer_norm_means = {
+            series_key: np.mean([value for _, _, value in steering_norm_data[series_key][layer]])
+            for series_key in steering_norm_data
+        }
         past_summary = "  ".join(
             f"K={k}:{layer_means[f'past_consistent_k{k}']:.4f}" for k in config.k_values
+        )
+        past_norm_summary = "  ".join(
+            f"K={k}:{layer_norm_means[f'past_consistent_k{k}']:.4f}" for k in config.k_values
         )
         logger.info(
             f"    {past_summary}  "
             f"garbage-valid={layer_means['garbage_valid']:.4f}  "
             f"garbage-random={layer_means['garbage_random']:.4f}"
         )
+        logger.info(f"    steering norms  {past_norm_summary}")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1178,6 +1279,13 @@ def main() -> None:
         unsteered_to_target_data,
         baseline_kl,
     )
+    agg_steering_norm = {
+        series_key: {
+            layer: _agg_records(records)
+            for layer, records in by_layer.items()
+        }
+        for series_key, by_layer in steering_norm_data.items()
+    }
 
     logger.info("Collecting propagation plot data ...")
     specs_k1 = [
@@ -1212,6 +1320,10 @@ def main() -> None:
             series_key: {str(layer): values for layer, values in by_layer.items()}
             for series_key, by_layer in agg_to_factual.items()
         },
+        "past_consistent_steering_norms": {
+            series_key: {str(layer): values for layer, values in by_layer.items()}
+            for series_key, by_layer in agg_steering_norm.items()
+        },
         "raw_records": raw_records,
     }
     with open(out_dir / "metrics.json", "w") as f:
@@ -1221,6 +1333,12 @@ def main() -> None:
     logger.info("Generating plots ...")
     _plot_main_result(agg_to_target, config.layer_indices, baseline, fig_dir / "kl_vs_layer")
     _plot_k_sweep(agg_to_target, config.k_values, config.layer_indices, fig_dir / "kl_vs_k")
+    _plot_steering_norm_vs_layer(
+        agg_steering_norm,
+        config.k_values,
+        config.layer_indices,
+        fig_dir / "steering_norm_vs_layer",
+    )
     _plot_heatmaps(agg_to_target, config.layer_indices, fig_dir)
     _plot_to_factual(agg_to_factual, baseline, config.layer_indices, fig_dir / "kl_to_factual")
     for series_key in series_keys:

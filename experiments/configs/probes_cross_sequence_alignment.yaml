@@ -1,4 +1,5 @@
 experiment_name: probes_cross_sequence_alignment
+output_user: dani
 
 n_sequences: 10
 max_probes_per_batch: 80

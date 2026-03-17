@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeVar
@@ -22,6 +22,7 @@ class ExperimentConfig:
     experiment_name: str
     hmm: HMMConfig
     model_name: str
+    output_user: str = field(default="dani", kw_only=True)
 
 
 
@@ -32,9 +33,15 @@ def load_config(path: str, cls: type[C]) -> C:
     return cls(hmm=HMMConfig(**hmm_raw), **raw)
 
 
+def apply_runtime_overrides(config: ExperimentConfig, output_user: str | None = None) -> ExperimentConfig:
+    if output_user is not None:
+        config.output_user = output_user
+    return config
+
+
 def setup_output_dir(config: ExperimentConfig) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path("outputs") / "chirag" / f"{timestamp}_{config.experiment_name}" # Name needs to be dynamically generated
+    out_dir = Path("outputs") / config.output_user / f"{timestamp}_{config.experiment_name}"
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "probes").mkdir(exist_ok=True)
     with open(out_dir / "config.yaml", "w") as f:

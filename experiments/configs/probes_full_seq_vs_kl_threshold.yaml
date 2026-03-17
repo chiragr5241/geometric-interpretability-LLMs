@@ -1,4 +1,5 @@
 experiment_name: probes_full_seq_vs_kl_threshold
+output_user: dani
 
 n_runs: 20  # number of independent sequences to average over (set to 20 for final run)
 max_probes_per_batch: 80

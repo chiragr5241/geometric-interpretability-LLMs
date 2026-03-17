@@ -12,6 +12,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from experiment import ExperimentConfig, load_config, setup_output_dir
+from experiment import ExperimentConfig, apply_runtime_overrides, load_config, setup_output_dir
 from experiment_utils import (
     build_emission_matrix,
     compute_optimal_probs,
@@ -692,11 +693,18 @@ def _plot_simplex_trajectories(
 # ── Main ─────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <config.yaml>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Belief geometry emergence curve")
+    parser.add_argument("config", type=str, help="Path to YAML config file")
+    parser.add_argument(
+        "--output-user",
+        type=str,
+        default=None,
+        help="Override output_user from the config file",
+    )
+    args = parser.parse_args()
 
-    config = load_config(sys.argv[1], EmergenceCurveConfig)
+    config = load_config(args.config, EmergenceCurveConfig)
+    apply_runtime_overrides(config, output_user=args.output_user)
     device = get_device()
 
     out_dir = setup_output_dir(config)

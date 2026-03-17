@@ -12,6 +12,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import itertools
 import json
@@ -36,7 +37,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from experiment import ExperimentConfig, HMMConfig, setup_output_dir
+from experiment import ExperimentConfig, HMMConfig, apply_runtime_overrides, setup_output_dir
 from experiment_utils import get_device, load_model, setup_logging
 from visualization import _to_barycentric, _belief_colors
 
@@ -622,11 +623,18 @@ def save_results_csv(results: list[ConfigResult], out_dir: Path) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <config.yaml>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Belief state geometry sweep")
+    parser.add_argument("config", type=str, help="Path to YAML config file")
+    parser.add_argument(
+        "--output-user",
+        type=str,
+        default=None,
+        help="Override output_user from the config file",
+    )
+    args = parser.parse_args()
 
-    config = load_sweep_config(sys.argv[1])
+    config = load_sweep_config(args.config)
+    apply_runtime_overrides(config, output_user=args.output_user)
     device = get_device()
 
     out_dir = setup_output_dir(config)
