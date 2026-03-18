@@ -8,7 +8,7 @@ seq_length: 400
 batch_size: 20
 n_donors: 5
 n_random_samples: 5
-k_values: [1, 5, 10, 50]
+k_values: [1, 5, 10, 25, 50, 100]
 pooled_probes: true
 
 hmm:

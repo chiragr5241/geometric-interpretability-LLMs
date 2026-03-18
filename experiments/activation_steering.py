@@ -46,13 +46,27 @@ _PAST_COLORS = {
     1: ("#1f77b4", "rgba(31,119,180,0.12)"),
     5: ("#9467bd", "rgba(148,103,189,0.12)"),
     10: ("#8c564b", "rgba(140,86,75,0.12)"),
+    25: ("#e377c2", "rgba(227,119,194,0.12)"),
     50: ("#17becf", "rgba(23,190,207,0.12)"),
+    100: ("#bcbd22", "rgba(188,189,34,0.12)"),
 }
 _OTHER_COLORS: dict[str, tuple[str, str]] = {
     "garbage_valid": ("#2ca02c", "rgba(44,160,44,0.12)"),
     "garbage_random": ("#d62728", "rgba(214,39,40,0.12)"),
 }
 _PROPAGATION_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+_PAST_VARIANT_LABELS = {
+    "past_consistent_shared_prefix": "shared-prefix",
+    "past_consistent": "different-prefix",
+}
+_PAST_VARIANT_DASH = {
+    "past_consistent_shared_prefix": "solid",
+    "past_consistent": "dash",
+}
+_PAST_VARIANT_ORDER = {
+    "past_consistent_shared_prefix": 0,
+    "past_consistent": 1,
+}
 
 
 @dataclass
@@ -94,35 +108,80 @@ def _kl(p: np.ndarray, q: np.ndarray) -> np.ndarray:
     return (p * np.log(np.clip(p, 1e-10, None) / np.clip(q, 1e-10, None))).sum(axis=-1)
 
 
-def _series_key(condition: str, k: int | None) -> str:
+def _past_series_key(condition: str, k: int) -> str:
     if condition == "past_consistent":
-        if k is None:
-            raise ValueError("past_consistent series requires k")
         return f"past_consistent_k{k}"
+    if condition == "past_consistent_shared_prefix":
+        return f"past_consistent_shared_prefix_k{k}"
+    raise ValueError(f"Unsupported past-consistent condition: {condition}")
+
+
+def _parse_past_series_key(series_key: str) -> tuple[str, int] | None:
+    for prefix, condition in (
+        ("past_consistent_shared_prefix_k", "past_consistent_shared_prefix"),
+        ("past_consistent_k", "past_consistent"),
+    ):
+        if series_key.startswith(prefix):
+            return condition, int(series_key.removeprefix(prefix))
+    return None
+
+
+def _past_series_keys(k_values: list[int]) -> list[str]:
+    out: list[str] = []
+    for k in k_values:
+        out.append(_past_series_key("past_consistent_shared_prefix", k))
+        out.append(_past_series_key("past_consistent", k))
+    return out
+
+
+def _hex_rgba(hex_color: str, alpha: float) -> str:
+    color = hex_color.lstrip("#")
+    if len(color) != 6:
+        raise ValueError(f"Expected 6-digit hex color, got {hex_color}")
+    r = int(color[0:2], 16)
+    g = int(color[2:4], 16)
+    b = int(color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _series_key(condition: str, k: int | None) -> str:
+    if condition in _PAST_VARIANT_LABELS:
+        if k is None:
+            raise ValueError(f"{condition} series requires k")
+        return _past_series_key(condition, k)
     return condition
 
 
 def _series_label(series_key: str) -> str:
-    if series_key.startswith("past_consistent_k"):
-        return f"past-consistent K={series_key.split('k')[-1]}"
+    parsed = _parse_past_series_key(series_key)
+    if parsed is not None:
+        condition, k = parsed
+        return f"past-consistent {_PAST_VARIANT_LABELS[condition]} K={k}"
     return series_key.replace("_", "-")
 
 
-def _series_sort_key(series_key: str) -> tuple[int, int]:
-    if series_key.startswith("past_consistent_k"):
-        return (0, int(series_key.split("k")[-1]))
+def _series_sort_key(series_key: str) -> tuple[int, int, int]:
+    parsed = _parse_past_series_key(series_key)
+    if parsed is not None:
+        condition, k = parsed
+        return (0, k, _PAST_VARIANT_ORDER[condition])
     if series_key == "garbage_valid":
-        return (1, 0)
+        return (1, 0, 0)
     if series_key == "garbage_random":
-        return (2, 0)
-    return (3, 0)
+        return (2, 0, 0)
+    return (3, 0, 0)
 
 
-def _series_colors(series_key: str) -> tuple[str, str]:
-    if series_key.startswith("past_consistent_k"):
-        k = int(series_key.split("k")[-1])
-        return _PAST_COLORS.get(k, ("#1f77b4", "rgba(31,119,180,0.12)"))
-    return _OTHER_COLORS.get(series_key, ("#7f7f7f", "rgba(127,127,127,0.12)"))
+def _series_style(series_key: str) -> tuple[str, str, str]:
+    parsed = _parse_past_series_key(series_key)
+    if parsed is not None:
+        condition, k = parsed
+        line_color, _ = _PAST_COLORS.get(k, ("#1f77b4", "rgba(31,119,180,0.12)"))
+        alpha = 0.14 if condition == "past_consistent_shared_prefix" else 0.07
+        return line_color, _hex_rgba(line_color, alpha), _PAST_VARIANT_DASH[condition]
+
+    line_color, fill_color = _OTHER_COLORS.get(series_key, ("#7f7f7f", "rgba(127,127,127,0.12)"))
+    return line_color, fill_color, "solid"
 
 
 def _compute_hybrid_beliefs(
@@ -143,6 +202,7 @@ def _compute_hybrid_beliefs(
 def _build_specs(
     seq_beliefs: list[np.ndarray],
     seq_tokens: list[np.ndarray],
+    hmm: Mess3HMM,
     t_3d: np.ndarray,
     k_values: list[int],
     n_donors: int,
@@ -175,6 +235,23 @@ def _build_specs(
                         k=k,
                         sub_idx=sub_idx,
                         donor_idx=int(donor_idx),
+                        positions=positions,
+                        source_beliefs=source_slice,
+                        target_beliefs=target_slice,
+                        final_target_belief=target_slice[-1],
+                    )
+                )
+
+            shared_prefix_belief = seq_beliefs[seq_idx][seq_len - k].astype(np.float32)
+            for sub_idx in range(donor_count):
+                _, target_slice = hmm.sample_continuation(shared_prefix_belief, k, rng)
+                specs.append(
+                    SteeringSpec(
+                        seq_idx=seq_idx,
+                        condition="past_consistent_shared_prefix",
+                        k=k,
+                        sub_idx=sub_idx,
+                        donor_idx=None,
                         positions=positions,
                         source_beliefs=source_slice,
                         target_beliefs=target_slice,
@@ -347,25 +424,31 @@ def _sorted_series_keys(agg: dict[str, dict[int, dict]]) -> list[str]:
 
 def _plot_main_result(
     agg: dict[str, dict[int, dict]],
+    k_values: list[int],
     layer_indices: list[int],
     baseline: dict,
     path: Path,
 ) -> None:
     layers_str = [str(layer) for layer in layer_indices]
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=layers_str,
-            y=[baseline["mean"]] * len(layer_indices),
-            name="Unsteered baseline",
-            mode="lines",
-            line=dict(color="black", dash="dash", width=1.5),
-        )
+    subplot_titles = [f"K={k}" for k in k_values] + ["Controls"]
+    n_panels = len(subplot_titles)
+    n_cols = min(3, n_panels)
+    n_rows = ceil(n_panels / n_cols)
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=subplot_titles,
+        shared_yaxes=True,
     )
 
-    for series_key in _sorted_series_keys(agg):
-        line_color, fill_color = _series_colors(series_key)
+    def add_series(
+        series_key: str,
+        row: int,
+        col: int,
+        showlegend: bool,
+        legend_name: str | None = None,
+    ) -> None:
+        line_color, fill_color, dash = _series_style(series_key)
         means = [agg[series_key][layer]["mean"] for layer in layer_indices]
         stderrs = [agg[series_key][layer]["stderr"] for layer in layer_indices]
         upper = [mean + stderr for mean, stderr in zip(means, stderrs)]
@@ -381,28 +464,87 @@ def _plot_main_result(
                 showlegend=False,
                 hoverinfo="skip",
                 mode="lines",
-            )
+            ),
+            row=row,
+            col=col,
         )
         fig.add_trace(
             go.Scatter(
                 x=layers_str,
                 y=means,
-                name=_series_label(series_key),
+                name=legend_name or _series_label(series_key),
                 mode="lines+markers",
-                line=dict(color=line_color, width=2),
-            )
+                line=dict(color=line_color, width=2, dash=dash),
+                showlegend=showlegend,
+            ),
+            row=row,
+            col=col,
         )
 
-    fig.update_yaxes(type="log")
+    for panel_idx, k in enumerate(k_values):
+        row = panel_idx // n_cols + 1
+        col = panel_idx % n_cols + 1
+        fig.add_trace(
+            go.Scatter(
+                x=layers_str,
+                y=[baseline["mean"]] * len(layer_indices),
+                name="Unsteered baseline",
+                mode="lines",
+                line=dict(color="black", dash="dash", width=1.5),
+                showlegend=(panel_idx == 0),
+            ),
+            row=row,
+            col=col,
+        )
+        add_series(
+            _past_series_key("past_consistent_shared_prefix", k),
+            row,
+            col,
+            showlegend=(panel_idx == 0),
+            legend_name="Past-consistent shared prefix",
+        )
+        add_series(
+            _past_series_key("past_consistent", k),
+            row,
+            col,
+            showlegend=(panel_idx == 0),
+            legend_name="Past-consistent different prefix",
+        )
+        fig.update_yaxes(type="log", row=row, col=col)
+
+    controls_idx = len(k_values)
+    controls_row = controls_idx // n_cols + 1
+    controls_col = controls_idx % n_cols + 1
+    fig.add_trace(
+        go.Scatter(
+            x=layers_str,
+            y=[baseline["mean"]] * len(layer_indices),
+            name="Unsteered baseline",
+            mode="lines",
+            line=dict(color="black", dash="dash", width=1.5),
+            showlegend=False,
+        ),
+        row=controls_row,
+        col=controls_col,
+    )
+    for series_key in ("garbage_valid", "garbage_random"):
+        add_series(series_key, controls_row, controls_col, showlegend=(controls_idx == 0))
+    fig.update_yaxes(type="log", row=controls_row, col=controls_col)
+
+    for panel_idx in range(n_panels):
+        row = panel_idx // n_cols + 1
+        col = panel_idx % n_cols + 1
+        fig.update_xaxes(title_text="Layer", row=row, col=col)
+        if col == 1:
+            fig.update_yaxes(title_text="KL [nats]", row=row, col=col)
+
     fig.update_layout(
         title=(
-            "Activation steering: KL vs layer by condition"
-            "<br><sup>KL(P_steered || P_opt(eta_target)) - log scale - mean +/- stderr</sup>"
+            "Activation steering: KL vs layer"
+            "<br><sup>Per-K shared vs different prefix, plus controls; mean +/- stderr</sup>"
         ),
-        xaxis_title="Layer",
-        yaxis_title="KL [nats]",
-        height=520,
-        width=900,
+        height=max(420, 360 * n_rows + 80),
+        width=min(420 * n_cols + 140, 1450),
         margin=dict(t=85, b=60, l=75, r=40),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -415,45 +557,48 @@ def _plot_k_sweep(
     layer_indices: list[int],
     path: Path,
 ) -> None:
-    representative_layers = [layer for layer in [3, 5, 10, 15] if layer in layer_indices]
-    if not representative_layers:
-        representative_layers = layer_indices[: min(4, len(layer_indices))]
-    n_layers = len(representative_layers)
-    n_cols = min(2, n_layers)
+    n_layers = len(layer_indices)
+    n_cols = min(4, n_layers)
     n_rows = ceil(n_layers / n_cols)
     fig = make_subplots(
         rows=n_rows,
         cols=n_cols,
-        subplot_titles=[f"Layer {layer}" for layer in representative_layers],
+        subplot_titles=[f"Layer {layer}" for layer in layer_indices],
     )
     x_vals = [str(k) for k in k_values]
 
-    for idx, layer in enumerate(representative_layers):
+    for idx, layer in enumerate(layer_indices):
         row = idx // n_cols + 1
         col = idx % n_cols + 1
-        means = [agg[f"past_consistent_k{k}"][layer]["mean"] for k in k_values]
-        errs = [agg[f"past_consistent_k{k}"][layer]["stderr"] for k in k_values]
-        fig.add_trace(
-            go.Scatter(
-                x=x_vals,
-                y=means,
-                error_y=dict(type="data", array=errs, visible=True),
-                mode="lines+markers",
-                line=dict(color="#1f77b4", width=2),
-                showlegend=False,
-            ),
-            row=row,
-            col=col,
-        )
+        show_legend = idx == 0
+        for condition, color in (
+            ("past_consistent_shared_prefix", "#1f77b4"),
+            ("past_consistent", "#ff7f0e"),
+        ):
+            means = [agg[_past_series_key(condition, k)][layer]["mean"] for k in k_values]
+            errs = [agg[_past_series_key(condition, k)][layer]["stderr"] for k in k_values]
+            fig.add_trace(
+                go.Scatter(
+                    x=x_vals,
+                    y=means,
+                    error_y=dict(type="data", array=errs, visible=True),
+                    mode="lines+markers",
+                    line=dict(color=color, width=2, dash=_PAST_VARIANT_DASH[condition]),
+                    name=_PAST_VARIANT_LABELS[condition],
+                    showlegend=show_legend,
+                ),
+                row=row,
+                col=col,
+            )
         fig.update_yaxes(type="log", row=row, col=col)
 
     fig.update_layout(
         title=(
             "Past-consistent steering: KL vs K"
-            "<br><sup>Representative layers, mean +/- stderr across sequences</sup>"
+            "<br><sup>All layers; shared-prefix (solid) vs different-prefix (dashed)</sup>"
         ),
-        height=max(380, 280 * n_rows + 80),
-        width=760,
+        height=max(420, 240 * n_rows + 100),
+        width=min(320 * n_cols + 120, 1500),
         margin=dict(t=85, b=60, l=70, r=40),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -470,39 +615,40 @@ def _plot_steering_norm_vs_layer(
     fig = go.Figure()
 
     for k in k_values:
-        series_key = f"past_consistent_k{k}"
-        line_color, fill_color = _series_colors(series_key)
-        means = [agg[series_key][layer]["mean"] for layer in layer_indices]
-        stderrs = [agg[series_key][layer]["stderr"] for layer in layer_indices]
-        upper = [mean + stderr for mean, stderr in zip(means, stderrs)]
-        lower = [max(mean - stderr, 0.0) for mean, stderr in zip(means, stderrs)]
+        for condition in ("past_consistent_shared_prefix", "past_consistent"):
+            series_key = _past_series_key(condition, k)
+            line_color, fill_color, dash = _series_style(series_key)
+            means = [agg[series_key][layer]["mean"] for layer in layer_indices]
+            stderrs = [agg[series_key][layer]["stderr"] for layer in layer_indices]
+            upper = [mean + stderr for mean, stderr in zip(means, stderrs)]
+            lower = [max(mean - stderr, 0.0) for mean, stderr in zip(means, stderrs)]
 
-        fig.add_trace(
-            go.Scatter(
-                x=layers_str + layers_str[::-1],
-                y=upper + lower[::-1],
-                fill="toself",
-                fillcolor=fill_color,
-                line=dict(width=0),
-                showlegend=False,
-                hoverinfo="skip",
-                mode="lines",
+            fig.add_trace(
+                go.Scatter(
+                    x=layers_str + layers_str[::-1],
+                    y=upper + lower[::-1],
+                    fill="toself",
+                    fillcolor=fill_color,
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                    mode="lines",
+                )
             )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=layers_str,
-                y=means,
-                name=_series_label(series_key),
-                mode="lines+markers",
-                line=dict(color=line_color, width=2),
+            fig.add_trace(
+                go.Scatter(
+                    x=layers_str,
+                    y=means,
+                    name=_series_label(series_key),
+                    mode="lines+markers",
+                    line=dict(color=line_color, width=2, dash=dash),
+                )
             )
-        )
 
     fig.update_layout(
         title=(
             "Average steering-vector norm vs layer"
-            "<br><sup>Past-consistent steering, mean +/- stderr across sequences</sup>"
+            "<br><sup>Shared-prefix (solid) vs different-prefix (dashed)</sup>"
         ),
         xaxis_title="Layer",
         yaxis_title="Average vector norm",
@@ -516,10 +662,63 @@ def _plot_steering_norm_vs_layer(
 
 def _plot_heatmaps(
     agg: dict[str, dict[int, dict]],
+    k_values: list[int],
     layer_indices: list[int],
     fig_dir: Path,
 ) -> None:
+    for k in k_values:
+        series_keys = [
+            _past_series_key("past_consistent_shared_prefix", k),
+            _past_series_key("past_consistent", k),
+        ]
+        z_arrays: dict[str, np.ndarray] = {}
+        n_seqs = 1
+        for series_key in series_keys:
+            n_seqs = max(n_seqs, agg[series_key][layer_indices[0]]["n_seqs"])
+            z_by_layer: list[list[float]] = []
+            for layer in layer_indices:
+                row = agg[series_key][layer]["seq_means"]
+                if len(row) < n_seqs:
+                    row = row + [float("nan")] * (n_seqs - len(row))
+                z_by_layer.append(row[:n_seqs])
+            z_arrays[series_key] = np.log10(np.clip(np.array(z_by_layer, dtype=float).T, 1e-10, None))
+
+        zmin = min(float(np.nanmin(z_arr)) for z_arr in z_arrays.values())
+        zmax = max(float(np.nanmax(z_arr)) for z_arr in z_arrays.values())
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=[_series_label(series_key) for series_key in series_keys],
+        )
+        for col, series_key in enumerate(series_keys, start=1):
+            fig.add_trace(
+                go.Heatmap(
+                    z=z_arrays[series_key],
+                    x=[str(layer) for layer in layer_indices],
+                    y=[f"Seq {idx}" for idx in range(n_seqs)],
+                    colorscale="Viridis",
+                    zmin=zmin,
+                    zmax=zmax,
+                    colorbar=dict(title="log10(KL)") if col == 2 else None,
+                    showscale=(col == 2),
+                ),
+                row=1,
+                col=col,
+            )
+        fig.update_layout(
+            title=f"KL heatmap comparison - K={k}",
+            xaxis_title="Layer",
+            xaxis2_title="Layer",
+            yaxis_title="Sequence",
+            height=520,
+            width=1200,
+            margin=dict(t=70, b=60, l=70, r=40),
+        )
+        fig.write_image(str(fig_dir / f"heatmap_past_consistent_k{k}.png"))
+
     for series_key in _sorted_series_keys(agg):
+        if _parse_past_series_key(series_key) is not None:
+            continue
         n_seqs = max(agg[series_key][layer_indices[0]]["n_seqs"], 1)
         z_by_layer: list[list[float]] = []
         for layer in layer_indices:
@@ -548,6 +747,73 @@ def _plot_heatmaps(
         fig.write_image(str(fig_dir / f"heatmap_{series_key}.png"))
 
 
+def _plot_past_variant_overlay(
+    agg: dict[str, dict[int, dict]],
+    k_values: list[int],
+    layer_indices: list[int],
+    path: Path,
+) -> None:
+    n_cols = min(2, len(k_values))
+    n_rows = ceil(len(k_values) / n_cols)
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=[f"K={k}" for k in k_values],
+    )
+    layers_str = [str(layer) for layer in layer_indices]
+
+    for idx, k in enumerate(k_values):
+        row = idx // n_cols + 1
+        col = idx % n_cols + 1
+        show_legend = idx == 0
+        for condition in ("past_consistent_shared_prefix", "past_consistent"):
+            series_key = _past_series_key(condition, k)
+            line_color, fill_color, dash = _series_style(series_key)
+            means = [agg[series_key][layer]["mean"] for layer in layer_indices]
+            stderrs = [agg[series_key][layer]["stderr"] for layer in layer_indices]
+            upper = [mean + stderr for mean, stderr in zip(means, stderrs)]
+            lower = [mean - stderr for mean, stderr in zip(means, stderrs)]
+            fig.add_trace(
+                go.Scatter(
+                    x=layers_str + layers_str[::-1],
+                    y=upper + lower[::-1],
+                    fill="toself",
+                    fillcolor=fill_color,
+                    line=dict(width=0),
+                    hoverinfo="skip",
+                    showlegend=False,
+                    mode="lines",
+                ),
+                row=row,
+                col=col,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=layers_str,
+                    y=means,
+                    mode="lines+markers",
+                    line=dict(color=line_color, width=2, dash=dash),
+                    name=_PAST_VARIANT_LABELS[condition],
+                    showlegend=show_legend,
+                ),
+                row=row,
+                col=col,
+            )
+        fig.update_yaxes(type="log", row=row, col=col)
+
+    fig.update_layout(
+        title=(
+            "Shared-prefix vs different-prefix steering"
+            "<br><sup>KL(P_steered || P_opt(eta_target)) by layer for each K</sup>"
+        ),
+        height=max(420, 320 * n_rows + 80),
+        width=1100,
+        margin=dict(t=85, b=60, l=75, r=40),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
 def _plot_to_factual(
     agg_to_factual: dict[str, dict[int, dict]],
     baseline: dict,
@@ -567,7 +833,7 @@ def _plot_to_factual(
     )
 
     for series_key in _sorted_series_keys(agg_to_factual):
-        line_color, _ = _series_colors(series_key)
+        line_color, _, dash = _series_style(series_key)
         means = [agg_to_factual[series_key][layer]["mean"] for layer in layer_indices]
         errs = [agg_to_factual[series_key][layer]["stderr"] for layer in layer_indices]
         fig.add_trace(
@@ -577,7 +843,7 @@ def _plot_to_factual(
                 error_y=dict(type="data", array=errs, visible=True),
                 name=_series_label(series_key),
                 mode="lines+markers",
-                line=dict(color=line_color, width=2),
+                line=dict(color=line_color, width=2, dash=dash),
             )
         )
 
@@ -674,6 +940,81 @@ def _plot_crossing(
     fig.write_image(str(path.with_suffix(".png")))
 
 
+def _plot_crossing_pair(
+    k: int,
+    agg_to_target: dict[str, dict[int, dict]],
+    agg_to_factual: dict[str, dict[int, dict]],
+    agg_unsteered_to_target: dict[str, dict],
+    baseline: dict,
+    layer_indices: list[int],
+    path: Path,
+) -> None:
+    n_layers = len(layer_indices)
+    n_cols = min(6, n_layers)
+    n_rows = ceil(n_layers / n_cols)
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=[f"Layer {layer}" for layer in layer_indices],
+        shared_yaxes=False,
+        vertical_spacing=0.15 if n_rows > 1 else 0.1,
+        horizontal_spacing=0.08,
+    )
+
+    uf_mean = baseline["mean"]
+    uf_err = baseline["stderr"]
+
+    for idx, layer in enumerate(layer_indices):
+        row = idx // n_cols + 1
+        col = idx % n_cols + 1
+        show_legend = idx == 0
+        for metric_name, color in (("factual", "#1f77b4"), ("target", "#ff7f0e")):
+            for condition in ("past_consistent_shared_prefix", "past_consistent"):
+                series_key = _past_series_key(condition, k)
+                ut_mean = agg_unsteered_to_target[series_key]["mean"]
+                ut_err = agg_unsteered_to_target[series_key]["stderr"]
+                steered_mean = (
+                    agg_to_factual[series_key][layer]["mean"]
+                    if metric_name == "factual"
+                    else agg_to_target[series_key][layer]["mean"]
+                )
+                steered_err = (
+                    agg_to_factual[series_key][layer]["stderr"]
+                    if metric_name == "factual"
+                    else agg_to_target[series_key][layer]["stderr"]
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=["Unsteered", "Steered"],
+                        y=[uf_mean, steered_mean] if metric_name == "factual" else [ut_mean, steered_mean],
+                        error_y=dict(
+                            type="data",
+                            array=[uf_err, steered_err] if metric_name == "factual" else [ut_err, steered_err],
+                            visible=True,
+                        ),
+                        name=f"{metric_name} | {_PAST_VARIANT_LABELS[condition]}",
+                        showlegend=show_legend,
+                        mode="lines+markers",
+                        line=dict(color=color, width=2, dash=_PAST_VARIANT_DASH[condition]),
+                        marker=dict(size=6),
+                    ),
+                    row=row,
+                    col=col,
+                )
+
+    fig.update_layout(
+        title=(
+            f"Crossing plot: K={k}"
+            "<br><sup>Blue = KL to factual optimal | Orange = KL to target optimal</sup>"
+        ),
+        height=max(320, 220 * n_rows + 100),
+        width=min(220 * n_cols + 260, 1450),
+        margin=dict(t=90, b=60, l=60, r=40),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
 def _plot_causal_shift(
     series_key: str,
     agg_to_target: dict[str, dict[int, dict]],
@@ -733,6 +1074,72 @@ def _plot_causal_shift(
         yaxis_title="Delta KL [nats]",
         height=440,
         width=760,
+        margin=dict(t=80, b=60, l=70, r=40),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
+def _plot_causal_shift_pair(
+    k: int,
+    agg_to_target: dict[str, dict[int, dict]],
+    agg_to_factual: dict[str, dict[int, dict]],
+    agg_unsteered_to_target: dict[str, dict],
+    baseline: dict,
+    layer_indices: list[int],
+    path: Path,
+) -> None:
+    layers_str = [str(layer) for layer in layer_indices]
+    uf_mean = baseline["mean"]
+    uf_err = baseline["stderr"]
+    fig = go.Figure()
+    fig.add_hline(y=0, line_color="black", line_width=1)
+
+    for metric_name, color, marker_symbol in (
+        ("factual", "#1f77b4", "circle"),
+        ("target", "#ff7f0e", "square"),
+    ):
+        for condition in ("past_consistent_shared_prefix", "past_consistent"):
+            series_key = _past_series_key(condition, k)
+            ut_mean = agg_unsteered_to_target[series_key]["mean"]
+            ut_err = agg_unsteered_to_target[series_key]["stderr"]
+            values = (
+                [agg_to_factual[series_key][layer]["mean"] - uf_mean for layer in layer_indices]
+                if metric_name == "factual"
+                else [ut_mean - agg_to_target[series_key][layer]["mean"] for layer in layer_indices]
+            )
+            errs = (
+                [
+                    float(np.sqrt(uf_err**2 + agg_to_factual[series_key][layer]["stderr"]**2))
+                    for layer in layer_indices
+                ]
+                if metric_name == "factual"
+                else [
+                    float(np.sqrt(ut_err**2 + agg_to_target[series_key][layer]["stderr"]**2))
+                    for layer in layer_indices
+                ]
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=layers_str,
+                    y=values,
+                    error_y=dict(type="data", array=errs, visible=True),
+                    name=f"{metric_name} | {_PAST_VARIANT_LABELS[condition]}",
+                    mode="lines+markers",
+                    line=dict(color=color, width=2, dash=_PAST_VARIANT_DASH[condition]),
+                    marker=dict(size=6, symbol=marker_symbol),
+                )
+            )
+
+    fig.update_layout(
+        title=(
+            f"Causal shift per layer: K={k}"
+            "<br><sup>Positive means steering moved output away from factual and toward target</sup>"
+        ),
+        xaxis_title="Layer",
+        yaxis_title="Delta KL [nats]",
+        height=440,
+        width=960,
         margin=dict(t=80, b=60, l=70, r=40),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1155,6 +1562,7 @@ def main() -> None:
     all_specs = _build_specs(
         seq_beliefs,
         seq_tokens,
+        hmm,
         t_3d,
         config.k_values,
         config.n_donors,
@@ -1164,7 +1572,8 @@ def main() -> None:
     per_sequence = len(all_specs) // max(n_sequences, 1)
     logger.info(f"  {len(all_specs)} total specs ({per_sequence} per sequence)")
 
-    series_keys = [_series_key("past_consistent", k) for k in config.k_values] + [
+    past_series_keys = _past_series_keys(config.k_values)
+    series_keys = past_series_keys + [
         "garbage_valid",
         "garbage_random",
     ]
@@ -1177,8 +1586,8 @@ def main() -> None:
         for series_key in series_keys
     }
     steering_norm_data: dict[str, dict[int, list[tuple[int, int, float]]]] = {
-        _series_key("past_consistent", k): {layer: [] for layer in config.layer_indices}
-        for k in config.k_values
+        series_key: {layer: [] for layer in config.layer_indices}
+        for series_key in past_series_keys
     }
     unsteered_to_target_data: dict[str, list[tuple[int, int, float]]] = {series_key: [] for series_key in series_keys}
     raw_records: list[dict[str, object]] = []
@@ -1234,6 +1643,7 @@ def main() -> None:
                 record = {
                     "layer": layer,
                     "condition": spec.condition,
+                    "series_key": series_key,
                     "k": spec.k,
                     "seq_idx": spec.seq_idx,
                     "sub_idx": spec.sub_idx,
@@ -1255,10 +1665,18 @@ def main() -> None:
             for series_key in steering_norm_data
         }
         past_summary = "  ".join(
-            f"K={k}:{layer_means[f'past_consistent_k{k}']:.4f}" for k in config.k_values
+            (
+                f"K={k}:shared={layer_means[_past_series_key('past_consistent_shared_prefix', k)]:.4f}"
+                f"/diff={layer_means[_past_series_key('past_consistent', k)]:.4f}"
+            )
+            for k in config.k_values
         )
         past_norm_summary = "  ".join(
-            f"K={k}:{layer_norm_means[f'past_consistent_k{k}']:.4f}" for k in config.k_values
+            (
+                f"K={k}:shared={layer_norm_means[_past_series_key('past_consistent_shared_prefix', k)]:.4f}"
+                f"/diff={layer_norm_means[_past_series_key('past_consistent', k)]:.4f}"
+            )
+            for k in config.k_values
         )
         logger.info(
             f"    {past_summary}  "
@@ -1320,6 +1738,10 @@ def main() -> None:
             series_key: {str(layer): values for layer, values in by_layer.items()}
             for series_key, by_layer in agg_to_factual.items()
         },
+        "steering_norms": {
+            series_key: {str(layer): values for layer, values in by_layer.items()}
+            for series_key, by_layer in agg_steering_norm.items()
+        },
         "past_consistent_steering_norms": {
             series_key: {str(layer): values for layer, values in by_layer.items()}
             for series_key, by_layer in agg_steering_norm.items()
@@ -1331,17 +1753,42 @@ def main() -> None:
     logger.info("Saved metrics.json")
 
     logger.info("Generating plots ...")
-    _plot_main_result(agg_to_target, config.layer_indices, baseline, fig_dir / "kl_vs_layer")
+    _plot_main_result(agg_to_target, config.k_values, config.layer_indices, baseline, fig_dir / "kl_vs_layer")
     _plot_k_sweep(agg_to_target, config.k_values, config.layer_indices, fig_dir / "kl_vs_k")
+    _plot_past_variant_overlay(
+        agg_to_target,
+        config.k_values,
+        config.layer_indices,
+        fig_dir / "past_consistent_overlay",
+    )
     _plot_steering_norm_vs_layer(
         agg_steering_norm,
         config.k_values,
         config.layer_indices,
         fig_dir / "steering_norm_vs_layer",
     )
-    _plot_heatmaps(agg_to_target, config.layer_indices, fig_dir)
+    _plot_heatmaps(agg_to_target, config.k_values, config.layer_indices, fig_dir)
     _plot_to_factual(agg_to_factual, baseline, config.layer_indices, fig_dir / "kl_to_factual")
-    for series_key in series_keys:
+    for k in config.k_values:
+        _plot_crossing_pair(
+            k,
+            agg_to_target,
+            agg_to_factual,
+            agg_unsteered_to_target,
+            baseline,
+            config.layer_indices,
+            fig_dir / f"crossing_past_consistent_k{k}",
+        )
+        _plot_causal_shift_pair(
+            k,
+            agg_to_target,
+            agg_to_factual,
+            agg_unsteered_to_target,
+            baseline,
+            config.layer_indices,
+            fig_dir / f"causal_shift_past_consistent_k{k}",
+        )
+    for series_key in ("garbage_valid", "garbage_random"):
         _plot_crossing(
             series_key,
             agg_to_target,
