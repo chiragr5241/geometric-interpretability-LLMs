@@ -358,11 +358,33 @@ def _plot_sanity_check(
     fig.write_image(str(path.with_suffix(".png")))
 
 
-def _scatter_layer_subset(layer_indices: list[int], n_max: int = 6) -> list[int]:
-    if len(layer_indices) <= n_max:
-        return list(layer_indices)
-    idx = np.round(np.linspace(0, len(layer_indices) - 1, n_max)).astype(int)
-    return [layer_indices[int(i)] for i in idx]
+def _add_trend_line(
+    fig,
+    x_vals: list[float],
+    y_vals: list[float],
+    row: int,
+    col: int,
+) -> None:
+    if len(x_vals) < 5:
+        return
+    x_arr = np.array(x_vals, dtype=float)
+    y_arr = np.array(y_vals, dtype=float)
+    valid = (y_arr > 0) & np.isfinite(x_arr) & np.isfinite(y_arr)
+    if valid.sum() < 5:
+        return
+    try:
+        coeffs = np.polyfit(x_arr[valid], np.log(y_arr[valid]), deg=2)
+        x_fit = np.linspace(x_arr[valid].min(), x_arr[valid].max(), 120)
+        y_fit = np.exp(np.polyval(coeffs, x_fit))
+        fig.add_trace(go.Scatter(
+            x=x_fit.tolist(), y=y_fit.tolist(),
+            mode="lines",
+            line=dict(color="rgba(0,0,0,0.30)", width=1.2),
+            showlegend=False,
+            hoverinfo="skip",
+        ), row=row, col=col)
+    except Exception:
+        pass
 
 
 def _plot_scatter(
@@ -372,20 +394,19 @@ def _plot_scatter(
     x_label: str,
     title_suffix: str,
     path: Path,
+    n_cols: int = 6,
 ) -> None:
-    scatter_layers = _scatter_layer_subset(layer_indices)
-    n_cols = min(3, len(scatter_layers))
-    n_rows = (len(scatter_layers) + n_cols - 1) // n_cols
+    n_rows = (len(layer_indices) + n_cols - 1) // n_cols
 
     fig = make_subplots(
         rows=n_rows, cols=n_cols,
-        subplot_titles=[f"Layer {l}" for l in scatter_layers],
-        horizontal_spacing=0.08,
-        vertical_spacing=0.18 if n_rows > 1 else 0.1,
+        subplot_titles=[f"Layer {l}" for l in layer_indices],
+        horizontal_spacing=0.05,
+        vertical_spacing=0.10,
     )
 
     by_layer: dict[int, dict[str, list]] = {
-        l: {"xf": [], "yf": [], "xc": [], "yc": []} for l in scatter_layers
+        l: {"xf": [], "yf": [], "xc": [], "yc": []} for l in layer_indices
     }
     for rec in records:
         if rec["layer"] not in by_layer:
@@ -398,7 +419,7 @@ def _plot_scatter(
             d["xc"].append(rec[x_key])
             d["yc"].append(rec["kl"])
 
-    for i, layer in enumerate(scatter_layers):
+    for i, layer in enumerate(layer_indices):
         row = i // n_cols + 1
         col = i % n_cols + 1
         show_legend = (i == 0)
@@ -408,28 +429,37 @@ def _plot_scatter(
             x=d["xc"], y=d["yc"],
             name="counterfactual",
             mode="markers",
-            marker=dict(color="#ff7f0e", size=4, opacity=0.5),
+            marker=dict(color="#ff7f0e", size=7, opacity=0.55),
             showlegend=show_legend,
         ), row=row, col=col)
         fig.add_trace(go.Scatter(
             x=d["xf"], y=d["yf"],
             name="factual",
             mode="markers",
-            marker=dict(color="#1f77b4", size=4, opacity=0.5),
+            marker=dict(color="#1f77b4", size=7, opacity=0.55),
             showlegend=show_legend,
         ), row=row, col=col)
 
+        _add_trend_line(fig, d["xf"] + d["xc"], d["yf"] + d["yc"], row, col)
+
     fig.update_yaxes(type="log")
-    fig.update_xaxes(title_text=x_label)
-    fig.update_yaxes(title_text="KL [nats]")
+
+    for i, layer in enumerate(layer_indices):
+        row = i // n_cols + 1
+        col = i % n_cols + 1
+        if row == n_rows:
+            fig.update_xaxes(title_text=x_label, row=row, col=col)
+        if col == 1:
+            fig.update_yaxes(title_text="KL [nats]", row=row, col=col)
+
     fig.update_layout(
         title=(
             f"KL vs {title_suffix}<br>"
-            "<sup>Blue = factual | Orange = counterfactual. "
-            "Prediction: points lie on the same curve regardless of color.</sup>"
+            "<sup>Blue = factual | Orange = counterfactual | Black curve = combined trend. "
+            "Prediction: same curve regardless of color.</sup>"
         ),
-        height=max(320, 300 * n_rows + 80),
-        width=min(340 * n_cols + 80, 1200),
+        height=220 * n_rows + 120,
+        width=220 * n_cols + 180,
         margin=dict(t=80, b=60, l=70, r=40),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
