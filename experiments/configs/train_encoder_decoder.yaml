@@ -1,4 +1,5 @@
 experiment_name: train_encoder_decoder
+output_user: dani
 
 n_train_sequences: 15
 n_eval_sequences: 5

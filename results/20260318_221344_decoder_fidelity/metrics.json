@@ -1,0 +1,282 @@
+{
+  "0": {
+    "pearson_dec": -0.8646494150161743,
+    "pearson_dec_norm": -0.8704785704612732,
+    "pearson_rt": -0.853903591632843,
+    "pearson_rt_norm": -0.866868793964386,
+    "mean_mse_dec": 0.3964828550815582,
+    "mean_mse_dec_norm": 0.036107517778873444,
+    "mean_mse_rt": 0.3820152282714844,
+    "mean_mse_rt_norm": 0.03470578044652939
+  },
+  "1": {
+    "pearson_dec": -0.8953022956848145,
+    "pearson_dec_norm": -0.9062545299530029,
+    "pearson_rt": -0.8950158357620239,
+    "pearson_rt_norm": -0.9096460938453674,
+    "mean_mse_dec": 0.9236992001533508,
+    "mean_mse_dec_norm": 0.12484733760356903,
+    "mean_mse_rt": 0.9124491214752197,
+    "mean_mse_rt_norm": 0.12313082814216614
+  },
+  "2": {
+    "pearson_dec": -0.7568591237068176,
+    "pearson_dec_norm": -0.7698410749435425,
+    "pearson_rt": -0.7529749870300293,
+    "pearson_rt_norm": -0.7669903039932251,
+    "mean_mse_dec": 2.922685146331787,
+    "mean_mse_dec_norm": 0.16595347225666046,
+    "mean_mse_rt": 2.913757801055908,
+    "mean_mse_rt_norm": 0.1653805375099182
+  },
+  "3": {
+    "pearson_dec": -0.7028282880783081,
+    "pearson_dec_norm": -0.7695215940475464,
+    "pearson_rt": -0.7004023194313049,
+    "pearson_rt_norm": -0.7670862078666687,
+    "mean_mse_dec": 4.906111717224121,
+    "mean_mse_dec_norm": 0.18062584102153778,
+    "mean_mse_rt": 4.897884845733643,
+    "mean_mse_rt_norm": 0.1803109347820282
+  },
+  "4": {
+    "pearson_dec": -0.6904783844947815,
+    "pearson_dec_norm": -0.8333637714385986,
+    "pearson_rt": -0.689953088760376,
+    "pearson_rt_norm": -0.833819568157196,
+    "mean_mse_dec": 6.822743892669678,
+    "mean_mse_dec_norm": 0.20952878892421722,
+    "mean_mse_rt": 6.810217380523682,
+    "mean_mse_rt_norm": 0.20910902321338654
+  },
+  "5": {
+    "pearson_dec": -0.6540056467056274,
+    "pearson_dec_norm": -0.7989370226860046,
+    "pearson_rt": -0.6524621844291687,
+    "pearson_rt_norm": -0.7976865768432617,
+    "mean_mse_dec": 8.859890937805176,
+    "mean_mse_dec_norm": 0.25351616740226746,
+    "mean_mse_rt": 8.847999572753906,
+    "mean_mse_rt_norm": 0.2531643509864807
+  },
+  "6": {
+    "pearson_dec": -0.6317562460899353,
+    "pearson_dec_norm": -0.7910895347595215,
+    "pearson_rt": -0.6300851106643677,
+    "pearson_rt_norm": -0.7897047400474548,
+    "mean_mse_dec": 13.704301834106445,
+    "mean_mse_dec_norm": 0.30233776569366455,
+    "mean_mse_rt": 13.694110870361328,
+    "mean_mse_rt_norm": 0.3020995557308197
+  },
+  "7": {
+    "pearson_dec": -0.5947378873825073,
+    "pearson_dec_norm": -0.7425703406333923,
+    "pearson_rt": -0.5936750769615173,
+    "pearson_rt_norm": -0.7417989373207092,
+    "mean_mse_dec": 19.543142318725586,
+    "mean_mse_dec_norm": 0.3544910252094269,
+    "mean_mse_rt": 19.529706954956055,
+    "mean_mse_rt_norm": 0.3542390763759613
+  },
+  "8": {
+    "pearson_dec": -0.6625009179115295,
+    "pearson_dec_norm": -0.7797922492027283,
+    "pearson_rt": -0.6610481142997742,
+    "pearson_rt_norm": -0.7785836458206177,
+    "mean_mse_dec": 18.784709930419922,
+    "mean_mse_dec_norm": 0.35522472858428955,
+    "mean_mse_rt": 18.770631790161133,
+    "mean_mse_rt_norm": 0.35495078563690186
+  },
+  "9": {
+    "pearson_dec": -0.6501366496086121,
+    "pearson_dec_norm": -0.7909355759620667,
+    "pearson_rt": -0.6481936573982239,
+    "pearson_rt_norm": -0.7894128561019897,
+    "mean_mse_dec": 19.663381576538086,
+    "mean_mse_dec_norm": 0.3502025008201599,
+    "mean_mse_rt": 19.645305633544922,
+    "mean_mse_rt_norm": 0.34986624121665955
+  },
+  "10": {
+    "pearson_dec": -0.6817901730537415,
+    "pearson_dec_norm": -0.7713266611099243,
+    "pearson_rt": -0.6797031760215759,
+    "pearson_rt_norm": -0.7695819735527039,
+    "mean_mse_dec": 18.805194854736328,
+    "mean_mse_dec_norm": 0.29750099778175354,
+    "mean_mse_rt": 18.78693389892578,
+    "mean_mse_rt_norm": 0.2972038686275482
+  },
+  "11": {
+    "pearson_dec": -0.6796862483024597,
+    "pearson_dec_norm": -0.7819295525550842,
+    "pearson_rt": -0.6773018836975098,
+    "pearson_rt_norm": -0.779905378818512,
+    "mean_mse_dec": 25.931299209594727,
+    "mean_mse_dec_norm": 0.322711318731308,
+    "mean_mse_rt": 25.908992767333984,
+    "mean_mse_rt_norm": 0.32241880893707275
+  },
+  "12": {
+    "pearson_dec": -0.676852822303772,
+    "pearson_dec_norm": -0.7417313456535339,
+    "pearson_rt": -0.672730565071106,
+    "pearson_rt_norm": -0.7379024028778076,
+    "mean_mse_dec": 25.286012649536133,
+    "mean_mse_dec_norm": 0.28197181224823,
+    "mean_mse_rt": 25.24681282043457,
+    "mean_mse_rt_norm": 0.28152787685394287
+  },
+  "13": {
+    "pearson_dec": -0.7626382112503052,
+    "pearson_dec_norm": -0.7624465227127075,
+    "pearson_rt": -0.7599127292633057,
+    "pearson_rt_norm": -0.7595300674438477,
+    "mean_mse_dec": 29.05791473388672,
+    "mean_mse_dec_norm": 0.2670804262161255,
+    "mean_mse_rt": 29.003192901611328,
+    "mean_mse_rt_norm": 0.2665838897228241
+  },
+  "14": {
+    "pearson_dec": -0.6966343522071838,
+    "pearson_dec_norm": -0.7241385579109192,
+    "pearson_rt": -0.6893633604049683,
+    "pearson_rt_norm": -0.7177923321723938,
+    "mean_mse_dec": 27.142108917236328,
+    "mean_mse_dec_norm": 0.19754384458065033,
+    "mean_mse_rt": 27.055957794189453,
+    "mean_mse_rt_norm": 0.1968999207019806
+  },
+  "15": {
+    "pearson_dec": -0.6838953495025635,
+    "pearson_dec_norm": -0.6915878057479858,
+    "pearson_rt": -0.6750869154930115,
+    "pearson_rt_norm": -0.6833134293556213,
+    "mean_mse_dec": 27.28660774230957,
+    "mean_mse_dec_norm": 0.15504269301891327,
+    "mean_mse_rt": 27.181888580322266,
+    "mean_mse_rt_norm": 0.15443865954875946
+  },
+  "16": {
+    "pearson_dec": -0.666984498500824,
+    "pearson_dec_norm": -0.6735087037086487,
+    "pearson_rt": -0.6542327404022217,
+    "pearson_rt_norm": -0.6606812477111816,
+    "mean_mse_dec": 27.60877799987793,
+    "mean_mse_dec_norm": 0.1368868350982666,
+    "mean_mse_rt": 27.503210067749023,
+    "mean_mse_rt_norm": 0.136360302567482
+  },
+  "17": {
+    "pearson_dec": -0.6601316928863525,
+    "pearson_dec_norm": -0.6699915528297424,
+    "pearson_rt": -0.6478691697120667,
+    "pearson_rt_norm": -0.6576997637748718,
+    "mean_mse_dec": 28.424528121948242,
+    "mean_mse_dec_norm": 0.11813948303461075,
+    "mean_mse_rt": 28.32073211669922,
+    "mean_mse_rt_norm": 0.11770348995923996
+  },
+  "18": {
+    "pearson_dec": -0.6566656231880188,
+    "pearson_dec_norm": -0.665998101234436,
+    "pearson_rt": -0.6426050066947937,
+    "pearson_rt_norm": -0.6515832543373108,
+    "mean_mse_dec": 29.63309669494629,
+    "mean_mse_dec_norm": 0.10866998881101608,
+    "mean_mse_rt": 29.532577514648438,
+    "mean_mse_rt_norm": 0.10829783976078033
+  },
+  "19": {
+    "pearson_dec": -0.6502748131752014,
+    "pearson_dec_norm": -0.6493218541145325,
+    "pearson_rt": -0.6360655426979065,
+    "pearson_rt_norm": -0.6350440979003906,
+    "mean_mse_dec": 39.97004318237305,
+    "mean_mse_dec_norm": 0.10998949408531189,
+    "mean_mse_rt": 39.83029556274414,
+    "mean_mse_rt_norm": 0.10960496962070465
+  },
+  "20": {
+    "pearson_dec": -0.6653909087181091,
+    "pearson_dec_norm": -0.649605393409729,
+    "pearson_rt": -0.6501550674438477,
+    "pearson_rt_norm": -0.6342496275901794,
+    "mean_mse_dec": 42.33903884887695,
+    "mean_mse_dec_norm": 0.09799505025148392,
+    "mean_mse_rt": 42.16355895996094,
+    "mean_mse_rt_norm": 0.09759056568145752
+  },
+  "21": {
+    "pearson_dec": -0.6784340143203735,
+    "pearson_dec_norm": -0.673649251461029,
+    "pearson_rt": -0.6571420431137085,
+    "pearson_rt_norm": -0.6523520350456238,
+    "mean_mse_dec": 46.40476608276367,
+    "mean_mse_dec_norm": 0.08658485859632492,
+    "mean_mse_rt": 46.25338363647461,
+    "mean_mse_rt_norm": 0.08629829436540604
+  },
+  "22": {
+    "pearson_dec": -0.7015568614006042,
+    "pearson_dec_norm": -0.6893593072891235,
+    "pearson_rt": -0.682669997215271,
+    "pearson_rt_norm": -0.6701602935791016,
+    "mean_mse_dec": 54.84375,
+    "mean_mse_dec_norm": 0.08489876985549927,
+    "mean_mse_rt": 54.63304901123047,
+    "mean_mse_rt_norm": 0.08457188308238983
+  },
+  "23": {
+    "pearson_dec": -0.6675142645835876,
+    "pearson_dec_norm": -0.6520755887031555,
+    "pearson_rt": -0.6451244354248047,
+    "pearson_rt_norm": -0.6290796995162964,
+    "mean_mse_dec": 59.77133560180664,
+    "mean_mse_dec_norm": 0.07384243607521057,
+    "mean_mse_rt": 59.54582977294922,
+    "mean_mse_rt_norm": 0.07356607913970947
+  },
+  "24": {
+    "pearson_dec": -0.618300199508667,
+    "pearson_dec_norm": -0.6105312705039978,
+    "pearson_rt": -0.5987619757652283,
+    "pearson_rt_norm": -0.5912187099456787,
+    "mean_mse_dec": 67.10171508789062,
+    "mean_mse_dec_norm": 0.06721757352352142,
+    "mean_mse_rt": 66.85047149658203,
+    "mean_mse_rt_norm": 0.0669625774025917
+  },
+  "25": {
+    "pearson_dec": -0.6194134950637817,
+    "pearson_dec_norm": -0.6140346527099609,
+    "pearson_rt": -0.594509482383728,
+    "pearson_rt_norm": -0.5892505645751953,
+    "mean_mse_dec": 85.25177001953125,
+    "mean_mse_dec_norm": 0.06652649492025375,
+    "mean_mse_rt": 85.00242614746094,
+    "mean_mse_rt_norm": 0.06632410734891891
+  },
+  "26": {
+    "pearson_dec": -0.517505407333374,
+    "pearson_dec_norm": -0.5142475962638855,
+    "pearson_rt": -0.49617767333984375,
+    "pearson_rt_norm": -0.4927799105644226,
+    "mean_mse_dec": 113.24030303955078,
+    "mean_mse_dec_norm": 0.06476634740829468,
+    "mean_mse_rt": 113.03984832763672,
+    "mean_mse_rt_norm": 0.06464871764183044
+  },
+  "27": {
+    "pearson_dec": -0.3805058002471924,
+    "pearson_dec_norm": -0.3760702610015869,
+    "pearson_rt": -0.34938207268714905,
+    "pearson_rt_norm": -0.3459838032722473,
+    "mean_mse_dec": 192.4009246826172,
+    "mean_mse_dec_norm": 0.03931214287877083,
+    "mean_mse_rt": 192.18931579589844,
+    "mean_mse_rt_norm": 0.039270710200071335
+  }
+}

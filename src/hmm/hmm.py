@@ -295,6 +295,32 @@ class Mess3HMM:
 
         return beliefs
 
+    def sample_continuation(
+        self,
+        initial_belief: np.ndarray,
+        seq_length: int,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if rng is None:
+            rng = np.random.default_rng()
+
+        belief = np.asarray(initial_belief, dtype=np.float32).copy()
+        emission = self.emission_matrix().detach().cpu().numpy()
+        transition = self.T_3d_matrix.detach().cpu().numpy()
+        tokens = np.zeros(seq_length, dtype=np.int64)
+        beliefs = np.zeros((seq_length, self.num_states), dtype=np.float32)
+
+        for idx in range(seq_length):
+            probs = belief @ emission
+            probs = probs / (probs.sum() + 1e-10)
+            token_idx = int(rng.choice(emission.shape[1], p=probs))
+            belief = transition[token_idx] @ belief
+            belief = (belief / (belief.sum() + 1e-10)).astype(np.float32)
+            tokens[idx] = token_idx
+            beliefs[idx] = belief
+
+        return tokens, beliefs
+
     def emission_matrix(self):
         """Emission matrix (n_states, vocab_size): P(token | state)."""
         em = self.T_3d_matrix.sum(dim=2).T  # (n_states, vocab_size)

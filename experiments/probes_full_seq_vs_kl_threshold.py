@@ -7,6 +7,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from dataclasses import dataclass
 
-from experiment import ExperimentConfig, load_config, setup_output_dir
+from experiment import ExperimentConfig, apply_runtime_overrides, load_config, setup_output_dir
 
 
 @dataclass
@@ -252,11 +253,18 @@ def plot_column_cosine_similarity(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <config.yaml>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Transient vs post-threshold probes")
+    parser.add_argument("config", type=str, help="Path to YAML config file")
+    parser.add_argument(
+        "--output-user",
+        type=str,
+        default=None,
+        help="Override output_user from the config file",
+    )
+    args = parser.parse_args()
 
-    config = load_config(sys.argv[1], ProbesFullSeqVsKLThresholdConfig)
+    config = load_config(args.config, ProbesFullSeqVsKLThresholdConfig)
+    apply_runtime_overrides(config, output_user=args.output_user)
     n_runs = config.n_runs
     device = get_device()
 

@@ -11,6 +11,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from dataclasses import dataclass
 
-from experiment import ExperimentConfig, load_config, setup_output_dir
+from experiment import ExperimentConfig, apply_runtime_overrides, load_config, setup_output_dir
 
 
 from experiment_utils import (
@@ -266,11 +267,18 @@ def plot_alignment_comparison(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <config.yaml>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Cross-sequence subspace alignment")
+    parser.add_argument("config", type=str, help="Path to YAML config file")
+    parser.add_argument(
+        "--output-user",
+        type=str,
+        default=None,
+        help="Override output_user from the config file",
+    )
+    args = parser.parse_args()
 
-    config = load_config(sys.argv[1], ProbesCrossSequenceAlignmentConfig)
+    config = load_config(args.config, ProbesCrossSequenceAlignmentConfig)
+    apply_runtime_overrides(config, output_user=args.output_user)
     M: int = config.n_sequences
     device = get_device()
 

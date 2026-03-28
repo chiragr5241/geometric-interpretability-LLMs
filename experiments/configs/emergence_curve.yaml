@@ -1,4 +1,5 @@
 experiment_name: emergence_curve
+output_user: dani
 
 pooled_probe_dir: "outputs/dani/20260306_190511_train_pooled_probes"
 

@@ -1,0 +1,28 @@
+experiment_name: activation_steering
+output_user: dani
+
+encoder_decoder_dir: "outputs/dani/20260316_155024_train_encoder_decoder"
+
+n_sequences: 20
+seq_length: 400
+batch_size: 20
+n_donors: 5
+n_random_samples: 5
+k_values: [1, 5, 10, 25, 50, 100]
+pooled_probes: true
+
+hmm:
+  process_name: mess3
+  process_params:
+    x: 0.05
+    alpha: 0.9
+
+model_name: "meta-llama/Llama-3.2-3B"
+n_ctx_override: 10000
+
+layer_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 19, 21, 23, 25, 27]
+
+vocab_mapping:
+  "A": 0
+  "B": 1
+  "C": 2

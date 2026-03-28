@@ -41,7 +41,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from decoder import Decoder, DecoderResult
-from experiment import ExperimentConfig, load_config, setup_output_dir
+from experiment import ExperimentConfig, apply_runtime_overrides, load_config, setup_output_dir
 from experiment_utils import (
     build_emission_matrix,
     get_device,
@@ -569,6 +569,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Activation patching experiment")
     parser.add_argument("config", type=str, help="Path to YAML config file")
     parser.add_argument(
+        "--output-user",
+        type=str,
+        default=None,
+        help="Override output_user from the config file",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -579,6 +585,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config, ActivationPatchingConfig)
+    apply_runtime_overrides(config, output_user=args.output_user)
 
     if args.dry_run:
         config.layer_indices  = [l for l in DRY_RUN_LAYERS if l in config.layer_indices]

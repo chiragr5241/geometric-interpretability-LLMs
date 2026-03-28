@@ -1,4 +1,5 @@
 experiment_name: token_probability_diagnostic
+output_user: dani
 
 n_sequences: 50
 seq_length: 500
