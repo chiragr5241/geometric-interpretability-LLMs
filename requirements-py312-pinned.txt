@@ -1,0 +1,23 @@
+# Pinned working versions for the py312 conda environment (Python 3.12).
+# GPU: NVIDIA GeForce GTX 1080 (compute capability 6.1 / Pascal)
+# torch must be +cu118 — CUDA 12.x builds drop Pascal support.
+# transformer-lens 2.17.0+ is required for n_ctx kwarg to be handled correctly
+#   (older versions leak it to HuggingFace's model __init__, which errors in transformers>=4.40).
+# torchvision must NOT be installed — it conflicts with the torch/transformers import chain.
+# numpy>=2.0 is required by jax 0.9.x (uses np.asarray(..., copy=copy)).
+
+torch==2.6.0+cu118
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+transformer-lens==2.17.0
+transformers==4.57.6
+tokenizers==0.22.2
+accelerate==1.12.0
+
+numpy==2.4.3
+scipy==1.17.0
+
+jax==0.9.0.1
+jaxlib==0.9.0.1
+jaxtyping==0.3.9
+simplexity @ git+https://github.com/Astera-org/simplexity.git

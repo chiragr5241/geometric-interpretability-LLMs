@@ -96,6 +96,35 @@ def load_model(
     return model
 
 
+def get_concept_token_ids(model, concepts: list[str]) -> dict[str, int]:
+    """Get the LLM token ID for each concept (space-prefixed).
+
+    Parameters
+    ----------
+    model
+        A ``HookedTransformer`` (or any model with ``.to_tokens``).
+    concepts : list[str]
+        HMM symbol names, e.g. ``["A", "B", "C"]``.
+
+    Returns
+    -------
+    dict mapping concept name → LLM token ID.
+    """
+    concept_to_id: dict[str, int] = {}
+    for concept in concepts:
+        spaced = f" {concept}"
+        ids = model.to_tokens(spaced, prepend_bos=False)[0]
+        concept_to_id[concept] = ids[-1].item()
+    return concept_to_id
+
+
+def compute_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """R² (coefficient of determination) score."""
+    ss_res = float(np.sum((y_pred - y_true) ** 2))
+    ss_tot = float(np.sum((y_true - y_true.mean(axis=0, keepdims=True)) ** 2))
+    return float(1.0 - ss_res / (ss_tot + 1e-10))
+
+
 def build_emission_matrix(hmm) -> np.ndarray:
     """
     emit[token_idx, state_idx] = P(token | state)

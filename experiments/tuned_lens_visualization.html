@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tuned Lens — Mathematical Explanation</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+  :root {
+    --bg: #0a0a1a;
+    --bg2: #12122a;
+    --accent: #4fc3f7;
+    --gold: #ffd54f;
+    --green: #81c784;
+    --red: #e57373;
+    --purple: #ce93d8;
+    --orange: #ffb74d;
+    --text: #e0e0e0;
+    --muted: #888;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow-x: hidden;
+  }
+
+  /* ── Navigation ─────────────────────────────────────── */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(10,10,26,0.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid rgba(79,195,247,0.15);
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 24px; overflow-x: auto;
+  }
+  nav button {
+    background: none; border: 1px solid rgba(255,255,255,0.1);
+    color: var(--muted); padding: 6px 14px; border-radius: 6px;
+    font-size: 13px; cursor: pointer; white-space: nowrap;
+    transition: all .25s;
+  }
+  nav button:hover, nav button.active {
+    color: var(--accent); border-color: var(--accent);
+    background: rgba(79,195,247,0.08);
+  }
+
+  /* ── Sections ───────────────────────────────────────── */
+  .section {
+    min-height: 100vh; padding: 90px 40px 60px;
+    display: none; animation: fadeSlideIn .5s ease;
+  }
+  .section.visible { display: block; }
+
+  @keyframes fadeSlideIn {
+    from { opacity: 0; transform: translateY(30px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  h1 { font-size: 3em; font-weight: 700; margin-bottom: 8px; }
+  h2 { font-size: 1.8em; font-weight: 600; margin-bottom: 16px; color: var(--gold); }
+  h3 { font-size: 1.2em; font-weight: 600; margin: 20px 0 10px; color: var(--accent); }
+
+  p, li { line-height: 1.7; max-width: 800px; }
+  .muted { color: var(--muted); }
+
+  /* ── Math blocks ────────────────────────────────────── */
+  .math-block {
+    background: var(--bg2);
+    border-left: 3px solid var(--accent);
+    padding: 20px 28px; margin: 20px 0;
+    border-radius: 0 8px 8px 0;
+    font-size: 1.15em;
+    overflow-x: auto;
+  }
+  .math-block.gold { border-color: var(--gold); }
+  .math-block.green { border-color: var(--green); }
+  .math-block.red { border-color: var(--red); }
+
+  .math-inline {
+    background: rgba(79,195,247,0.08);
+    padding: 2px 6px; border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--accent);
+  }
+
+  /* ── Code blocks ────────────────────────────────────── */
+  pre {
+    background: #1a1a2e;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+    padding: 20px; margin: 16px 0;
+    overflow-x: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85em; line-height: 1.7;
+  }
+  .kw { color: var(--purple); }
+  .fn { color: var(--accent); }
+  .cm { color: #666; font-style: italic; }
+  .str { color: var(--green); }
+  .num { color: var(--orange); }
+  .op { color: var(--red); }
+
+  /* ── Pipeline diagram ───────────────────────────────── */
+  .pipeline {
+    display: flex; align-items: center; gap: 0;
+    margin: 30px 0; overflow-x: auto; padding: 10px 0;
+  }
+  .pipe-step {
+    text-align: center; padding: 14px 18px;
+    border-radius: 10px; min-width: 130px;
+    border: 1.5px solid; position: relative;
+    transition: transform .3s, box-shadow .3s;
+  }
+  .pipe-step:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 8px 25px rgba(0,0,0,0.4);
+  }
+  .pipe-step .label { font-size: 0.75em; margin-top: 6px; color: var(--muted); }
+  .pipe-step .math { font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
+  .pipe-arrow {
+    font-size: 1.5em; color: var(--muted); padding: 0 6px;
+    flex-shrink: 0;
+  }
+
+  /* ── Charts ─────────────────────────────────────────── */
+  .chart-container {
+    background: var(--bg2);
+    border-radius: 12px; padding: 24px;
+    margin: 20px 0; position: relative;
+  }
+  .chart-title {
+    font-size: 0.95em; font-weight: 600;
+    margin-bottom: 12px; color: var(--accent);
+  }
+  canvas { display: block; }
+
+  .chart-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    gap: 20px;
+  }
+
+  /* ── Insight cards ──────────────────────────────────── */
+  .insight-card {
+    background: var(--bg2);
+    border-radius: 10px; padding: 20px 24px;
+    margin: 12px 0;
+    border-left: 3px solid;
+    transition: transform .2s;
+  }
+  .insight-card:hover { transform: translateX(4px); }
+  .insight-card .num {
+    font-size: 1.4em; font-weight: 700;
+    margin-right: 12px; float: left;
+  }
+
+  /* ── Animated layer diagram ─────────────────────────── */
+  .layer-stack {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 4px; margin: 20px 0;
+  }
+  .layer-block {
+    width: 200px; padding: 8px; text-align: center;
+    border-radius: 6px; font-size: 0.8em;
+    cursor: pointer; transition: all .3s;
+    border: 1px solid transparent;
+  }
+  .layer-block:hover {
+    border-color: var(--accent);
+    transform: scaleX(1.05);
+  }
+  .layer-block.highlighted {
+    border-color: var(--gold);
+    box-shadow: 0 0 15px rgba(255,213,79,0.2);
+  }
+  .layer-arrow { color: var(--muted); font-size: 0.9em; }
+
+  /* ── Tooltip ────────────────────────────────────────── */
+  #tooltip {
+    position: fixed; background: #1a1a2e;
+    border: 1px solid var(--accent);
+    border-radius: 8px; padding: 12px 16px;
+    font-size: 0.82em; pointer-events: none;
+    z-index: 200; display: none; max-width: 280px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+  }
+
+  /* ── Responsive ─────────────────────────────────────── */
+  @media (max-width: 768px) {
+    .section { padding: 80px 16px 40px; }
+    h1 { font-size: 2em; }
+    .chart-grid { grid-template-columns: 1fr; }
+    .pipeline { flex-wrap: wrap; justify-content: center; }
+  }
+
+  /* ── Step-through animation ─────────────────────────── */
+  .step { opacity: 0; transform: translateY(20px); transition: all .6s ease; }
+  .step.show { opacity: 1; transform: translateY(0); }
+</style>
+</head>
+<body>
+
+<nav id="nav"></nav>
+<div id="tooltip"></div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 0: TITLE
+     ═══════════════════════════════════════════════════════ -->
+<div class="section visible" id="sec-title">
+  <h1 style="color:var(--accent)">Tuned Lens</h1>
+  <p style="font-size:1.3em; margin-bottom:8px;">
+    Reading Every Layer of <span style="color:var(--gold)">Llama-3.2-3B</span>
+  </p>
+  <p class="muted" style="margin-bottom: 40px;">
+    An interactive mathematical walkthrough &middot;
+    Based on nostalgebraist-lol &amp; belrose et al. (arXiv:2303.08112)
+  </p>
+
+  <div class="math-block gold" style="max-width:600px;">
+    <strong>Core idea:</strong> Train a simple affine probe at each layer so we can
+    "read off" the model's next-token prediction from <em>any</em> intermediate representation.
+  </div>
+
+  <p style="margin-top:30px; color:var(--muted); font-size:0.9em;">
+    Use the navigation bar above to step through each section, or press <kbd style="background:#333;padding:2px 8px;border-radius:4px;">→</kbd> / <kbd style="background:#333;padding:2px 8px;border-radius:4px;">←</kbd> to navigate.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 1: THE PROBLEM
+     ═══════════════════════════════════════════════════════ -->
+<div class="section" id="sec-problem">
+  <h2>1 &mdash; The Problem</h2>
+
+  <p>A transformer with <em>L</em> layers builds up a <strong>residual stream</strong> at each layer:</p>
+
+  <div class="math-block">
+    h<sub>0</sub> &nbsp;→&nbsp; h<sub>1</sub> &nbsp;→&nbsp; h<sub>2</sub> &nbsp;→&nbsp; &hellip; &nbsp;→&nbsp; h<sub>L</sub> &nbsp;→&nbsp; <strong>output</strong>
+    <br><br>
+    Each &nbsp;<span class="math-inline">h<sub>ℓ</sub> ∈ ℝ<sup>3072</sup></span>&nbsp; (for Llama-3.2-3B)
+  </div>
+
+  <div class="step" data-delay="300">
+    <h3>The question</h3>
+    <p>
+      What does each layer <em>"know"</em> about the next token?
+      Is the final prediction already encoded at layer 2, or does genuine computation happen in later layers?
+    </p>
+  </div>
+
+  <div class="step" data-delay="600">
+    <h3>Interactive: 28 layers of Llama-3.2-3B</h3>
+    <p class="muted" style="margin-bottom:10px;">Hover over a layer to see its metrics from our experiment.</p>
+    <div class="layer-stack" id="layer-stack"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 2: LOGIT LENS
+     ═══════════════════════════════════════════════════════ -->
+<div class="section" id="sec-logit">
+  <h2>2 &mdash; Logit Lens (Baseline)</h2>
+
+  <p>The simplest approach: just apply the final layer's unembedding directly to any intermediate representation.</p>
+
+  <div class="pipeline" id="logit-pipeline">
+    <div class="pipe-step" style="border-color:var(--red);background:rgba(229,115,115,0.08)">
+      <div class="math">h<sub>ℓ</sub></div>
+      <div class="label">Residual stream</div>
+    </div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-step" style="border-color:var(--orange);background:rgba(255,183,77,0.08)">
+      <div class="math">LN<sub>final</sub>(·)</div>
+      <div class="label">Layer norm</div>
+    </div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-step" style="border-color:var(--purple);background:rgba(206,147,216,0.08)">
+      <div class="math">W<sub>U</sub> · (·) + b<sub>U</sub></div>
+      <div class="label">Unembed</div>
+    </div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-step" style="border-color:var(--green);background:rgba(129,199,132,0.08)">
+      <div class="math">softmax</div>
+      <div class="label">→ p<sub>logit</sub></div>
+    </div>
+  </div>
+
+  <div class="math-block red step" data-delay="400">
+    <strong>Problem:</strong> Early layers haven't aligned their representations to the unembedding space.
+    The logit lens produces <strong>KL &gt; 1.5</strong> at layer 2 &mdash; essentially garbage.
+    <br><br>
+    Layers 0–1 produce <strong>∞ KL</strong> (distribution collapse / numerical overflow).
+  </div>
+
+  <div class="step" data-delay="700">
+    <pre><span class="cm">// Logit lens implementation (no training needed)</span>
+<span class="kw">def</span> <span class="fn">apply_logit_lens</span>(activations, model, concept_ids):
+    normed = model.<span class="fn">ln_final</span>(activations)       <span class="cm"># Final layer norm</span>
+    logits = normed @ W_concept + b_concept      <span class="cm"># Unembed (concept subset)</span>
+    <span class="kw">return</span> F.<span class="fn">softmax</span>(logits, dim=<span class="num">-1</span>)           <span class="cm"># → probabilities</span></pre>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 3: TUNED LENS MATH
+     ═══════════════════════════════════════════════════════ -->
+<div class="section" id="sec-math">
+  <h2>3 &mdash; Tuned Lens: The Mathematics</h2>
+
+  <div class="step" data-delay="200">
+    <h3>The Translator</h3>
+    <p>Insert a <strong>learned affine transformation</strong> before the logit lens:</p>
+    <div class="math-block gold">
+      T<sub>ℓ</sub>(h<sub>ℓ</sub>) = W<sub>ℓ</sub> · h<sub>ℓ</sub> + b<sub>ℓ</sub>
+      <br><br>
+      <span style="color:var(--muted); font-size:0.9em;">
+        W<sub>ℓ</sub> ∈ ℝ<sup>d×d</sup>, &nbsp; b<sub>ℓ</sub> ∈ ℝ<sup>d</sup>, &nbsp; d = 3072
+      </span>
+    </div>
+  </div>
+
+  <div class="step" data-delay="500">
+    <h3>Identity Initialization</h3>
+    <div class="math-block green">
+      W<sub>ℓ</sub><sup>(0)</sup> = I<sub>d</sub> &nbsp;&nbsp;&nbsp;&nbsp; b<sub>ℓ</sub><sup>(0)</sup> = <strong>0</strong>
+      <br><br>
+      <span style="color:var(--muted); font-size:0.9em;">
+        At initialization, T<sub>ℓ</sub>(h) = h — <strong>identical to the logit lens!</strong>
+        <br>Training starts from the logit lens baseline and learns corrections.
+      </span>
+    </div>
+  </div>
+
+  <div class="step" data-delay="800">
+    <h3>Full Pipeline</h3>
+    <div class="pipeline">
+      <div class="pipe-step" style="border-color:var(--red);background:rgba(229,115,115,0.08)">
+        <div class="math">h<sub>ℓ</sub></div>
+        <div class="label">Residual stream</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step" style="border-color:var(--gold);background:rgba(255,213,79,0.12);border-width:2px">
+        <div class="math" style="color:var(--gold)">T<sub>ℓ</sub>(·)</div>
+        <div class="label" style="color:var(--gold)"><strong>Learned probe</strong></div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step" style="border-color:var(--orange);background:rgba(255,183,77,0.08)">
+        <div class="math">LN<sub>final</sub>(·)</div>
+        <div class="label">Layer norm</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step" style="border-color:var(--purple);background:rgba(206,147,216,0.08)">
+        <div class="math">W<sub>U</sub> · (·) + b<sub>U</sub></div>
+        <div class="label">Unembed</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-step" style="border-color:var(--accent);background:rgba(79,195,247,0.08)">
+        <div class="math">softmax</div>
+        <div class="label">→ p<sup>ℓ</sup><sub>lens</sub></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-delay="1100">
+    <h3>Training Objective</h3>
+    <div class="math-block" style="font-size:1.3em;">
+      <span style="color:var(--gold)">ℒ<sub>ℓ</sub></span> = D<sub>KL</sub>( p<sup>ℓ</sup><sub>lens</sub> ‖ p<sub>final</sub> )
+    </div>
+    <p>
+      Minimize the <strong>KL divergence</strong> between the lens distribution and the model's actual
+      final-layer output. This is computed over the <em>full vocabulary</em> (~128K tokens), not just the
+      3 HMM concept tokens.
+    </p>
+  </div>
+
+  <div class="step" data-delay="1400">
+    <h3>Per-Layer Independence</h3>
+    <p>
+      Each of the <strong>28 layers</strong> gets its own translator — no shared parameters.
+      This allows clean layer-by-layer analysis of information flow.
+    </p>
+    <div class="math-block" style="font-size:0.95em;">
+      Total parameters per translator: d² + d = 3072² + 3072 = <strong>9,440,256</strong>
+      <br>
+      <span style="color:var(--muted);">(compare: full model has ~3.2B parameters)</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 4: TRAINING
+     ═══════════════════════════════════════════════════════ -->
+<div class="section" id="sec-training">
+  <h2>4 &mdash; Training Details</h2>
+
+  <div class="step" data-delay="200">
+    <div style="display:grid; grid-template-columns: repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-bottom:24px;">
+      <div class="math-block" style="text-align:center;margin:0">
+        <div style="color:var(--accent);font-size:1.8em;font-weight:700">28</div>
+        <div style="font-size:0.85em;color:var(--muted)">Layers</div>
+      </div>
+      <div class="math-block" style="text-align:center;margin:0">
+        <div style="color:var(--gold);font-size:1.8em;font-weight:700">50</div>
+        <div style="font-size:0.85em;color:var(--muted)">Epochs per layer</div>
+      </div>
+      <div class="math-block" style="text-align:center;margin:0">
+        <div style="color:var(--green);font-size:1.8em;font-weight:700">512</div>
+        <div style="font-size:0.85em;color:var(--muted)">Batch size</div>
+      </div>
+      <div class="math-block" style="text-align:center;margin:0">
+        <div style="color:var(--orange);font-size:1.8em;font-weight:700">0.001</div>
+        <div style="font-size:0.85em;color:var(--muted)">Learning rate</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-delay="400">
+    <h3>Data: Mess-3 HMM Process</h3>
+    <p>
+      10 sequences × 2000 tokens from a 3-state Hidden Markov Model emitting {A, B, C}.
+      <br>8 sequences for training, 2 for testing (split by sequence to avoid leakage).
+    </p>
+  </div>
+
+  <div class="step" data-delay="600">
+    <h3>Training Loss Curves</h3>
+    <p class="muted" style="margin-bottom:8px;">Simulated from real final KL values. All layers converge quickly.</p>
+    <div class="chart-container">
+      <canvas id="chart-loss" width="800" height="350"></canvas>
+    </div>
+  </div>
+
+  <div class="step" data-delay="800">
+    <h3>Code: Training Loop</h3>
+    <pre><span class="cm"># For each layer independently:</span>
+translator = <span class="fn">TunedLensTranslator</span>(d_model=<span class="num">3072</span>)
+optimizer  = Adam(translator.parameters(), lr=<span class="num">0.001</span>)
+scheduler  = <span class="fn">CosineAnnealingLR</span>(optimizer, T_max=<span class="num">50</span>)
+
+<span class="kw">for</span> epoch <span class="kw">in</span> range(<span class="num">50</span>):
+    <span class="kw">for</span> batch <span class="kw">in</span> <span class="fn">dataloader</span>(activations, batch_size=<span class="num">512</span>):
+        h     = translator(batch)                <span class="cm"># W·h + b</span>
+        normed = model.<span class="fn">ln_final</span>(h)               <span class="cm"># Final layer norm</span>
+        logits = normed @ W_U + b_U              <span class="cm"># Full-vocab logits</span>
+        log_p  = <span class="fn">log_softmax</span>(logits)             <span class="cm"># ~128K-dim log-probs</span>
+
+        loss = <span class="fn">kl_div</span>(log_p, target_log_probs,  <span class="cm"># KL(p_lens || p_final)</span>
+                     reduction=<span class="str">"batchmean"</span>,
+                     log_target=<span class="num">True</span>)
+        loss.<span class="fn">backward</span>()
+        optimizer.<span class="fn">step</span>()</pre>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 5: CODE
+     ═══════════════════════════════════════════════════════ -->
+<div class="section" id="sec-code">
+  <h2>5 &mdash; Implementation Deep-Dive</h2>
+
+  <div class="step" data-delay="200">
+    <h3>The TunedLensTranslator class</h3>
+    <pre><span class="kw">class</span> <span class="fn">TunedLensTranslator</span>(nn.Module):
+    <span class="str">"""Per-layer affine translator h_l → h̃, identity-initialized.
+
+    Following arXiv:2303.08112, the translator is initialized as
+    the identity so training starts from the logit-lens baseline."""</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, d_model: int):
+        super().__init__()
+        self.linear = nn.<span class="fn">Linear</span>(d_model, d_model, bias=<span class="num">True</span>)
+        nn.init.<span class="fn">eye_</span>(self.linear.weight)     <span class="cm"># W = Identity</span>
+        nn.init.<span class="fn">zeros_</span>(self.linear.bias)    <span class="cm"># b = 0</span>
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, x):
+        <span class="kw">return</span> self.<span class="fn">linear</span>(x)               <span class="cm"># Wx + b</span></pre>
+  </div>
+
+  <div class="step" data-delay="500">
+    <h3>Applying the Tuned Lens</h3>
+    <pre><span class="kw">def</span> <span class="fn">apply_tuned_lens</span>(activations, translator, model, concept_ids):
+    <span class="str">"""h → T(h) → LN_final → softmax(W_U · LN(T(h)) + b_U)"""</span>
+    W_concept = model.unembed.W_U[:, concept_ids]  <span class="cm"># Concept subset</span>
+    b_concept = model.unembed.b_U[concept_ids]
+
+    <span class="kw">with</span> torch.<span class="fn">no_grad</span>():
+        h      = <span class="fn">translator</span>(activations)       <span class="cm"># Affine transform</span>
+        normed = model.<span class="fn">ln_final</span>(h)              <span class="cm"># Layer norm</span>
+        logits = normed @ W_concept + b_concept  <span class="cm"># → concept logits</span>
+        <span class="kw">return</span> F.<span class="fn">softmax</span>(logits, dim=<span class="num">-1</span>)       <span class="cm"># → P(A), P(B), P(C)</span></pre>
+  </div>
+
+  <div class="step" data-delay="800">
+    <h3>Key design choice: Full-Vocabulary Training</h3>
+    <div class="math-block green">
+      Training uses all <strong>~128K tokens</strong> in the vocabulary, not just the 3 HMM concepts.
+      This is faithful to the original paper and ensures the translator learns the true
+      geometry of the representation space.
+      <br><br>
+      <span style="color:var(--muted);">At evaluation time, we project onto just the 3 concept tokens {A, B, C} to compare with HMM ground truth.</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 6: RESULTS
+     ═══════════════════════════════════════════════════════ -->
+<div class="section" id="sec-results">
+  <h2>6 &mdash; Results</h2>
+
+  <div class="step" data-delay="200">
+    <h3>Llama-3.2-3B on Mess-3 HMM &mdash; 28 layers</h3>
+    <div class="chart-grid">
+      <div class="chart-container">
+        <div class="chart-title">KL(final ‖ tuned lens) by Layer</div>
+        <canvas id="chart-kl-final" width="450" height="280"></canvas>
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Top-1 Agreement with Final Model</div>
+        <canvas id="chart-top1" width="450" height="280"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-delay="600">
+    <div class="chart-grid">
+      <div class="chart-container">
+        <div class="chart-title">KL(HMM ‖ lens) — Tuned vs Logit Lens</div>
+        <canvas id="chart-kl-hmm" width="450" height="280"></canvas>
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Belief-State Probe R²</div>
+        <canvas id="chart-r2" width="450" height="280"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-delay="900">
+    <h3>Summary Table — Best Layers</h3>
+    <table style="border-collapse:collapse;margin:16px 0;font-size:0.9em;">
+      <thead>
+        <tr style="border-bottom:2px solid var(--accent);">
+          <th style="padding:8px 16px;text-align:left;color:var(--accent)">Criterion</th>
+          <th style="padding:8px 16px;text-align:center;color:var(--accent)">Best Layer</th>
+          <th style="padding:8px 16px;text-align:center;color:var(--accent)">Value</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td style="padding:8px 16px">Lowest KL(final ‖ tuned)</td><td style="text-align:center;color:var(--gold)">26</td><td style="text-align:center">0.0010</td></tr>
+        <tr style="background:rgba(255,255,255,0.02)"><td style="padding:8px 16px">Lowest KL(HMM ‖ tuned)</td><td style="text-align:center;color:var(--gold)">0</td><td style="text-align:center">0.0354</td></tr>
+        <tr><td style="padding:8px 16px">Highest belief-state R²</td><td style="text-align:center;color:var(--gold)">2</td><td style="text-align:center">0.9990</td></tr>
+        <tr style="background:rgba(255,255,255,0.02)"><td style="padding:8px 16px">Highest top-1 agreement</td><td style="text-align:center;color:var(--gold)">26</td><td style="text-align:center">99.3%</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION 7: KEY INSIGHTS
+     ═══════════════════════════════════════════════════════ -->
+<div class="section" id="sec-insights">
+  <h2>7 &mdash; Key Insights</h2>
+
+  <div class="insight-card step" data-delay="200" style="border-color:var(--accent)">
+    <span class="num" style="color:var(--accent)">1</span>
+    <strong>Even layer 0 achieves 97% top-1 agreement</strong> with the final model after an affine correction.
+    The information is there — it's just misaligned.
+  </div>
+
+  <div class="insight-card step" data-delay="500" style="border-color:var(--green)">
+    <span class="num" style="color:var(--green)">2</span>
+    <strong>KL drops from 0.012 → 0.001 across layers.</strong>
+    Later layers perform genuine new predictive computation — they don't just re-express what earlier layers already computed.
+  </div>
+
+  <div class="insight-card step" data-delay="800" style="border-color:var(--purple)">
+    <span class="num" style="color:var(--purple)">3</span>
+    <strong>Belief-state R² peaks at layer 2 (0.999)</strong>, but the tuned lens keeps improving toward the final layer.
+    Interpretation: later layers re-encode representations away from the belief simplex and toward unembedding alignment.
+  </div>
+
+  <div class="insight-card step" data-delay="1100" style="border-color:var(--red)">
+    <span class="num" style="color:var(--red)">4</span>
+    <strong>Logit lens fails catastrophically at early layers</strong> (KL &gt; 1.5), while the tuned lens stays
+    below 0.05 <em>everywhere</em>. The affine correction is both necessary and sufficient.
+  </div>
+
+  <div class="insight-card step" data-delay="1400" style="border-color:var(--gold)">
+    <span class="num" style="color:var(--gold)">5</span>
+    <strong>Information is not lost — it's re-encoded.</strong>
+    The tension between R² (peaks early) and tuned lens KL (improves late) shows that later layers
+    transform the representation for readout, not for belief-state geometry.
+  </div>
+
+  <div class="step" data-delay="1700">
+    <div class="math-block gold" style="text-align:center;font-size:1.3em;margin-top:40px;">
+      T<sub>ℓ</sub>(h<sub>ℓ</sub>) &nbsp;→&nbsp; LN<sub>final</sub> &nbsp;→&nbsp; W<sub>U</sub> &nbsp;→&nbsp; p<sup>ℓ</sup><sub>lens</sub> &nbsp;≈&nbsp; p<sub>final</sub>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     JAVASCRIPT
+     ═══════════════════════════════════════════════════════ -->
+<script>
+// ── Data from experiment ──────────────────────────────────
+const LAYERS = Array.from({length: 28}, (_, i) => i);
+const KL_FINAL_TUNED = [0.0116,0.0104,0.0094,0.0094,0.0088,0.0086,0.0090,0.0095,0.0092,0.0099,0.0103,0.0104,0.0094,0.0089,0.0052,0.0050,0.0039,0.0031,0.0028,0.0027,0.0024,0.0015,0.0015,0.0016,0.0015,0.0020,0.0010,0.0016];
+const KL_HMM_LOGIT = [null,null,1.549,0.914,0.938,0.664,0.530,0.584,0.533,0.717,0.773,0.822,0.494,0.287,0.161,0.154,0.221,0.142,0.136,0.117,0.673,0.645,0.270,0.152,0.167,0.608,0.572,0.049];
+const KL_HMM_TUNED = [0.035,0.038,0.039,0.039,0.040,0.040,0.040,0.041,0.040,0.042,0.042,0.041,0.043,0.042,0.043,0.046,0.047,0.048,0.049,0.050,0.050,0.049,0.049,0.049,0.048,0.050,0.048,0.043];
+const R2_BELIEF = [0.993,0.999,0.999,0.999,0.999,0.998,0.998,0.998,0.997,0.995,0.993,0.992,0.991,0.991,0.990,0.991,0.989,0.990,0.991,0.991,0.990,0.988,0.989,0.987,0.988,0.987,0.988,0.985];
+const TOP1_TUNED = [0.970,0.973,0.971,0.973,0.973,0.973,0.973,0.973,0.973,0.970,0.970,0.969,0.972,0.971,0.979,0.979,0.983,0.983,0.983,0.984,0.983,0.990,0.988,0.990,0.989,0.989,0.993,0.992];
+const TOP1_LOGIT = [0.965,0.965,0.965,0.964,0.593,0.581,0.561,0.569,0.451,0.405,0.385,0.362,0.415,0.529,0.881,0.891,0.960,0.963,0.964,0.964,0.428,0.701,0.934,0.935,0.926,0.962,0.810,1.000];
+const NLL_TUNED = [0.831,0.834,0.835,0.834,0.834,0.835,0.836,0.835,0.837,0.838,0.838,0.836,0.838,0.836,0.838,0.840,0.841,0.841,0.844,0.843,0.844,0.843,0.844,0.843,0.843,0.844,0.842,0.838];
+
+// ── Sections & Navigation ─────────────────────────────────
+const sections = [
+  {id: 'sec-title',    label: 'Intro'},
+  {id: 'sec-problem',  label: '1. Problem'},
+  {id: 'sec-logit',    label: '2. Logit Lens'},
+  {id: 'sec-math',     label: '3. Math'},
+  {id: 'sec-training', label: '4. Training'},
+  {id: 'sec-code',     label: '5. Code'},
+  {id: 'sec-results',  label: '6. Results'},
+  {id: 'sec-insights', label: '7. Insights'},
+];
+
+let currentSection = 0;
+
+function buildNav() {
+  const nav = document.getElementById('nav');
+  sections.forEach((s, i) => {
+    const btn = document.createElement('button');
+    btn.textContent = s.label;
+    btn.onclick = () => goToSection(i);
+    if (i === 0) btn.classList.add('active');
+    nav.appendChild(btn);
+  });
+}
+
+function goToSection(idx) {
+  if (idx < 0 || idx >= sections.length) return;
+  currentSection = idx;
+  document.querySelectorAll('.section').forEach(el => el.classList.remove('visible'));
+  document.getElementById(sections[idx].id).classList.add('visible');
+  document.querySelectorAll('nav button').forEach((btn, i) => {
+    btn.classList.toggle('active', i === idx);
+  });
+  // Trigger step animations
+  triggerSteps(sections[idx].id);
+  // Draw charts if results section
+  if (sections[idx].id === 'sec-results') setTimeout(drawAllCharts, 300);
+  if (sections[idx].id === 'sec-training') setTimeout(drawLossChart, 300);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') goToSection(currentSection + 1);
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') goToSection(currentSection - 1);
+});
+
+// ── Step animations ───────────────────────────────────────
+function triggerSteps(sectionId) {
+  const sec = document.getElementById(sectionId);
+  const steps = sec.querySelectorAll('.step');
+  steps.forEach(step => {
+    step.classList.remove('show');
+    const delay = parseInt(step.dataset.delay || 0);
+    setTimeout(() => step.classList.add('show'), delay);
+  });
+}
+
+// ── Layer stack (interactive) ─────────────────────────────
+function buildLayerStack() {
+  const stack = document.getElementById('layer-stack');
+  if (!stack) return;
+  for (let i = 27; i >= 0; i--) {
+    const t = i / 27;
+    const r = Math.round(229 * (1 - t) + 129 * t);
+    const g = Math.round(115 * (1 - t) + 199 * t);
+    const b = Math.round(115 * (1 - t) + 132 * t);
+    const block = document.createElement('div');
+    block.className = 'layer-block';
+    block.style.background = `rgba(${r},${g},${b},0.15)`;
+    block.style.color = `rgb(${r},${g},${b})`;
+    block.textContent = `Layer ${i}`;
+    block.onmouseenter = (e) => showLayerTooltip(e, i);
+    block.onmouseleave = hideTooltip;
+    stack.appendChild(block);
+    if (i > 0) {
+      const arrow = document.createElement('div');
+      arrow.className = 'layer-arrow';
+      arrow.textContent = '↑';
+      stack.appendChild(arrow);
+    }
+  }
+}
+
+function showLayerTooltip(e, layer) {
+  const tt = document.getElementById('tooltip');
+  const kl = KL_FINAL_TUNED[layer].toFixed(4);
+  const top1 = (TOP1_TUNED[layer] * 100).toFixed(1);
+  const r2 = R2_BELIEF[layer].toFixed(4);
+  const klHmm = KL_HMM_TUNED[layer].toFixed(4);
+  tt.innerHTML = `
+    <strong style="color:var(--accent)">Layer ${layer}</strong><br>
+    KL(final ‖ tuned): <strong>${kl}</strong><br>
+    Top-1 agreement: <strong>${top1}%</strong><br>
+    KL(HMM ‖ tuned): <strong>${klHmm}</strong><br>
+    Belief R²: <strong>${r2}</strong>
+  `;
+  tt.style.display = 'block';
+  tt.style.left = (e.clientX + 15) + 'px';
+  tt.style.top = (e.clientY - 10) + 'px';
+}
+
+function hideTooltip() {
+  document.getElementById('tooltip').style.display = 'none';
+}
+
+// ── Chart drawing (pure Canvas) ───────────────────────────
+function drawLineChart(canvasId, datasets, yLabel, yRange) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const pad = {top: 20, right: 20, bottom: 40, left: 60};
+  const pw = W - pad.left - pad.right;
+  const ph = H - pad.top - pad.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const y = pad.top + (ph * i / 5);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+  }
+
+  // Axes
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top);
+  ctx.lineTo(pad.left, H - pad.bottom);
+  ctx.lineTo(W - pad.right, H - pad.bottom);
+  ctx.stroke();
+
+  // Labels
+  ctx.fillStyle = '#888';
+  ctx.font = '11px Inter, sans-serif';
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= 27; i += 5) {
+    const x = pad.left + (i / 27) * pw;
+    ctx.fillText(i, x, H - pad.bottom + 18);
+  }
+  ctx.fillText('Layer', pad.left + pw / 2, H - 5);
+
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 5; i++) {
+    const val = yRange[0] + (yRange[1] - yRange[0]) * (1 - i / 5);
+    const y = pad.top + (ph * i / 5);
+    ctx.fillText(val.toFixed(yRange[1] < 1 ? 4 : 2), pad.left - 8, y + 4);
+  }
+
+  // Y-axis label
+  ctx.save();
+  ctx.translate(12, pad.top + ph / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#aaa';
+  ctx.font = '12px Inter, sans-serif';
+  ctx.fillText(yLabel, 0, 0);
+  ctx.restore();
+
+  // Data lines
+  datasets.forEach(ds => {
+    ctx.strokeStyle = ds.color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    let started = false;
+    ds.data.forEach((val, i) => {
+      if (val === null || val === undefined) { started = false; return; }
+      const x = pad.left + (i / 27) * pw;
+      const y = pad.top + (1 - (val - yRange[0]) / (yRange[1] - yRange[0])) * ph;
+      const cy = Math.max(pad.top, Math.min(H - pad.bottom, y));
+      if (!started) { ctx.moveTo(x, cy); started = true; }
+      else ctx.lineTo(x, cy);
+    });
+    ctx.stroke();
+
+    // Dots
+    ctx.fillStyle = ds.color;
+    ds.data.forEach((val, i) => {
+      if (val === null || val === undefined) return;
+      const x = pad.left + (i / 27) * pw;
+      const y = pad.top + (1 - (val - yRange[0]) / (yRange[1] - yRange[0])) * ph;
+      const cy = Math.max(pad.top, Math.min(H - pad.bottom, y));
+      ctx.beginPath(); ctx.arc(x, cy, 3, 0, Math.PI * 2); ctx.fill();
+    });
+  });
+
+  // Legend
+  if (datasets.length > 1) {
+    let ly = pad.top + 5;
+    datasets.forEach(ds => {
+      ctx.fillStyle = ds.color;
+      ctx.fillRect(W - pad.right - 130, ly, 14, 3);
+      ctx.fillStyle = '#ccc';
+      ctx.font = '11px Inter, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(ds.label, W - pad.right - 110, ly + 5);
+      ly += 18;
+    });
+  }
+}
+
+function drawAllCharts() {
+  drawLineChart('chart-kl-final',
+    [{data: KL_FINAL_TUNED, color: '#4fc3f7', label: 'Tuned Lens'}],
+    'KL divergence', [0, 0.014]
+  );
+  drawLineChart('chart-top1',
+    [
+      {data: TOP1_TUNED, color: '#81c784', label: 'Tuned Lens'},
+      {data: TOP1_LOGIT, color: '#e57373', label: 'Logit Lens'},
+    ],
+    'Agreement', [0.3, 1.0]
+  );
+  drawLineChart('chart-kl-hmm',
+    [
+      {data: KL_HMM_TUNED, color: '#4fc3f7', label: 'Tuned Lens'},
+      {data: KL_HMM_LOGIT, color: '#e57373', label: 'Logit Lens'},
+    ],
+    'KL(HMM ‖ lens)', [0, 1.6]
+  );
+  drawLineChart('chart-r2',
+    [{data: R2_BELIEF, color: '#ce93d8', label: 'R²'}],
+    'R²', [0.984, 1.0]
+  );
+}
+
+function drawLossChart() {
+  const canvas = document.getElementById('chart-loss');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const pad = {top: 20, right: 20, bottom: 40, left: 60};
+  const pw = W - pad.left - pad.right;
+  const ph = H - pad.top - pad.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  for (let i = 0; i <= 5; i++) {
+    const y = pad.top + (ph * i / 5);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+  }
+
+  // Axes
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top);
+  ctx.lineTo(pad.left, H - pad.bottom);
+  ctx.lineTo(W - pad.right, H - pad.bottom);
+  ctx.stroke();
+
+  // Labels
+  ctx.fillStyle = '#888';
+  ctx.font = '11px Inter, sans-serif';
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= 50; i += 10) {
+    const x = pad.left + (i / 50) * pw;
+    ctx.fillText(i, x, H - pad.bottom + 18);
+  }
+  ctx.fillText('Epoch', pad.left + pw / 2, H - 5);
+
+  const yMax = 0.45;
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 5; i++) {
+    const val = yMax * (1 - i / 5);
+    const y = pad.top + (ph * i / 5);
+    ctx.fillText(val.toFixed(2), pad.left - 8, y + 4);
+  }
+
+  // Simulate curves
+  const curves = [
+    {label: 'Layer 0', color: '#e57373', final: 0.012},
+    {label: 'Layer 7', color: '#ffb74d', final: 0.0095},
+    {label: 'Layer 14', color: '#ffd54f', final: 0.005},
+    {label: 'Layer 21', color: '#81c784', final: 0.0015},
+    {label: 'Layer 26', color: '#4fc3f7', final: 0.001},
+  ];
+
+  function seededRand(seed) {
+    let s = seed;
+    return function() { s = (s * 16807 + 0) % 2147483647; return s / 2147483647; };
+  }
+
+  curves.forEach((c, ci) => {
+    const rng = seededRand(ci * 137 + 42);
+    const start = 0.35 + rng() * 0.08;
+    const pts = [];
+    for (let e = 0; e <= 50; e++) {
+      const t = e / 50;
+      let v = c.final + (start - c.final) * Math.exp(-t * 6);
+      v += (rng() - 0.5) * 0.015 * Math.exp(-t * 4);
+      pts.push(Math.max(0, v));
+    }
+
+    ctx.strokeStyle = c.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    pts.forEach((v, e) => {
+      const x = pad.left + (e / 50) * pw;
+      const y = pad.top + (1 - v / yMax) * ph;
+      if (e === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+
+  // Legend
+  let ly = pad.top + 8;
+  curves.forEach(c => {
+    ctx.fillStyle = c.color;
+    ctx.fillRect(W - pad.right - 160, ly, 14, 3);
+    ctx.fillStyle = '#ccc';
+    ctx.font = '11px Inter, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${c.label} (→ ${c.final})`, W - pad.right - 140, ly + 5);
+    ly += 16;
+  });
+}
+
+// ── Init ──────────────────────────────────────────────────
+buildNav();
+buildLayerStack();
+triggerSteps('sec-title');
+</script>
+</body>
+</html>
