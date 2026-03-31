@@ -1,0 +1,17 @@
+{
+  "balance_target_size": 6773,
+  "per_bin_target": 2257,
+  "counts_before_balance": [
+    7949,
+    6544,
+    27907
+  ],
+  "min_bin_cap": 2257,
+  "counts_after_balance_per_bin": [
+    2257,
+    2257,
+    2257
+  ],
+  "n_train_rows": 5415,
+  "n_balanced_eval_rows": 1356
+}

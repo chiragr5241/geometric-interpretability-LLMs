@@ -247,7 +247,8 @@ def _train_probes_batched_impl(
         sl = seq_lens[i]
         acts_pad[i, :sl] = torch.tensor(inp.activations, dtype=torch.float32)
         tgt_pad[i, :sl] = torch.tensor(inp.gt_belief_states, dtype=torch.float32)
-        split_idx = int(sl * split)
+        split_idx = sl if split >= 1.0 else int(sl * split)
+        split_idx = max(0, min(split_idx, sl))
         split_indices.append(split_idx)
         train_mask[i, :split_idx] = True
         test_mask[i, split_idx:sl] = True
@@ -276,7 +277,11 @@ def _train_probes_batched_impl(
         preds = torch.bmm(acts_pad, W) + bias.unsqueeze(1)
         sq_err = ((preds - tgt_pad) ** 2).mean(dim=-1)
         test_counts = test_mask.sum(dim=1).float()
-        test_mses = (sq_err * test_mask).sum(dim=1) / test_counts  # (N,)
+        if test_counts.min() > 0:
+            test_mses = (sq_err * test_mask).sum(dim=1) / test_counts
+        else:
+            train_only = (sq_err * train_mask).sum(dim=1) / train_counts.clamp(min=1e-10)
+            test_mses = train_only
         all_computed = preds.cpu().numpy()
 
     results: list[ProbeResult] = []

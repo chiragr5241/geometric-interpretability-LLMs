@@ -44,6 +44,7 @@ geometric_interpretability_LLMs/
 │   ├── experiment_utils.py     # Shared helpers (model loading, logging, etc.)
 │   ├── hmm/
 │   │   └── hmm.py              # Mess3HMM, barycentric / MSP visualisation
+│   ├── encoder_decoder_utils.py # Shared eval/plot helpers for encoder-decoder training
 │   ├── metrics/
 │   │   └── probe_metrics.py    # find_kl_threshold, compare_probes, cross_mse_matrix
 │   └── models/

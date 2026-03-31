@@ -222,7 +222,8 @@ def _train_batched_impl(
         sl = seq_lens[i]
         beliefs_pad[i, :sl] = torch.tensor(inp.belief_states, dtype=torch.float32)
         acts_pad[i, :sl] = torch.tensor(inp.activations, dtype=torch.float32)
-        split_idx = int(sl * split)
+        split_idx = sl if split >= 1.0 else int(sl * split)
+        split_idx = max(0, min(split_idx, sl))
         split_indices.append(split_idx)
         train_mask[i, :split_idx] = True
         eval_mask[i, split_idx:sl] = True
@@ -236,6 +237,7 @@ def _train_batched_impl(
 
     train_counts = train_mask.sum(dim=1).float()  # (N,)
     eval_counts = eval_mask.sum(dim=1).float()    # (N,)
+    use_eval_holdout = bool(eval_counts.min() > 0)
 
     train_loss_curves: list[list[float]] = [[] for _ in range(N)]
     eval_loss_curves: list[list[float]] = [[] for _ in range(N)]
@@ -260,7 +262,10 @@ def _train_batched_impl(
         optimizer.step()
 
         with torch.no_grad():
-            per_decoder_eval = (sq_err.detach() * eval_mask).sum(dim=1) / eval_counts
+            if use_eval_holdout:
+                per_decoder_eval = (sq_err.detach() * eval_mask).sum(dim=1) / eval_counts
+            else:
+                per_decoder_eval = per_decoder_train.detach()
 
             buf_idx = epoch % patience
             eval_window[:, buf_idx] = per_decoder_eval
@@ -279,7 +284,10 @@ def _train_batched_impl(
         final_preds = torch.bmm(beliefs_pad, W_batch) + bias_batch.unsqueeze(1)
         final_sq = ((final_preds - acts_pad) ** 2).mean(dim=-1)
         final_train = (final_sq * train_mask).sum(dim=1) / train_counts
-        final_eval = (final_sq * eval_mask).sum(dim=1) / eval_counts
+        if use_eval_holdout:
+            final_eval = (final_sq * eval_mask).sum(dim=1) / eval_counts
+        else:
+            final_eval = final_train
 
     results: list[DecoderResult] = []
     for i in range(N):

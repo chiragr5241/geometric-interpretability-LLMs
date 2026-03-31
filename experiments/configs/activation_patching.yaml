@@ -1,7 +1,7 @@
 experiment_name: activation_patching
 output_user: dani
 
-encoder_decoder_dir: "outputs/dani/20260316_155024_train_encoder_decoder"
+encoder_decoder_dir: "outputs/dani/20260330_161347_train_encoder_decoder"
 
 n_sequences: 20
 seq_length: 400
