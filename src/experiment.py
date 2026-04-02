@@ -42,7 +42,7 @@ def apply_runtime_overrides(config: ExperimentConfig, output_user: str | None = 
 def setup_output_dir(config: ExperimentConfig) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     project_root = Path(__file__).resolve().parent.parent
-    name = config.output_name
+    name = config.output_user
     out_dir = project_root / "outputs" / name / f"{timestamp}_{config.experiment_name}"
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "probes").mkdir(exist_ok=True)

@@ -1,0 +1,14 @@
+experiment_name: suffix_kl_curve
+hmm:
+  process_name: mess3
+  process_params:
+    x: 0.05
+    alpha: 0.9
+model_name: n/a
+output_user: dani
+n_sequences: 1000
+seq_length: 500
+k_max: 25
+n_positions_per_seq: 50
+model_empirical_kl: null
+random_seed: 42
