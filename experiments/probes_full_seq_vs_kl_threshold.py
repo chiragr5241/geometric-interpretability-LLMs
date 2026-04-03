@@ -114,7 +114,7 @@ def plot_kl_over_sequence(
     fig.update_layout(
         title="KL(optimal ‖ model) over sequence (run 0) with threshold",
         xaxis_title="Sequence position",
-        yaxis_title="KL(optimal ‖ model)",
+        yaxis=dict(title="KL(optimal ‖ model)", type="log"),
         legend=dict(x=0.7, y=0.95),
     )
     fig.write_image(str(Path(path).with_suffix(".png")))
