@@ -162,32 +162,32 @@ def plot_comparison(results: list[ConfigResult], path: Path) -> None:
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
-    # Panel 1: R² by layer
+    # Panel 1: 1 - R² by layer (log scale — lower is better)
     ax = axes[0]
     for i, r in enumerate(results):
         layers = sorted(r.r2_per_layer.keys())
-        values = [r.r2_per_layer[l] for l in layers]
+        values = [max(1 - r.r2_per_layer[l], 1e-6) for l in layers]
         ax.plot(layers, values, marker=".", markersize=3, linewidth=1.2,
                 label=r.label, color=result_colors[i])
     ax.set_xlabel("Layer")
-    ax.set_ylabel("R²")
-    ax.set_title("Belief State Probe R² by Layer — All Configurations")
-    ax.legend(fontsize=8, loc="lower right")
+    ax.set_ylabel("1 − R²  (lower is better)")
+    ax.set_title("Belief State Probe Error (1 − R²) by Layer — All Configurations")
+    ax.legend(fontsize=8, loc="upper right")
     ax.grid(alpha=0.3)
     ax.set_yscale("log")
 
-    # Panel 2: KL divergence
+    # Panel 2: KL divergence (full-vocab softmax)
     ax = axes[1]
     for i, r in enumerate(results):
-        positions = np.arange(len(r.kl_mean))
-        ax.plot(positions, r.kl_mean, linewidth=1.0,
+        positions = np.arange(len(r.kl_all_vocab_mean))
+        ax.plot(positions, r.kl_all_vocab_mean, linewidth=1.0,
                 label=r.label, color=result_colors[i])
     ax.set_xlabel("Position in sequence")
     ax.set_ylabel("KL(HMM || LLM)")
-    ax.set_title("KL Divergence Convergence — All Configurations")
+    ax.set_title("KL Divergence [all-vocab] — All Configurations")
     ax.set_xscale("log")
-    ax.set_xlim(1, max(len(r.kl_mean) for r in results))
-    ax.set_ylim(bottom=0)
+    ax.set_xlim(1, max(len(r.kl_all_vocab_mean) for r in results))
+    ax.set_ylim(bottom=0, top=3)
     ax.legend(fontsize=8, loc="upper right")
     ax.grid(alpha=0.3)
 

@@ -13,7 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
 from data_generation import generate_hmm_sequences
 from experiment_utils import get_concept_token_ids
-from metrics.kl_divergence import compute_kl_divergence_batch, extract_concept_probs
+from metrics.kl_divergence import (
+    compute_kl_divergence_batch,
+    extract_concept_probs,
+    extract_concept_probs_all_vocab,
+)
 
 from .config import BeliefStateSweepConfig, make_config_label
 from .pca import plot_pca, plot_pca_3d
@@ -128,6 +132,7 @@ def run_single_config(
 
     # 4. KL divergence
     llm_probs = extract_concept_probs(all_logits_flat, concept_ids)
+    llm_probs_all_vocab = extract_concept_probs_all_vocab(all_logits_flat, concept_ids)
 
     n_total = llm_probs.shape[0]
     if n_total != n_sequences * seq_length:
@@ -137,10 +142,17 @@ def run_single_config(
             f"KL will be computed on the first {n_total} points only."
         )
     llm_probs_3d = llm_probs.reshape(n_sequences, -1, n_vocab)
+    llm_probs_all_vocab_3d = llm_probs_all_vocab.reshape(n_sequences, -1, n_vocab)
     hmm_probs = obs_probs_all[:, :llm_probs_3d.shape[1], :]
 
     kl_mean, kl_std = compute_kl_divergence_batch(hmm_probs, llm_probs_3d)
-    logger.info(f"  Mean KL: {kl_mean.mean():.4f}")
+    kl_all_vocab_mean, kl_all_vocab_std = compute_kl_divergence_batch(
+        hmm_probs, llm_probs_all_vocab_3d
+    )
+    logger.info(
+        f"  Mean KL (renorm): {kl_mean.mean():.4f}, "
+        f"Mean KL (all-vocab): {kl_all_vocab_mean.mean():.4f}"
+    )
 
     # 5. Linear probes
     probe_results = train_probes(
@@ -183,6 +195,8 @@ def run_single_config(
         belief_states_flat=all_beliefs_flat,
         kl_mean=kl_mean,
         kl_std=kl_std,
+        kl_all_vocab_mean=kl_all_vocab_mean,
+        kl_all_vocab_std=kl_all_vocab_std,
         r2_per_layer=probe_results.r2_per_layer,
         mse_per_layer=probe_results.mse_per_layer,
         predicted_beliefs=probe_results.best_layer_predicted,

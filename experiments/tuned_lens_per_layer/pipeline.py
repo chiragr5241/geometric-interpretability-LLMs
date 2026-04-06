@@ -21,15 +21,15 @@ from .evaluation import LayerMetrics, compute_layer_metrics
 from .tuned_lens import (
     apply_logit_lens,
     apply_tuned_lens,
-    train_tuned_lens,
+    train_tuned_lens_concept,
 )
 from .plotting import (
     plot_comparison,
     plot_layer_vs_kl_final,
-    plot_layer_vs_kl_hmm,
     plot_nll_by_layer,
     plot_token_position_vs_kl,
     plot_training_loss,
+    plot_tuned_lens_results,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,19 +169,40 @@ def run_pipeline(
 
     logger.info(f"Train points: {train_logits.shape[0]}, Test points: {test_logits.shape[0]}")
 
-    # ── 5. Train tuned lens on TRAINING data ────────────────────────────────
-    logger.info("Training tuned lens translators...")
-    translators, loss_curves = train_tuned_lens(
+    # ── 5. Train tuned lenses on TRAINING data ─────────────────────────────
+    # Model-target tuned lens (concept-only)
+    train_concept_logits = train_logits[:, concept_ids]
+    logger.info("Training model-target tuned lens...")
+    translators, loss_curves = train_tuned_lens_concept(
         activations_by_layer=train_activations,
         model=model,
+        concept_ids=concept_ids,
         layers=config.layer_indices,
-        target_logits=train_logits,
+        target_concept_values=train_concept_logits,
+        target_is_probs=False,
         n_epochs=config.tuned_lens_epochs,
         lr=config.tuned_lens_lr,
         batch_size=config.tuned_lens_batch_size,
     )
 
-    plot_training_loss(loss_curves, figures_dir / "training_loss.png")
+    # HMM-target tuned lens (concept-only, trained on HMM observation probs)
+    train_obs_probs = obs_probs_all[:n_train, :seq_len_actual, :]
+    train_obs_probs_flat = train_obs_probs.reshape(-1, train_obs_probs.shape[-1])
+    logger.info("Training HMM-target tuned lens...")
+    translators_hmm, loss_curves_hmm = train_tuned_lens_concept(
+        activations_by_layer=train_activations,
+        model=model,
+        concept_ids=concept_ids,
+        layers=config.layer_indices,
+        target_concept_values=train_obs_probs_flat,
+        target_is_probs=True,
+        n_epochs=config.tuned_lens_epochs,
+        lr=config.tuned_lens_lr,
+        batch_size=config.tuned_lens_batch_size,
+    )
+
+    plot_training_loss(loss_curves, figures_dir / "training_loss_model.png", label="model-target")
+    plot_training_loss(loss_curves_hmm, figures_dir / "training_loss_hmm.png", label="hmm-target")
 
     # ── 6. Evaluate on TEST data ────────────────────────────────────────────
     logger.info("Evaluating on held-out test set...")
@@ -206,12 +227,17 @@ def run_pipeline(
     all_metrics: list[LayerMetrics] = []
 
     for layer in tqdm(config.layer_indices, desc="Evaluating layers"):
-        # Raw logit lens
+        # Raw logit lens (concept-only)
         logit_probs = apply_logit_lens(test_activations[layer], model, concept_ids)
 
-        # Tuned lens
+        # Model-target tuned lens (concept-only softmax)
         tuned_probs = apply_tuned_lens(
             test_activations[layer], translators[layer], model, concept_ids,
+        )
+
+        # HMM-target tuned lens (concept-only softmax)
+        tuned_hmm_probs = apply_tuned_lens(
+            test_activations[layer], translators_hmm[layer], model, concept_ids,
         )
 
         m = compute_layer_metrics(
@@ -223,6 +249,7 @@ def run_pipeline(
             next_tokens=test_next_tokens_flat,
             n_sequences=n_test,
             seq_length=seq_len_actual,
+            tuned_lens_hmm_probs=tuned_hmm_probs,
         )
         all_metrics.append(m)
 
@@ -230,6 +257,7 @@ def run_pipeline(
             f"  Layer {layer:2d}: "
             f"KL(final||tuned)={m.kl_final_vs_tuned:.4f}  "
             f"KL(HMM||tuned)={m.kl_hmm_vs_tuned:.4f}  "
+            f"KL(HMM||tuned_hmm)={m.kl_hmm_vs_tuned_hmm:.4f}  "
             f"KL(HMM||logit)={m.kl_hmm_vs_logit:.4f}  "
             f"top1_tuned={m.top1_agreement_tuned:.3f}"
         )
@@ -238,19 +266,23 @@ def run_pipeline(
     logger.info("Generating plots...")
 
     plot_layer_vs_kl_final(all_metrics, figures_dir / "layer_vs_kl_final_tuned.png")
-    plot_layer_vs_kl_hmm(all_metrics, figures_dir / "layer_vs_kl_hmm.png")
+    plot_tuned_lens_results(
+        all_metrics, r2_per_layer, figures_dir / "tuned_lens_comparison.png",
+        title=f"Tuned Lens — {config.process_name} {config.process_params}",
+    )
     plot_nll_by_layer(all_metrics, figures_dir / "nll_by_layer.png")
 
-    # Token position plots for a selection of layers
-    n_layers = len(config.layer_indices)
-    selected = [config.layer_indices[i] for i in [0, n_layers // 4, n_layers // 2, 3 * n_layers // 4, -1]]
-
+    # Token position plots for all layers
     plot_token_position_vs_kl(
-        all_metrics, selected, figures_dir / "token_pos_kl_hmm_tuned.png",
+        all_metrics, config.layer_indices, figures_dir / "token_pos_kl_hmm_tuned_all_layers.png",
         metric_type="kl_hmm_vs_tuned",
     )
     plot_token_position_vs_kl(
-        all_metrics, selected, figures_dir / "token_pos_kl_final_tuned.png",
+        all_metrics, config.layer_indices, figures_dir / "token_pos_kl_hmm_tuned_hmm_all_layers.png",
+        metric_type="kl_hmm_vs_tuned_hmm",
+    )
+    plot_token_position_vs_kl(
+        all_metrics, config.layer_indices, figures_dir / "token_pos_kl_final_tuned_all_layers.png",
         metric_type="kl_final_vs_tuned",
     )
 
@@ -259,11 +291,15 @@ def run_pipeline(
     # ── 8. Save artifacts ───────────────────────────────────────────────────
     logger.info("Saving artifacts...")
 
-    # Save translators
+    # Save translators (model-target and HMM-target)
     translators_dir = output_dir / "translators"
     translators_dir.mkdir(exist_ok=True)
     for layer, translator in translators.items():
         torch.save(translator.state_dict(), translators_dir / f"layer_{layer}.pt")
+    translators_hmm_dir = output_dir / "translators_hmm"
+    translators_hmm_dir.mkdir(exist_ok=True)
+    for layer, translator in translators_hmm.items():
+        torch.save(translator.state_dict(), translators_hmm_dir / f"layer_{layer}.pt")
 
     # Save metrics as JSON
     metrics_summary = []
@@ -272,6 +308,8 @@ def run_pipeline(
             "layer": m.layer,
             "kl_final_vs_tuned": m.kl_final_vs_tuned,
             "kl_hmm_vs_tuned": m.kl_hmm_vs_tuned,
+            "kl_hmm_vs_tuned_hmm": m.kl_hmm_vs_tuned_hmm,
+            "kl_final_vs_tuned_hmm": m.kl_final_vs_tuned_hmm,
             "kl_hmm_vs_logit": m.kl_hmm_vs_logit,
             "nll_tuned": m.nll_tuned,
             "nll_logit": m.nll_logit,
@@ -289,6 +327,7 @@ def run_pipeline(
         **{f"kl_final_tuned_layer{m.layer}": m.kl_final_vs_tuned_by_pos for m in all_metrics},
         **{f"kl_hmm_tuned_layer{m.layer}": m.kl_hmm_vs_tuned_by_pos for m in all_metrics},
         **{f"kl_hmm_logit_layer{m.layer}": m.kl_hmm_vs_logit_by_pos for m in all_metrics},
+        **{f"kl_hmm_tuned_hmm_layer{m.layer}": m.kl_hmm_vs_tuned_hmm_by_pos for m in all_metrics},
     )
 
     # Save config
@@ -311,7 +350,10 @@ def run_pipeline(
 
     # Save training loss curves
     with open(output_dir / "training_losses.json", "w") as f:
-        json.dump({str(k): v for k, v in loss_curves.items()}, f)
+        json.dump({
+            "model_target": {str(k): v for k, v in loss_curves.items()},
+            "hmm_target": {str(k): v for k, v in loss_curves_hmm.items()},
+        }, f)
 
     # ── 9. Generate markdown report ─────────────────────────────────────────
     logger.info("Writing report...")
@@ -415,12 +457,13 @@ def _write_report(
 ## Plots
 
 - `figures/layer_vs_kl_final_tuned.png` — Layer vs KL(final model || tuned lens)
-- `figures/layer_vs_kl_hmm.png` — Layer vs KL(HMM || tuned lens) and KL(HMM || logit lens)
+- `figures/tuned_lens_comparison.png` — 3-panel: KL by layer, R² vs KL, model vs HMM target
 - `figures/nll_by_layer.png` — Next-token NLL by layer
 - `figures/token_pos_kl_hmm_tuned.png` — Token position vs KL(HMM || tuned) for selected layers
 - `figures/token_pos_kl_final_tuned.png` — Token position vs KL(final || tuned) for selected layers
 - `figures/comparison.png` — 4-panel comparison (tuned lens, logit lens, top-1, R²)
-- `figures/training_loss.png` — Per-layer training loss curves
+- `figures/training_loss_model.png` — Model-target training loss curves
+- `figures/training_loss_hmm.png` — HMM-target training loss curves
 
 ## Interpretation
 

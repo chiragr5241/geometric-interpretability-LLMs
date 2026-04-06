@@ -43,6 +43,7 @@ class BeliefStateSweepConfig(ExperimentConfig):
         default_factory=lambda: {2: ["A", "B"], 3: ["A", "B", "C"]}
     )
     n_ctx_override: int | None = None
+    output_name: str = "belief_state_sweep"
 
 
 # ── Config loader ─────────────────────────────────────────────────────────────

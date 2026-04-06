@@ -16,6 +16,8 @@ class ConfigResult:
     belief_states_flat: np.ndarray      # (total_points, n_states)
     kl_mean: np.ndarray                 # (seq_len,)
     kl_std: np.ndarray                  # (seq_len,)
+    kl_all_vocab_mean: np.ndarray       # (seq_len,) — KL using full-vocab softmax
+    kl_all_vocab_std: np.ndarray        # (seq_len,)
     r2_per_layer: dict[int, float]
     mse_per_layer: dict[int, float]
     predicted_beliefs: np.ndarray       # (n_test, n_states) — best layer probe predictions

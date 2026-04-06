@@ -117,6 +117,88 @@ def train_tuned_lens(
     return translators, loss_curves
 
 
+def train_tuned_lens_concept(
+    activations_by_layer: dict[int, np.ndarray],
+    model,
+    concept_ids: list[int],
+    layers: list[int],
+    target_concept_values: np.ndarray,
+    target_is_probs: bool = False,
+    n_epochs: int = 50,
+    lr: float = 1e-3,
+    batch_size: int = 512,
+) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
+    """Train one TunedLensTranslator per layer using concept-token logits only.
+
+    Parameters
+    ----------
+    activations_by_layer : dict mapping layer index -> (N, d_model) array
+    model : HookedTransformer
+    concept_ids : LLM token IDs for HMM emission symbols
+    layers : list of layer indices to train
+    target_concept_values : (N, n_concepts) — logits if target_is_probs=False,
+        probabilities if target_is_probs=True
+    target_is_probs : if True, target is already probabilities
+    n_epochs, lr, batch_size : training hyperparameters
+    """
+    device = model.unembed.W_U.device
+    d_model = model.cfg.d_model
+
+    W_c = model.unembed.W_U[:, concept_ids].detach().to(device)
+    b_c = model.unembed.b_U[concept_ids].detach().to(device)
+
+    target = torch.as_tensor(target_concept_values, dtype=torch.float32)
+    target_probs = target if target_is_probs else F.softmax(target, dim=-1)
+
+    translators: dict[int, TunedLensTranslator] = {}
+    loss_curves: dict[int, list[float]] = {}
+
+    for layer in tqdm(layers, desc="Training tuned lens (concept)"):
+        acts = torch.tensor(activations_by_layer[layer], dtype=torch.float32)
+        n = acts.shape[0]
+
+        translator = TunedLensTranslator(d_model).to(device)
+        optimizer = torch.optim.Adam(translator.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+        epoch_losses = []
+        for epoch in range(n_epochs):
+            perm = torch.randperm(n)
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for start in range(0, n, batch_size):
+                idx = perm[start : start + batch_size]
+                acts_batch = acts[idx].to(device)
+                target_batch = target_probs[idx].to(device)
+
+                optimizer.zero_grad()
+                h = translator(acts_batch)
+                normed = model.ln_final(h)
+                concept_logit = normed @ W_c + b_c
+                log_probs = F.log_softmax(concept_logit, dim=-1)
+
+                loss = F.kl_div(log_probs, target_batch, reduction="batchmean")
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            scheduler.step()
+            epoch_losses.append(epoch_loss / max(n_batches, 1))
+
+        translators[layer] = translator.cpu().eval()
+        for p in translators[layer].parameters():
+            p.requires_grad = False
+        loss_curves[layer] = epoch_losses
+        torch.cuda.empty_cache()
+
+        logger.info(f"  Layer {layer:2d}: final KL = {epoch_losses[-1]:.4f}")
+
+    return translators, loss_curves
+
+
 def apply_logit_lens(
     activations: np.ndarray,
     model,

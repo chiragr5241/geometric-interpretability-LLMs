@@ -127,8 +127,14 @@ def main() -> None:
         plot_kl_divergence(
             result.kl_mean,
             result.kl_std,
-            title=f"KL(HMM || LLM) — {label}",
+            title=f"KL(HMM || LLM) [renorm] — {label}",
             path=config_dir / "figures" / "kl_divergence.png",
+        )
+        plot_kl_divergence(
+            result.kl_all_vocab_mean,
+            result.kl_all_vocab_std,
+            title=f"KL(HMM || LLM) [all-vocab] — {label}",
+            path=config_dir / "figures" / "kl_divergence_all_vocab.png",
         )
         plot_r2_by_layer(
             result.r2_per_layer,
@@ -144,6 +150,7 @@ def main() -> None:
             "r2_per_layer": {str(k): v for k, v in result.r2_per_layer.items()},
             "mse_per_layer": {str(k): v for k, v in result.mse_per_layer.items()},
             "mean_kl": float(result.kl_mean.mean()),
+            "mean_kl_all_vocab": float(result.kl_all_vocab_mean.mean()),
         }
         with open(config_dir / "metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
@@ -177,6 +184,7 @@ def main() -> None:
                 "best_r2": float(max(r.r2_per_layer.values())),
                 "best_r2_layer": int(max(r.r2_per_layer, key=r.r2_per_layer.get)),
                 "mean_kl": float(r.kl_mean.mean()),
+                "mean_kl_all_vocab": float(r.kl_all_vocab_mean.mean()),
             }
             for r in all_results
         ],
@@ -191,7 +199,8 @@ def main() -> None:
     for entry in summary["configs"]:
         logger.info(
             f"  {entry['label']}: best R²={entry['best_r2']:.4f} "
-            f"(layer {entry['best_r2_layer']}), mean KL={entry['mean_kl']:.4f}"
+            f"(layer {entry['best_r2_layer']}), mean KL={entry['mean_kl']:.4f}, "
+            f"mean KL all-vocab={entry['mean_kl_all_vocab']:.4f}"
         )
 
 

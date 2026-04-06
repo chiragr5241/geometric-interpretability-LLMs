@@ -29,6 +29,32 @@ def extract_concept_probs(
     return F.softmax(torch.tensor(concept_logits, dtype=torch.float32), dim=-1).numpy()
 
 
+def extract_concept_probs_all_vocab(
+    logits_flat: np.ndarray,
+    concept_ids: list[int],
+) -> np.ndarray:
+    """Softmax over full vocabulary, then select concept token probabilities.
+
+    Unlike :func:`extract_concept_probs` which renormalises over concept tokens
+    only, this keeps the true probability mass each concept token receives from
+    the full-vocabulary softmax.  The resulting rows will **not** sum to 1.
+
+    Parameters
+    ----------
+    logits_flat : np.ndarray
+        Shape ``(N, full_vocab_size)`` — raw LLM logits.
+    concept_ids : list[int]
+        LLM token IDs corresponding to HMM emission symbols.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(N, len(concept_ids))``.
+    """
+    full_probs = F.softmax(torch.tensor(logits_flat, dtype=torch.float32), dim=-1)
+    return full_probs[:, concept_ids].numpy()
+
+
 def compute_kl_divergence_batch(
     hmm_probs: np.ndarray,
     llm_probs: np.ndarray,

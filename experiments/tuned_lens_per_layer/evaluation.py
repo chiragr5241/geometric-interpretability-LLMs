@@ -23,10 +23,15 @@ class LayerMetrics:
     top1_agreement_tuned: float = 0.0   # fraction where tuned lens top-1 == final model top-1
     top1_agreement_logit: float = 0.0   # fraction where logit lens top-1 == final model top-1
 
+    # HMM-target tuned lens metrics
+    kl_hmm_vs_tuned_hmm: float = 0.0   # KL(HMM || HMM-target tuned lens)
+    kl_final_vs_tuned_hmm: float = 0.0  # KL(final model || HMM-target tuned lens)
+
     # Per-position arrays (test set, averaged over test sequences)
     kl_final_vs_tuned_by_pos: np.ndarray = field(default_factory=lambda: np.array([]))
     kl_hmm_vs_tuned_by_pos: np.ndarray = field(default_factory=lambda: np.array([]))
     kl_hmm_vs_logit_by_pos: np.ndarray = field(default_factory=lambda: np.array([]))
+    kl_hmm_vs_tuned_hmm_by_pos: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
 def _kl(p: np.ndarray, q: np.ndarray, eps: float = 1e-10) -> np.ndarray:
@@ -51,6 +56,7 @@ def compute_layer_metrics(
     next_tokens: np.ndarray,
     n_sequences: int,
     seq_length: int,
+    tuned_lens_hmm_probs: np.ndarray | None = None,
 ) -> LayerMetrics:
     """Compute all evaluation metrics for a single layer.
 
@@ -59,12 +65,13 @@ def compute_layer_metrics(
 
     Parameters
     ----------
-    tuned_lens_probs : (N, n_concepts) from tuned lens
+    tuned_lens_probs : (N, n_concepts) from model-target tuned lens
     logit_lens_probs : (N, n_concepts) from raw logit lens
     final_model_probs : (N, n_concepts) from final model output
     hmm_probs : (N, n_concepts) from HMM
     next_tokens : (N,) next token indices (in concept vocab space, 0..n_concepts-1)
     n_sequences, seq_length : for reshaping to per-position
+    tuned_lens_hmm_probs : (N, n_concepts) from HMM-target tuned lens (optional)
     """
     N = tuned_lens_probs.shape[0]
 
@@ -82,6 +89,13 @@ def compute_layer_metrics(
     top1_tuned = float((tuned_top1 == final_top1).mean())
     top1_logit = float((logit_top1 == final_top1).mean())
 
+    # HMM-target tuned lens metrics
+    kl_hmm_tuned_hmm = 0.0
+    kl_final_tuned_hmm = 0.0
+    if tuned_lens_hmm_probs is not None:
+        kl_hmm_tuned_hmm = float(_kl(hmm_probs, tuned_lens_hmm_probs).mean())
+        kl_final_tuned_hmm = float(_kl(final_model_probs, tuned_lens_hmm_probs).mean())
+
     # Per-position metrics (reshape to (n_seq, seq_len, ...) then average over sequences)
     def per_pos(values_flat: np.ndarray) -> np.ndarray:
         return values_flat.reshape(n_sequences, seq_length).mean(axis=0)
@@ -89,6 +103,11 @@ def compute_layer_metrics(
     kl_ft_pos = per_pos(_kl(final_model_probs, tuned_lens_probs))
     kl_ht_pos = per_pos(_kl(hmm_probs, tuned_lens_probs))
     kl_hl_pos = per_pos(_kl(hmm_probs, logit_lens_probs))
+
+    # HMM-target tuned lens per-position
+    kl_ht_hmm_pos = np.array([])
+    if tuned_lens_hmm_probs is not None:
+        kl_ht_hmm_pos = per_pos(_kl(hmm_probs, tuned_lens_hmm_probs))
 
     return LayerMetrics(
         layer=layer,
@@ -99,7 +118,10 @@ def compute_layer_metrics(
         nll_logit=nll_l,
         top1_agreement_tuned=top1_tuned,
         top1_agreement_logit=top1_logit,
+        kl_hmm_vs_tuned_hmm=kl_hmm_tuned_hmm,
+        kl_final_vs_tuned_hmm=kl_final_tuned_hmm,
         kl_final_vs_tuned_by_pos=kl_ft_pos,
         kl_hmm_vs_tuned_by_pos=kl_ht_pos,
         kl_hmm_vs_logit_by_pos=kl_hl_pos,
+        kl_hmm_vs_tuned_hmm_by_pos=kl_ht_hmm_pos,
     )

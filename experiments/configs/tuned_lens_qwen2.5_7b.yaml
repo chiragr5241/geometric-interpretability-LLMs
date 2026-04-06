@@ -1,0 +1,39 @@
+experiment_name: tuned_lens_qwen2.5_7b
+model_name: "Qwen/Qwen2.5-7B"
+n_ctx_override: 4098
+
+# Sequence generation
+seq_length: 1000
+n_sequences: 50
+random_seed: 42
+
+# Layer selection (all 28 layers of Qwen2.5-7B)
+layer_indices: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27]
+
+# Train/test split by sequence
+n_train_sequences: 20
+
+# Tuned lens training hyperparameters
+tuned_lens_epochs: 50
+tuned_lens_lr: 0.001
+tuned_lens_batch_size: 512
+
+# Output
+results_dir: results/tuned_lens_qwen2.5_7b
+
+# Sweep over multiple HMM processes and parameter combinations
+sweeps:
+  - process_name: fern
+    param_grid:
+      x: [0.63, 0.4]
+  - process_name: leopard
+    param_grid:
+      x: [0.5, 0.15]
+  - process_name: mess3
+    param_grid:
+      a: [0.6, 0.2]
+      x: [0.15, 0.5]
+
+default_vocab_tokens:
+  2: ["F", "Q"]
+  3: ["F", "Q", "V"]

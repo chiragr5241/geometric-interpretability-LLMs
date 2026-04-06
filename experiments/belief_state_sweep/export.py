@@ -28,7 +28,8 @@ def save_results_csv(results: list[ConfigResult], out_dir: Path) -> None:
             ["label", "process_name"]
             + param_cols
             + r2_cols
-            + ["best_r2", "best_r2_layer", "mean_kl", "std_kl"]
+            + ["best_r2", "best_r2_layer", "mean_kl", "std_kl",
+               "mean_kl_all_vocab", "std_kl_all_vocab"]
         )
         writer = csv.writer(f)
         writer.writerow(header)
@@ -44,6 +45,8 @@ def save_results_csv(results: list[ConfigResult], out_dir: Path) -> None:
                 best_layer,
                 float(r.kl_mean.mean()),
                 float(r.kl_mean.std()),
+                float(r.kl_all_vocab_mean.mean()),
+                float(r.kl_all_vocab_mean.std()),
             ]
             writer.writerow(row)
 
@@ -51,7 +54,8 @@ def save_results_csv(results: list[ConfigResult], out_dir: Path) -> None:
     kl_path = out_dir / "kl_by_position.csv"
     with open(kl_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["label", "position", "kl_mean", "kl_std"])
+        writer.writerow(["label", "position", "kl_mean", "kl_std",
+                         "kl_all_vocab_mean", "kl_all_vocab_std"])
         for r in results:
             for pos in range(len(r.kl_mean)):
                 writer.writerow([
@@ -59,4 +63,6 @@ def save_results_csv(results: list[ConfigResult], out_dir: Path) -> None:
                     pos,
                     float(r.kl_mean[pos]),
                     float(r.kl_std[pos]),
+                    float(r.kl_all_vocab_mean[pos]),
+                    float(r.kl_all_vocab_std[pos]),
                 ])

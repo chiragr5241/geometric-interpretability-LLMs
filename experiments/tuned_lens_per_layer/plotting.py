@@ -57,10 +57,12 @@ def plot_token_position_vs_kl(
     selected_layers: list[int],
     path: Path,
     metric_type: str = "kl_hmm_vs_tuned",
+    smooth_window: int = 0,
 ) -> None:
     """Plot: token position vs KL for selected layers.
 
-    metric_type: one of 'kl_hmm_vs_tuned', 'kl_final_vs_tuned', 'kl_hmm_vs_logit'
+    metric_type: one of 'kl_hmm_vs_tuned', 'kl_final_vs_tuned', 'kl_hmm_vs_logit', 'kl_hmm_vs_tuned_hmm'
+    smooth_window: if > 0, apply rolling mean with this window size
     """
     layer_to_metrics = {m.layer: m for m in metrics}
     attr_name = f"{metric_type}_by_pos"
@@ -69,9 +71,14 @@ def plot_token_position_vs_kl(
         "kl_hmm_vs_tuned": "KL(HMM || Tuned Lens) by Token Position",
         "kl_final_vs_tuned": "KL(Final Model || Tuned Lens) by Token Position",
         "kl_hmm_vs_logit": "KL(HMM || Logit Lens) by Token Position",
+        "kl_hmm_vs_tuned_hmm": "KL(HMM || HMM-Target Tuned Lens) by Token Position",
     }
 
-    fig, ax = plt.subplots(figsize=(12, 5))
+    # Determine figsize based on number of layers
+    n_layers = len(selected_layers)
+    figsize = (14, 6) if n_layers > 5 else (12, 5)
+
+    fig, ax = plt.subplots(figsize=figsize)
     cmap = plt.cm.viridis
     colors = cmap(np.linspace(0, 1, len(selected_layers)))
 
@@ -79,14 +86,25 @@ def plot_token_position_vs_kl(
         m = layer_to_metrics[layer]
         kl_by_pos = getattr(m, attr_name)
         positions = np.arange(len(kl_by_pos))
-        ax.plot(positions, kl_by_pos, linewidth=1, alpha=0.8, color=colors[i],
+
+        # Apply smoothing if requested
+        if smooth_window > 0:
+            kl_by_pos = np.convolve(kl_by_pos, np.ones(smooth_window) / smooth_window, mode='valid')
+            positions = positions[:len(kl_by_pos)]
+
+        # For many layers, reduce linewidth and alpha
+        lw = 0.8 if n_layers > 10 else 1
+        alpha = 0.6 if n_layers > 10 else 0.8
+
+        ax.plot(positions, kl_by_pos, linewidth=lw, alpha=alpha, color=colors[i],
                 label=f"Layer {layer}")
 
     ax.set_xlabel("Token position")
     ax.set_ylabel("KL divergence")
     ax.set_title(titles.get(metric_type, metric_type))
     ax.set_xscale("log")
-    ax.legend(ncol=2, fontsize=7)
+    ncol = min(7, max(2, len(selected_layers) // 4))
+    ax.legend(ncol=ncol, fontsize=6)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -156,19 +174,111 @@ def plot_comparison(
 def plot_training_loss(
     loss_curves: dict[int, list[float]],
     path: Path,
+    label: str = "",
 ) -> None:
     """Plot tuned lens training loss curves per layer."""
     fig, ax = plt.subplots(figsize=(12, 4))
-    for layer, losses in sorted(loss_curves.items()):
-        ax.plot(losses, alpha=0.6, linewidth=1, label=f"L{layer}")
+
+    layers = sorted(loss_curves.keys())
+    cmap = plt.cm.Blues
+    norm = plt.Normalize(vmin=min(layers) - 5, vmax=max(layers))
+    for layer in layers:
+        ax.plot(loss_curves[layer], alpha=0.8, linewidth=1,
+                label=f'L{layer}', color=cmap(norm(layer)))
+
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("KL loss (full vocabulary)")
-    ax.set_title("Tuned Lens Training Loss per Layer")
+    ax.set_ylabel("KL loss (concept tokens)")
+    title = "Tuned Lens Training Loss per Layer"
+    if label:
+        title += f" ({label})"
+    ax.set_title(title)
     ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
     ax.legend(ncol=7, fontsize=7, loc="upper right")
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_tuned_lens_results(
+    metrics: list[LayerMetrics],
+    r2_per_layer: dict[int, float],
+    path: Path,
+    title: str = "Tuned Lens Results",
+) -> None:
+    """Three-panel tuned lens results plot matching the notebook's plot_tuned_lens_results.
+
+    Panel 1: KL divergence by layer (4 KL curves + logit lens baseline)
+    Panel 2: R² vs KL(HMM || lens) dual y-axis
+    Panel 3: KL(model || lens) for model-target vs HMM-target
+    """
+    layers = [m.layer for m in metrics]
+
+    kl_tuned = [m.kl_hmm_vs_tuned for m in metrics]
+    kl_tuned_hmm = [m.kl_hmm_vs_tuned_hmm for m in metrics]
+    kl_tuned_vs_model = [m.kl_final_vs_tuned for m in metrics]
+    kl_tuned_hmm_vs_model = [m.kl_final_vs_tuned_hmm for m in metrics]
+    kl_logit = [m.kl_hmm_vs_logit for m in metrics]
+    r2_values = [r2_per_layer[l] for l in layers]
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+
+    # Panel 1: KL divergence by layer
+    ax = axes[0]
+    ax.plot(layers, kl_tuned, "o-", color="steelblue", linewidth=2,
+            label="KL(HMM || tuned_lens)")
+    ax.plot(layers, kl_tuned_hmm, "o-", color="green", linewidth=2,
+            label="KL(HMM || tuned_lens_hmm)")
+    ax.plot(layers, kl_tuned_vs_model, "o-", color="darkorange", linewidth=2,
+            label="KL(model || tuned_lens)")
+    ax.plot(layers, kl_tuned_hmm_vs_model, "o-", color="red", linewidth=2,
+            label="KL(model || tuned_lens_hmm)")
+    ax.axhline(
+        kl_logit[-1], color="grey", linestyle="--", linewidth=1,
+        label=f"Logit lens (layer {layers[-1]})",
+    )
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("KL")
+    ax.set_title("KL Divergence by Layer")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: R² vs KL(HMM || lens) dual y-axis
+    ax1 = axes[1]
+    ax2 = ax1.twinx()
+    ax1.plot(layers, r2_values, "o-", color="black", linewidth=2,
+             label="R² (linear probe)")
+    ax2.plot(layers, kl_tuned, "s--", color="steelblue", linewidth=2,
+             label="KL(HMM || tuned_lens)")
+    ax2.plot(layers, kl_tuned_hmm, "s--", color="green", linewidth=2,
+             label="KL(HMM || tuned_lens_hmm)")
+    ax1.set_xlabel("Layer")
+    ax1.set_ylabel("R² (linear probe → belief state)", color="steelblue")
+    ax2.set_ylabel("KL(HMM || tuned lens)", color="darkorange")
+    ax1.tick_params(axis="y", labelcolor="steelblue")
+    ax2.tick_params(axis="y", labelcolor="darkorange")
+    ax1.set_title("Belief-State R² vs Tuned-Lens KL per Layer")
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 3: KL(model || lens) for both translators
+    ax = axes[2]
+    ax.plot(layers, kl_tuned_vs_model, "o-", color="darkorange", linewidth=2,
+            label="KL(model || tuned_lens)")
+    ax.plot(layers, kl_tuned_hmm_vs_model, "o-", color="red", linewidth=2,
+            label="KL(model || tuned_lens_hmm)")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("KL")
+    ax.set_title("KL(model || lens): Model-target vs HMM-target")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.suptitle(title, fontsize=11, y=1.02)
+    plt.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
 
 
