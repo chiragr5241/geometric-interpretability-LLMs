@@ -6,8 +6,8 @@ set -euo pipefail
 
 echo "=== Setting up environment on Delta ==="
 
-# Load modules
-module purge
+# Load modules (use reset, not purge — purge removes default modtree/gpu)
+module reset
 module load anaconda3_gpu
 
 # Create venv with system site-packages (gets CUDA-aware torch from module)
@@ -40,5 +40,5 @@ echo "Before running experiments, set your HuggingFace token:"
 echo "  export HF_TOKEN=<your-token>"
 echo ""
 echo "Submit jobs with:"
-echo "  sbatch scripts/delta/run_tuned_lens.slurm experiments/configs/tuned_lens_llama3.1_8b.yaml"
-echo "  sbatch scripts/delta/run_tuned_lens.slurm experiments/configs/tuned_lens_qwen2.5_7b.yaml"
+echo "  sbatch scripts/delta/run_experiment.slurm experiments/configs/belief_state_sweep_llama3.1_8b.yaml"
+echo "  sbatch scripts/delta/run_experiment.slurm experiments/configs/belief_state_sweep_qwen2.5_7b.yaml"
