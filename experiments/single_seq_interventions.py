@@ -40,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
@@ -164,7 +165,7 @@ def _run_patched(
     pos_tensor = torch.tensor(positions, dtype=torch.long)
 
     def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
-        value[:, pos_tensor, :] = target_acts.to(dtype=value.dtype)
+        value[:, pos_tensor, :] = target_acts.to(device=value.device, dtype=value.dtype)
         return value
 
     with torch.no_grad():
@@ -199,7 +200,7 @@ def _run_steered(
     pos_tensor = torch.tensor(positions, dtype=torch.long)
 
     def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
-        value[:, pos_tensor, :] = value[:, pos_tensor, :] + steering_deltas.to(dtype=value.dtype)
+        value[:, pos_tensor, :] = value[:, pos_tensor, :] + steering_deltas.to(device=value.device, dtype=value.dtype)
         return value
 
     with torch.no_grad():
@@ -238,7 +239,7 @@ def _run_ablated(
         v = value.float()
         # P_batch @ v[b].T → (B, d, L); transpose to (B, L, d)
         proj = torch.bmm(P_batch, v.transpose(1, 2)).transpose(1, 2)
-        value = (v - proj).to(dtype=value.dtype)
+        value = (v - proj).to(device=value.device, dtype=value.dtype)
         return value
 
     with torch.no_grad():
@@ -480,6 +481,170 @@ def _plot_roundtrip_comparison(
     fig.write_image(str(path.with_suffix(".png")))
 
 
+def _plot_crossing(
+    agg_to_opt: dict[int, dict],
+    agg_to_clean: dict[int, dict],
+    baseline_to_opt: float,
+    layer_indices: list[int],
+    k: int,
+    condition: str,
+    title: str,
+    path: Path,
+) -> None:
+    """Small-multiples crossing plot: before/after for a single condition.
+
+    Blue: KL(P ∥ P_opt) — should go DOWN after intervention.
+    Orange: KL(P ∥ P_unintervened) — should go UP (output actually changed).
+    Crossing of the two = causal effect on model beliefs.
+    """
+    n_layers = len(layer_indices)
+    n_cols = min(6, n_layers)
+    n_rows = ceil(n_layers / n_cols)
+
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=[f"Layer {l}" for l in layer_indices],
+        shared_yaxes=False,
+        vertical_spacing=0.15 if n_rows > 1 else 0.1,
+        horizontal_spacing=0.08,
+    )
+
+    for i, layer in enumerate(layer_indices):
+        row = i // n_cols + 1
+        col = i % n_cols + 1
+        show_legend = i == 0
+
+        pt_opt_mean = agg_to_opt[layer]["mean"]
+        pt_opt_err = agg_to_opt[layer]["stderr"]
+        pt_clean_mean = agg_to_clean[layer]["mean"]
+        pt_clean_err = agg_to_clean[layer]["stderr"]
+
+        fig.add_trace(go.Scatter(
+            x=["Baseline", "Intervened"],
+            y=[baseline_to_opt, pt_opt_mean],
+            error_y=dict(type="data", array=[0.0, pt_opt_err], visible=True),
+            name="KL to optimal",
+            showlegend=show_legend,
+            mode="lines+markers",
+            line=dict(color="#1f77b4", width=2),
+            marker=dict(size=6),
+        ), row=row, col=col)
+
+        fig.add_trace(go.Scatter(
+            x=["Baseline", "Intervened"],
+            y=[0.0, pt_clean_mean],
+            error_y=dict(type="data", array=[0.0, pt_clean_err], visible=True),
+            name="KL to unintervened",
+            showlegend=show_legend,
+            mode="lines+markers",
+            line=dict(color="#ff7f0e", width=2),
+            marker=dict(size=6),
+        ), row=row, col=col)
+
+    fig.update_layout(
+        title=(
+            f"{title} — crossing ({condition.replace('_', '-')}, k={k})<br>"
+            "<sup>Blue = KL to optimal (↓ = causal) | Orange = KL to unintervened (↑ = output changed)</sup>"
+        ),
+        height=max(320, 220 * n_rows + 100),
+        width=min(220 * n_cols + 220, 1400),
+        margin=dict(t=90, b=60, l=60, r=40),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
+def _plot_causal_shift(
+    agg_to_opt: dict[str, dict[int, dict]],
+    baseline_to_opt: float,
+    layer_indices: list[int],
+    k: int,
+    title: str,
+    colors: dict[str, str],
+    path: Path,
+) -> None:
+    """Summary: ΔKL per layer — how much each condition moves output toward optimal.
+
+    ΔKL = KL_baseline_to_opt − KL_intervened_to_opt (positive = moved toward optimal).
+    """
+    layers_str = [str(l) for l in layer_indices]
+    fig = go.Figure()
+    fig.add_hline(y=0, line_color="black", line_width=1)
+
+    for cond, color in colors.items():
+        if cond not in agg_to_opt:
+            continue
+        delta = [baseline_to_opt - agg_to_opt[cond][l]["mean"] for l in layer_indices]
+        err = [agg_to_opt[cond][l]["stderr"] for l in layer_indices]
+        fig.add_trace(go.Scatter(
+            x=layers_str,
+            y=delta,
+            error_y=dict(type="data", array=err, visible=True),
+            name=cond.replace("_", "-"),
+            mode="lines+markers",
+            line=dict(color=color, width=2),
+            marker=dict(size=6),
+        ))
+
+    fig.update_layout(
+        title=(
+            f"{title} — causal shift (k={k})<br>"
+            "<sup>ΔKL = KL_baseline − KL_intervened toward optimal: positive = causal</sup>"
+        ),
+        xaxis_title="Layer",
+        yaxis_title="ΔKL [nats] (↑ = toward optimal)",
+        height=460,
+        width=780,
+        margin=dict(t=80, b=60, l=70, r=40),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
+def _plot_ablation_kl_to_output(
+    agg_belief: dict[int, dict],
+    agg_random: dict[int, dict],
+    layer_indices: list[int],
+    path: Path,
+) -> None:
+    """KL(P_ablated ∥ P_clean) for both ablation conditions.
+
+    Shows how much ablation perturbs the output distribution (independent of optimality).
+    """
+    layers_str = [str(l) for l in layer_indices]
+    fig = go.Figure()
+
+    for agg, color, name in [
+        (agg_belief, "#d62728", "Belief-subspace ablation"),
+        (agg_random, "#7f7f7f", "Random-subspace ablation (control)"),
+    ]:
+        means = [agg[l]["mean"] for l in layer_indices]
+        stderrs = [agg[l]["stderr"] for l in layer_indices]
+        fig.add_trace(go.Scatter(
+            x=layers_str,
+            y=means,
+            error_y=dict(type="data", array=stderrs, visible=True),
+            name=name,
+            mode="lines+markers",
+            line=dict(color=color, width=2),
+        ))
+
+    fig.update_layout(
+        title=(
+            "Ablation: KL to unintervened output<br>"
+            "<sup>KL(P_ablated ∥ P_clean) — output perturbation per condition</sup>"
+        ),
+        xaxis_title="Layer",
+        yaxis_title="KL [nats]",
+        height=460,
+        width=780,
+        margin=dict(t=80, b=60, l=70, r=40),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(path.with_suffix(".png")))
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -507,7 +672,10 @@ def main() -> None:
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
+    project_root = Path(__file__).resolve().parent.parent
     training_dir = Path(config.training_dir)
+    if not training_dir.is_absolute():
+        training_dir = project_root / training_dir
     npz_path = training_dir / "hmm_data.npz"
 
     logger.info(f"Output dir      : {out_dir}")
@@ -548,7 +716,7 @@ def main() -> None:
 
     logger.info(f"Seq length      : {L}")
     logger.info(f"Post-conv start : {P}")
-    logger.info(f"Eval act start  : {eval_act_start} (effective: {effective_eval_start})")
+    logger.info(f"Eval act start  : {eval_act_start}")
     logger.info(f"Measure pos     : {measure_pos}")
     logger.info(f"N sequences     : {N}")
 
@@ -579,6 +747,18 @@ def main() -> None:
     ablation_kl: dict[str, dict[int, list[tuple[int, int, float]]]] = {
         "belief": {l: [] for l in config.layer_indices},
         "random": {l: [] for l in config.layer_indices},
+    }
+    ablation_kl_to_clean: dict[str, dict[int, list[tuple[int, int, float]]]] = {
+        "belief": {l: [] for l in config.layer_indices},
+        "random": {l: [] for l in config.layer_indices},
+    }
+    patch_kl_to_clean: dict[str, dict[int, dict[int, list[tuple[int, int, float]]]]] = {
+        cond: {k: {l: [] for l in config.layer_indices} for k in config.k_values}
+        for cond in PATCH_CONDITIONS
+    }
+    steer_kl_to_clean: dict[str, dict[int, dict[int, list[tuple[int, int, float]]]]] = {
+        cond: {k: {l: [] for l in config.layer_indices} for k in config.k_values}
+        for cond in STEER_CONDITIONS
     }
     baseline_kl: list[float] = []
 
@@ -658,6 +838,11 @@ def main() -> None:
             for draw_i, kl_v in enumerate(kl_abl[1:]):
                 ablation_kl["random"][layer].append((seq_i, draw_i, float(kl_v)))
 
+            kl_abl_to_clean = _kl(P_abl, P_clean[None])
+            ablation_kl_to_clean["belief"][layer].append((seq_i, 0, float(kl_abl_to_clean[0])))
+            for draw_i, kl_v in enumerate(kl_abl_to_clean[1:]):
+                ablation_kl_to_clean["random"][layer].append((seq_i, draw_i, float(kl_v)))
+
             # ─ Per-k patching and steering ──────────────────────────────────
             for k in config.k_values:
                 positions = list(range(L - k, L))
@@ -716,6 +901,15 @@ def main() -> None:
                 for draw_i in range(config.n_random_patch_draws):
                     patch_kl["random"][k][layer].append((seq_i, draw_i, float(kl_patch[b_idx]))); b_idx += 1
 
+                kl_patch_to_clean = _kl(P_patch, P_clean[None])
+                b_idx = 0
+                patch_kl_to_clean["optimal"][k][layer].append((seq_i, 0, float(kl_patch_to_clean[b_idx]))); b_idx += 1
+                patch_kl_to_clean["round_trip"][k][layer].append((seq_i, 0, float(kl_patch_to_clean[b_idx]))); b_idx += 1
+                for draw_i in range(config.n_past_consistent_draws):
+                    patch_kl_to_clean["past_consistent"][k][layer].append((seq_i, draw_i, float(kl_patch_to_clean[b_idx]))); b_idx += 1
+                for draw_i in range(config.n_random_patch_draws):
+                    patch_kl_to_clean["random"][k][layer].append((seq_i, draw_i, float(kl_patch_to_clean[b_idx]))); b_idx += 1
+
                 # Steering: delta = decoder(target) − decoder(encoder(act))
                 with torch.no_grad():
                     source_beliefs = probe(torch.from_numpy(clean_acts_k).float().to(device))  # (k, n_states)
@@ -748,6 +942,14 @@ def main() -> None:
                     steer_kl["past_consistent"][k][layer].append((seq_i, draw_i, float(kl_steer[s_idx]))); s_idx += 1
                 for draw_i in range(config.n_random_patch_draws):
                     steer_kl["random"][k][layer].append((seq_i, draw_i, float(kl_steer[s_idx]))); s_idx += 1
+
+                kl_steer_to_clean = _kl(P_steer, P_clean[None])
+                s_idx = 0
+                steer_kl_to_clean["optimal"][k][layer].append((seq_i, 0, float(kl_steer_to_clean[s_idx]))); s_idx += 1
+                for draw_i in range(config.n_past_consistent_draws):
+                    steer_kl_to_clean["past_consistent"][k][layer].append((seq_i, draw_i, float(kl_steer_to_clean[s_idx]))); s_idx += 1
+                for draw_i in range(config.n_random_patch_draws):
+                    steer_kl_to_clean["random"][k][layer].append((seq_i, draw_i, float(kl_steer_to_clean[s_idx]))); s_idx += 1
 
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -785,6 +987,24 @@ def main() -> None:
         "belief": {l: _agg_records(ablation_kl["belief"][l]) for l in config.layer_indices},
         "random": {l: _agg_records(ablation_kl["random"][l]) for l in config.layer_indices},
     }
+    agg_patch_to_clean: dict[str, dict[int, dict[int, dict]]] = {
+        cond: {
+            k: {l: _agg_records(patch_kl_to_clean[cond][k][l]) for l in config.layer_indices}
+            for k in config.k_values
+        }
+        for cond in PATCH_CONDITIONS
+    }
+    agg_steer_to_clean: dict[str, dict[int, dict[int, dict]]] = {
+        cond: {
+            k: {l: _agg_records(steer_kl_to_clean[cond][k][l]) for l in config.layer_indices}
+            for k in config.k_values
+        }
+        for cond in STEER_CONDITIONS
+    }
+    agg_ablation_to_clean = {
+        "belief": {l: _agg_records(ablation_kl_to_clean["belief"][l]) for l in config.layer_indices},
+        "random": {l: _agg_records(ablation_kl_to_clean["random"][l]) for l in config.layer_indices},
+    }
 
     metrics = {
         "baseline": agg_baseline,
@@ -799,6 +1019,18 @@ def main() -> None:
         "ablation": {
             cond: {str(l): v for l, v in by_layer.items()}
             for cond, by_layer in agg_ablation.items()
+        },
+        "patching_to_clean": {
+            cond: {str(k): {str(l): v for l, v in by_layer.items()} for k, by_layer in by_k.items()}
+            for cond, by_k in agg_patch_to_clean.items()
+        },
+        "steering_to_clean": {
+            cond: {str(k): {str(l): v for l, v in by_layer.items()} for k, by_layer in by_k.items()}
+            for cond, by_k in agg_steer_to_clean.items()
+        },
+        "ablation_to_clean": {
+            cond: {str(l): v for l, v in by_layer.items()}
+            for cond, by_layer in agg_ablation_to_clean.items()
         },
     }
     with open(out_dir / "metrics.json", "w") as f:
@@ -820,6 +1052,25 @@ def main() -> None:
             colors=_PATCH_COLORS,
             path=fig_dir / f"patching_kl_vs_layer_k{k}",
         )
+        _plot_crossing(
+            agg_to_opt=agg_patch["optimal"][k],
+            agg_to_clean=agg_patch_to_clean["optimal"][k],
+            baseline_to_opt=baseline_mean,
+            layer_indices=config.layer_indices,
+            k=k,
+            condition="optimal",
+            title="Activation patching",
+            path=fig_dir / f"patching_crossing_optimal_k{k}",
+        )
+        _plot_causal_shift(
+            agg_to_opt={cond: agg_patch[cond][k] for cond in PATCH_CONDITIONS},
+            baseline_to_opt=baseline_mean,
+            layer_indices=config.layer_indices,
+            k=k,
+            title="Activation patching",
+            colors=_PATCH_COLORS,
+            path=fig_dir / f"patching_causal_shift_k{k}",
+        )
 
     # Steering: KL vs layer, one plot per k
     for k in config.k_values:
@@ -831,6 +1082,25 @@ def main() -> None:
             title="Activation steering: KL vs layer by condition",
             colors=_STEER_COLORS,
             path=fig_dir / f"steering_kl_vs_layer_k{k}",
+        )
+        _plot_crossing(
+            agg_to_opt=agg_steer["optimal"][k],
+            agg_to_clean=agg_steer_to_clean["optimal"][k],
+            baseline_to_opt=baseline_mean,
+            layer_indices=config.layer_indices,
+            k=k,
+            condition="optimal",
+            title="Activation steering",
+            path=fig_dir / f"steering_crossing_optimal_k{k}",
+        )
+        _plot_causal_shift(
+            agg_to_opt={cond: agg_steer[cond][k] for cond in STEER_CONDITIONS},
+            baseline_to_opt=baseline_mean,
+            layer_indices=config.layer_indices,
+            k=k,
+            title="Activation steering",
+            colors=_STEER_COLORS,
+            path=fig_dir / f"steering_causal_shift_k{k}",
         )
 
     # Heatmaps (largest k, optimal condition)
@@ -848,11 +1118,17 @@ def main() -> None:
         path=fig_dir / f"heatmap_steering_optimal_k{k_max}",
     )
 
-    # Ablation causal importance curve
+    # Ablation causal importance curve (KL to optimal)
     _plot_ablation_curve(
         agg_ablation["belief"], agg_ablation["random"],
         config.layer_indices,
         path=fig_dir / "ablation_causal_importance",
+    )
+    # Ablation KL to unintervened output (output perturbation)
+    _plot_ablation_kl_to_output(
+        agg_ablation_to_clean["belief"], agg_ablation_to_clean["random"],
+        config.layer_indices,
+        path=fig_dir / "ablation_kl_to_output",
     )
 
     # Round-trip comparison (H2A vs H2B), largest k

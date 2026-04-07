@@ -101,7 +101,7 @@ class ProbeResult:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         torch.save(self.probe.state_dict(), path / "probe.pt")
-        with open(path / "metadata.json", "w") as f:
+        with open(path / "probe_metadata.json", "w") as f:
             json.dump(
                 {
                     "train_mse_curve": self.train_mse_curve,
@@ -118,7 +118,7 @@ class ProbeResult:
     @classmethod
     def load_weights_only(cls, path: Path) -> "ProbeResult":
         path = Path(path)
-        with open(path / "metadata.json") as f:
+        with open(path / "probe_metadata.json") as f:
             meta = json.load(f)
         probe = Probe(meta["d_model"], meta["n_states"])
         probe.load_state_dict(
