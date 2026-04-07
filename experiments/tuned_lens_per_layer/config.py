@@ -47,6 +47,7 @@ class TunedLensConfig:
     tuned_lens_batch_size: int = 512
 
     # Output
+    output_user: str = "SPAR"
     output_name: str = "tuned_lens_per_layer"
     results_dir: str = "results/tuned_lens_per_layer"
 

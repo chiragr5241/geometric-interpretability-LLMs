@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=geom_interp
-#SBATCH --account=chirag5241
-#SBATCH --partition=gpuA100x4
+#SBATCH --account=bfqt-delta-gpu
+#SBATCH --partition=gpuA40x4
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-node=1
 #SBATCH --gpu-bind=closest
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --time=06:00:00
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
@@ -46,10 +46,11 @@ echo ""
 # ── Environment ────────────────────────────────────────────────────────────
 # Use module reset (not purge) to keep default modtree/gpu and set $SCRATCH/$WORK
 module reset
-module load anaconda3_gpu
+module load miniforge3-python
 
-# Activate project venv (created by setup_env.sh)
-source .venv/bin/activate
+# Initialize conda for this shell session, then activate
+eval "$(conda shell.bash hook)"
+conda activate geom-interp
 
 # HuggingFace token — set in your ~/.bashrc or pass via --export
 if [ -z "${HF_TOKEN:-}" ]; then

@@ -122,7 +122,16 @@ def run_single_config(
         all_beliefs.append(beliefs[:n_use])
         torch.cuda.empty_cache()
 
-    # Concatenate across sequences
+    # 4. Linear probes (per-sequence, before concatenation)
+    probe_results = train_probes(
+        all_activations_per_seq=all_activations,
+        beliefs_per_seq=all_beliefs,
+        layer_indices=config.layer_indices,
+        test_size=config.probe.test_size,
+        random_state=config.probe.random_state,
+    )
+
+    # Concatenate across sequences (for KL, PCA, and downstream plots)
     for layer in config.layer_indices:
         all_activations[layer] = np.concatenate(all_activations[layer], axis=0)
     all_logits_flat = np.concatenate(all_logits, axis=0)
@@ -130,7 +139,7 @@ def run_single_config(
 
     logger.info(f"  Total datapoints: {len(all_beliefs_flat)}")
 
-    # 4. KL divergence
+    # 5. KL divergence
     llm_probs = extract_concept_probs(all_logits_flat, concept_ids)
     llm_probs_all_vocab = extract_concept_probs_all_vocab(all_logits_flat, concept_ids)
 
@@ -152,15 +161,6 @@ def run_single_config(
     logger.info(
         f"  Mean KL (renorm): {kl_mean.mean():.4f}, "
         f"Mean KL (all-vocab): {kl_all_vocab_mean.mean():.4f}"
-    )
-
-    # 5. Linear probes
-    probe_results = train_probes(
-        all_activations=all_activations,
-        belief_states_flat=all_beliefs_flat,
-        layer_indices=config.layer_indices,
-        test_size=config.probe.test_size,
-        random_state=config.probe.random_state,
     )
 
     logger.info(

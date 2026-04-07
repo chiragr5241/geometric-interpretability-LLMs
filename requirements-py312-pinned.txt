@@ -20,4 +20,4 @@ scipy==1.17.0
 jax==0.9.0.1
 jaxlib==0.9.0.1
 jaxtyping==0.3.9
-simplexity @ git+https://github.com/Astera-org/simplexity.git
+simplexity @ git+https://github.com/Astera-org/simplexity.git@xavier/processes

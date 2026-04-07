@@ -16,6 +16,19 @@ from .config import TunedLensConfig, expand_param_grid, load_config, make_config
 from .pipeline import run_pipeline
 
 
+def _setup_output_dir(config: TunedLensConfig, override: str | None = None) -> Path:
+    """Create timestamped output directory, matching belief_state_sweep convention."""
+    if override:
+        output_dir = Path(override)
+    else:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        project_root = Path(__file__).resolve().parent.parent.parent
+        output_dir = project_root / "outputs" / config.output_user / f"{timestamp}_{config.experiment_name}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Per-layer tuned lens experiment")
     parser.add_argument(
@@ -38,9 +51,8 @@ def main() -> None:
     else:
         config = TunedLensConfig()
 
-    # Setup output directory
-    output_dir = Path(args.output_dir) if args.output_dir else Path(config.results_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Setup output directory (timestamped like belief_state_sweep)
+    output_dir = _setup_output_dir(config, args.output_dir)
 
     # Setup logging
     logger = setup_logging(output_dir, name="tuned_lens")

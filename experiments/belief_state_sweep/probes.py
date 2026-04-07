@@ -26,20 +26,25 @@ class ProbeResults:
 
 
 def train_probes(
-    all_activations: dict[int, np.ndarray],
-    belief_states_flat: np.ndarray,
+    all_activations_per_seq: dict[int, list[np.ndarray]],
+    beliefs_per_seq: list[np.ndarray],
     layer_indices: list[int],
     test_size: float = 0.2,
     random_state: int = 42,
 ) -> ProbeResults:
-    """Train a LinearRegression probe per layer and return results.
+    """Train a LinearRegression probe per layer, within each sequence independently.
 
-    Returns
-    -------
-    ProbeResults
-        Contains R²/MSE per layer, the best layer index, and the predicted
-        belief states from the best layer's probe (on the test set).
+    To avoid inflated R² from cross-sequence structure, each probe is trained
+    and evaluated on a single sequence.  Results are averaged across sequences.
+
+    Parameters
+    ----------
+    all_activations_per_seq : dict mapping layer -> list of per-sequence arrays,
+        each of shape (n_positions_i, d_model).
+    beliefs_per_seq : list of per-sequence belief arrays,
+        each of shape (n_positions_i, n_states).
     """
+    n_sequences = len(beliefs_per_seq)
     r2_per_layer: dict[int, float] = {}
     mse_per_layer: dict[int, float] = {}
     best_r2 = -np.inf
@@ -48,31 +53,43 @@ def train_probes(
     best_gt: np.ndarray | None = None
 
     for layer in layer_indices:
-        acts = all_activations[layer]
+        seq_r2s = []
+        seq_mses = []
+        layer_predicted_parts = []
+        layer_gt_parts = []
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            acts,
-            belief_states_flat,
-            test_size=test_size,
-            random_state=random_state,
-        )
+        for seq_idx in range(n_sequences):
+            acts = all_activations_per_seq[layer][seq_idx]
+            beliefs = beliefs_per_seq[seq_idx]
 
-        reg = LinearRegression()
-        reg.fit(X_train, y_train)
+            X_train, X_test, y_train, y_test = train_test_split(
+                acts,
+                beliefs,
+                test_size=test_size,
+                random_state=random_state + seq_idx,
+            )
 
-        y_pred_test = reg.predict(X_test)
+            reg = LinearRegression()
+            reg.fit(X_train, y_train)
 
-        mse_test = float(np.mean((y_pred_test - y_test) ** 2))
-        r2_test = compute_r2(y_test, y_pred_test)
+            y_pred_test = reg.predict(X_test)
 
+            seq_mses.append(float(np.mean((y_pred_test - y_test) ** 2)))
+            seq_r2s.append(compute_r2(y_test, y_pred_test))
+
+            layer_predicted_parts.append(y_pred_test)
+            layer_gt_parts.append(y_test)
+
+        r2_test = float(np.mean(seq_r2s))
+        mse_test = float(np.mean(seq_mses))
         r2_per_layer[layer] = r2_test
         mse_per_layer[layer] = mse_test
 
         if r2_test > best_r2:
             best_r2 = r2_test
             best_layer = layer
-            best_predicted = y_pred_test
-            best_gt = y_test
+            best_predicted = np.concatenate(layer_predicted_parts, axis=0)
+            best_gt = np.concatenate(layer_gt_parts, axis=0)
 
     return ProbeResults(
         r2_per_layer=r2_per_layer,
