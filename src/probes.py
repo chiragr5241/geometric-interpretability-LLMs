@@ -97,6 +97,51 @@ class ProbeResult:
                 indent=2,
             )
 
+    def save_weights_only(self, path: Path) -> None:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        torch.save(self.probe.state_dict(), path / "probe.pt")
+        with open(path / "metadata.json", "w") as f:
+            json.dump(
+                {
+                    "train_mse_curve": self.train_mse_curve,
+                    "test_mse": self.test_mse,
+                    "test_split_idx": self.test_split_idx,
+                    "kl_threshold": self.kl_threshold,
+                    "d_model": int(self.probe.W.shape[0]),
+                    "n_states": int(self.probe.W.shape[1]),
+                },
+                f,
+                indent=2,
+            )
+
+    @classmethod
+    def load_weights_only(cls, path: Path) -> "ProbeResult":
+        path = Path(path)
+        with open(path / "metadata.json") as f:
+            meta = json.load(f)
+        probe = Probe(meta["d_model"], meta["n_states"])
+        probe.load_state_dict(
+            torch.load(path / "probe.pt", map_location="cpu", weights_only=True)
+        )
+        probe.eval()
+        dummy_acts = np.zeros((0, meta["d_model"]), dtype=np.float32)
+        dummy_beliefs = np.zeros((0, meta["n_states"]), dtype=np.float32)
+        dummy_tokens = np.zeros((0,), dtype=np.int64)
+        return cls(
+            probe=probe,
+            train_mse_curve=meta["train_mse_curve"],
+            test_mse=meta["test_mse"],
+            test_split_idx=meta["test_split_idx"],
+            kl_threshold=meta["kl_threshold"],
+            train_tokens=dummy_tokens,
+            activations=dummy_acts,
+            gt_next_token_preds=dummy_acts,
+            computed_next_token_preds=dummy_acts,
+            gt_belief_states=dummy_beliefs,
+            computed_belief_states=dummy_beliefs,
+        )
+
     @classmethod
     def load(cls, path: Path) -> "ProbeResult":
         path = Path(path)
