@@ -2,7 +2,7 @@ experiment_name: single_seq_interventions
 output_user: dani
 
 # Path to Phase 1+2 output directory (from train_single_seq_encoder_decoder.py)
-training_dir: "outputs/dani/20260407_182339_train_single_seq_encoder_decoder_dry_run"
+training_dir: "outputs/dani/20260407_192713_train_single_seq_encoder_decoder"
 
 random_seed: 42
 
