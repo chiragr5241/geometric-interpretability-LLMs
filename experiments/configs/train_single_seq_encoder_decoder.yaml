@@ -29,8 +29,8 @@ decoder_params:
   patience: 400
   min_relative_improvement: 1.0e-2
 
-max_probes_per_batch: 30
-max_decoders_per_batch: 20
+max_probes_per_batch: 100
+max_decoders_per_batch: 100
 keep_activations: false
 
 vocab_mapping:
