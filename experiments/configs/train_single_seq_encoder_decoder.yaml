@@ -3,7 +3,7 @@ output_user: dani
 
 random_seed: 42
 
-n_sequences: 10
+n_sequences: 15
 seq_length: 1500
 post_convergence_start: 30
 train_eval_split: 0.7
