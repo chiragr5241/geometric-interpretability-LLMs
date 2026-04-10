@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass, field
@@ -150,20 +151,17 @@ def _eval_split_idx(L: int, P: int, train_eval_split: float) -> int:
     return int(n_post_conv * train_eval_split)
 
 
-def _orthogonal_projector(W: np.ndarray) -> np.ndarray:
-    """Orthogonal projector onto col-span of W: P = W (WᵀW)⁻¹ Wᵀ.  W: (d, k)."""
-    WtW = W.T @ W
-    try:
-        WtW_inv = np.linalg.inv(WtW)
-    except np.linalg.LinAlgError:
-        WtW_inv = np.linalg.pinv(WtW)
-    return W @ WtW_inv @ W.T
+def _orthonormal_basis(W: np.ndarray) -> np.ndarray:
+    """Orthonormal basis for col-span of W via QR.  W: (d, k) -> Q: (d, k)."""
+    Q, _ = np.linalg.qr(W)
+    return Q.astype(np.float32)
 
 
-def _random_projector(d: int, k: int, rng: np.random.Generator) -> np.ndarray:
+def _random_basis(d: int, k: int, rng: np.random.Generator) -> np.ndarray:
+    """Random orthonormal basis.  Returns Q: (d, k)."""
     A = rng.standard_normal((d, k)).astype(np.float32)
     Q, _ = np.linalg.qr(A)
-    return Q @ Q.T
+    return Q.astype(np.float32)
 
 
 def _agg_records(records: list[tuple[int, int, float]]) -> dict:
@@ -193,13 +191,43 @@ def _extract_4cat(
     return np.concatenate([probs_hmm, probs_junk], axis=-1).astype(np.float32)
 
 
+# ── Attention monkey-patch ─────────────────────────────────────────────────────
+
+def _patch_attention_dtype(model) -> None:
+    """Force TransformerLens attention softmax to stay in model dtype (fp16).
+
+    By default F.softmax promotes fp16→float32, doubling attention-pattern VRAM.
+    This patches each attention block to compute softmax in the model's dtype and
+    removes the redundant NaN→zero mask (NaN can't arise when causal mask uses
+    the model dtype's -inf).
+    """
+    from transformer_lens.components.abstract_attention import AbstractAttention
+
+    target_dtype = model.cfg.dtype
+
+    _orig_forward = AbstractAttention.forward
+
+    def _patched_forward(self, *args, **kwargs):
+        import torch.nn.functional as _F
+        orig_softmax = _F.softmax
+        def _fp16_softmax(input, dim=None, _stacklevel=3, dtype=None):
+            return orig_softmax(input, dim=dim, dtype=dtype or target_dtype)
+        _F.softmax = _fp16_softmax
+        try:
+            return _orig_forward(self, *args, **kwargs)
+        finally:
+            _F.softmax = orig_softmax
+
+    AbstractAttention.forward = _patched_forward
+
+
 # ── Hook-based forward passes ─────────────────────────────────────────────────
 
 def _run_ablated(
     model,
     tokens_batch: torch.Tensor,
     layer: int,
-    projectors: list[np.ndarray],
+    bases: list[np.ndarray],
     measure_pos: int,
     mid_tok_ids: list[int],
     device: torch.device,
@@ -208,13 +236,14 @@ def _run_ablated(
     """Run belief-subspace ablation at ALL positions. Returns P_ablated (B, 4).
 
     tokens_batch: (B, L).
-    projectors: list of B projector matrices (d, d).
+    bases: list of B orthonormal basis matrices Q, each (d, k).
+    Projection is Q @ Q^T @ v, computed as Q @ (Q^T @ v) to avoid materialising (d, d).
     """
-    B = len(projectors)
-    P_batch = torch.from_numpy(np.stack(projectors, axis=0)).to(device=device, dtype=model_dtype)
+    Q_batch = torch.from_numpy(np.stack(bases, axis=0)).to(device=device, dtype=model_dtype)
 
     def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
-        proj = torch.bmm(P_batch, value.transpose(1, 2)).transpose(1, 2)
+        QtV = torch.bmm(Q_batch.transpose(1, 2), value.transpose(1, 2))
+        proj = torch.bmm(Q_batch, QtV).transpose(1, 2)
         return value - proj
 
     with torch.no_grad():
@@ -408,16 +437,13 @@ def _round_trip_targets(
     probe: Probe,
     clean_acts: np.ndarray,
     decoder: Decoder,
-    device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Returns (decoded_acts (k, d_model), round_trip_beliefs (k, n_states))."""
-    probe = probe.to(device)
-    decoder = decoder.to(device)
     with torch.no_grad():
-        acts_t = torch.from_numpy(clean_acts).float().to(device)
+        acts_t = torch.from_numpy(clean_acts).float()
         encoded = probe(acts_t)
         decoded = decoder(encoded)
-    return decoded.float().cpu().numpy(), encoded.float().cpu().numpy()
+    return decoded.float().numpy(), encoded.float().numpy()
 
 
 def _past_consistent_targets(
@@ -808,6 +834,9 @@ def main() -> None:
 
     model = load_model(config.model_name, device, logger, n_ctx=config.n_ctx_override)
     model_dtype: torch.dtype = next(model.parameters()).dtype
+    if model_dtype == torch.float16:
+        _patch_attention_dtype(model)
+        logger.info("Patched attention softmax to stay in fp16")
 
     hmm = Mess3HMM()
     p = config.hmm.process_params
@@ -916,18 +945,18 @@ def main() -> None:
 
         for layer in config.layer_indices:
             layer_dir = training_dir / f"seq_{seq_i}" / f"layer_{layer}"
-            encoder = ProbeResult.load_weights_only(layer_dir).probe.to(device)
-            decoder = DecoderResult.load(layer_dir).decoder.to(device)
+            encoder = ProbeResult.load_weights_only(layer_dir).probe
+            decoder = DecoderResult.load(layer_dir).decoder
             encoder.eval()
             decoder.eval()
 
-            W = encoder.W.detach().float().cpu().numpy()
-            P_belief = _orthogonal_projector(W).astype(np.float32)
-            random_projs = [
-                _random_projector(W.shape[0], W.shape[1], rng)
+            W = encoder.W.detach().float().numpy()
+            Q_belief = _orthonormal_basis(W)
+            random_bases = [
+                _random_basis(W.shape[0], W.shape[1], rng)
                 for _ in range(config.n_random_ablation_draws)
             ]
-            sd.ablation_projs[layer] = [P_belief] + random_projs
+            sd.ablation_projs[layer] = [Q_belief] + random_bases
 
             for k in config.k_values:
                 clean_acts_k = sd.clean_acts_tail[layer][-k:]
@@ -944,17 +973,17 @@ def main() -> None:
                 ]
 
                 round_trip_acts, round_trip_beliefs = _round_trip_targets(
-                    encoder, clean_acts_k, decoder, device,
+                    encoder, clean_acts_k, decoder,
                 )
 
                 with torch.no_grad():
-                    dec_optimal = decoder(torch.from_numpy(eta_optimal).float().to(device)).cpu()
+                    dec_optimal = decoder(torch.from_numpy(eta_optimal).float())
                     dec_past = [
-                        decoder(torch.from_numpy(ep).float().to(device)).cpu()
+                        decoder(torch.from_numpy(ep).float())
                         for ep in eta_past_list
                     ]
                     dec_random = [
-                        decoder(torch.from_numpy(er).float().to(device)).cpu()
+                        decoder(torch.from_numpy(er).float())
                         for er in eta_random_list
                     ]
 
@@ -975,15 +1004,15 @@ def main() -> None:
                 sd.patch_target_P_opts[(layer, k)] = np.stack(patch_P_opt_list, axis=0)
 
                 with torch.no_grad():
-                    source_beliefs = encoder(torch.from_numpy(clean_acts_k).float().to(device))
+                    source_beliefs = encoder(torch.from_numpy(clean_acts_k).float())
                     dec_source = decoder(source_beliefs)
-                    steer_optimal = (dec_optimal.to(device) - dec_source).unsqueeze(0).cpu()
+                    steer_optimal = (dec_optimal - dec_source).unsqueeze(0)
                     steer_past = [
-                        (dp.to(device) - dec_source).unsqueeze(0).cpu()
+                        (dp - dec_source).unsqueeze(0)
                         for dp in dec_past
                     ]
                     steer_random = [
-                        (dr.to(device) - dec_source).unsqueeze(0).cpu()
+                        (dr - dec_source).unsqueeze(0)
                         for dr in dec_random
                     ]
 
@@ -1000,6 +1029,8 @@ def main() -> None:
                     steer_P_opt_list.append((er[measure_belief_idx] @ emit.T).astype(np.float32))
                 sd.steer_target_P_opts[(layer, k)] = np.stack(steer_P_opt_list, axis=0)
 
+            del encoder, decoder
+
     # ── Phase C: Batched interventions ────────────────────────────────────────
     logger.info("=== Phase C: Batched interventions ===")
 
@@ -1007,9 +1038,19 @@ def main() -> None:
         max_B = config.max_intervention_batch
     elif device.type == "cuda":
         free_bytes, _ = torch.cuda.mem_get_info()
-        bytes_per_item = int(L_trunc * model.cfg.d_model * 2 * 8)
-        max_B = max(64, min(512, int(free_bytes * 0.5 / bytes_per_item)))
-        logger.info(f"Auto batch size : {max_B} (free VRAM: {free_bytes / 1e9:.1f} GB)")
+        dtype_bytes = 2 if model_dtype == torch.float16 else 4
+        d = model.cfg.d_model
+        L = L_trunc
+        n_h = model.cfg.n_heads
+        d_mlp = getattr(model.cfg, "d_mlp", 4 * d)
+        resid_per_item = L * d * dtype_bytes * 2
+        qkv_per_item = L * 3 * d * dtype_bytes
+        attn_per_item = n_h * L * L * dtype_bytes * 2
+        mlp_per_item = L * d_mlp * dtype_bytes * 2
+        bytes_per_item = resid_per_item + qkv_per_item + attn_per_item + mlp_per_item
+        max_B = max(16, int(free_bytes * 0.3 / bytes_per_item))
+        logger.info(f"Auto batch size : {max_B} (free VRAM: {free_bytes / 1e9:.1f} GB, "
+                    f"est {bytes_per_item / 1e6:.0f} MB/item)")
     else:
         max_B = 96
     abl_chunk_size = max(1, max_B // n_abl_per_seq)
@@ -1038,42 +1079,69 @@ def main() -> None:
         pass_count = 0
         logger.info(f"  Layer {layer} ({layer_idx + 1}/{n_layers})")
 
-        abl_chunks = _chunk(all_seq_data, abl_chunk_size)
-        for chunk_idx, sub_batch in enumerate(abl_chunks):
-            tokens_batch, projs = _build_ablation_batch(sub_batch, layer)
-            P_abl = _run_ablated(
-                model, tokens_batch, layer, projs,
-                measure_pos, mid_tok_ids, device, model_dtype,
-            )
+        def _run_abl_safe(batch: list[SequenceData]) -> None:
+            tb, pr = _build_ablation_batch(batch, layer)
+            try:
+                P_abl = _run_ablated(
+                    model, tb, layer, pr,
+                    measure_pos, mid_tok_ids, device, model_dtype,
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if len(batch) <= 1:
+                    raise
+                mid = max(1, len(batch) // 2)
+                logger.warning(f"    OOM on ablation ({len(batch)} seqs), splitting → {mid}+{len(batch)-mid}")
+                _run_abl_safe(batch[:mid])
+                _run_abl_safe(batch[mid:])
+                return
             _scatter_ablation_results(
-                P_abl, sub_batch, layer,
-                ablation_kl, ablation_kl_to_clean,
+                P_abl, batch, layer, ablation_kl, ablation_kl_to_clean,
             )
+
+        abl_chunks = _chunk(all_seq_data, abl_chunk_size)
+        for sub_batch in abl_chunks:
+            _run_abl_safe(sub_batch)
             pass_count += 1
         abl_elapsed = time.perf_counter() - layer_start
         logger.info(f"    ablation done ({pass_count}/{passes_per_layer} passes, {abl_elapsed:.1f}s)")
 
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         for k_idx, k in enumerate(config.k_values):
             k_start = time.perf_counter()
             positions = list(range(L_trunc - k, L_trunc))
-            combined_chunks = _chunk(all_seq_data, combined_chunk_size)
-            for chunk_idx, sub_batch in enumerate(combined_chunks):
-                tokens_batch, n_patch, patch_tgts, steer_dlts = _build_combined_batch(
-                    sub_batch, layer, k
-                )
-                P_out = _run_combined(
-                    model, tokens_batch, layer, positions,
-                    n_patch, patch_tgts, steer_dlts,
-                    measure_pos, mid_tok_ids, device, model_dtype,
-                )
+
+            def _run_comb_safe(batch: list[SequenceData], _k: int = k, _pos: list[int] = positions) -> None:
+                tb, np_b, pt_b, sd_b = _build_combined_batch(batch, layer, _k)
+                try:
+                    P_out = _run_combined(
+                        model, tb, layer, _pos,
+                        np_b, pt_b, sd_b,
+                        measure_pos, mid_tok_ids, device, model_dtype,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    if len(batch) <= 1:
+                        raise
+                    mid = max(1, len(batch) // 2)
+                    logger.warning(f"    OOM on combined ({len(batch)} seqs), splitting → {mid}+{len(batch)-mid}")
+                    _run_comb_safe(batch[:mid], _k, _pos)
+                    _run_comb_safe(batch[mid:], _k, _pos)
+                    return
                 _scatter_combined_results(
-                    P_out, n_patch, sub_batch, layer, k,
+                    P_out, np_b, batch, layer, _k,
                     patch_kl_to_target, patch_kl_to_factual,
                     steer_kl_to_target, steer_kl_to_factual,
                     patch_kl_to_clean, steer_kl_to_clean,
                     baseline_kl_to_target_patch, baseline_kl_to_target_steer,
                     config.n_past_consistent_draws, config.n_random_patch_draws,
                 )
+
+            combined_chunks = _chunk(all_seq_data, combined_chunk_size)
+            for sub_batch in combined_chunks:
+                _run_comb_safe(sub_batch)
                 pass_count += 1
             k_elapsed = time.perf_counter() - k_start
             logger.info(

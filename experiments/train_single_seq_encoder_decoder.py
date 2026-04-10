@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SPAR-29 Phase 1+2 — Per-sequence encoder-decoder training (layer-wise).
+"""SPAR-29 Phase 1+2 — Per-sequence encoder-decoder training (multi-layer batched).
 
 Phase 1:  Generate N independent sequences from the HMM and compute belief states.
           Saves tokens + beliefs to {out_dir}/hmm_data.npz (skipped if it already exists).
@@ -8,13 +8,15 @@ Phase 2a: Run all N sequences through the LLM and save per-(seq, layer) post-con
           activations to disk as {out_dir}/activations/seq_{i}_layer_{l}.npy.
           Then delete the model to free VRAM for training.
 
-Phase 2b: Train encoders and decoders layer-wise: for each layer, train N encoders
-          and N decoders in a single batch.  Same-layer decoders have similar
-          convergence profiles, minimising idle GPU time from early-stopping.
+Phase 2b: Train encoders and decoders in a single flat batch keyed by (layer, seq_i).
+          All untrained (layer, seq_i) pairs are batched together (subject to
+          max_probes_per_batch / max_decoders_per_batch chunking) to maximise GPU
+          utilisation on larger hardware.
           Saves weights to {out_dir}/seq_{i}/layer_{l}/ (same layout as Phase 3 expects).
 
 Phase 2c: Evaluate trained encoders/decoders on held-out positions and generate
-          per-sequence + aggregate diagnostic plots.
+          per-sequence + aggregate diagnostic plots (including normalised decoder
+          reconstruction loss: MSE / mean_act_norm²).
 
 Alignment (no BOS):
     cache position t  ──▶  beliefs[t+1]
@@ -246,42 +248,51 @@ def main() -> None:
     else:
         logger.info("Phase 2a: all activations already cached, skipping forward passes")
 
-    # ── Phase 2b: layer-wise training ────────────────────────────────────────
-    logger.info("Phase 2b: layer-wise encoder-decoder training ...")
+    # ── Phase 2b: multi-layer batched training ───────────────────────────────
+    logger.info("Phase 2b: multi-layer batched encoder-decoder training ...")
     enc_p = config.encoder_params
     dec_p = config.decoder_params
 
     for seq_i in range(N):
         (out_dir / f"seq_{seq_i}").mkdir(parents=True, exist_ok=True)
 
-    for layer in config.layer_indices:
-        if _layer_training_complete(out_dir, layer, N):
-            logger.info(f"  Layer {layer:2d}: already complete, skipping")
-            continue
+    pending_layers = [
+        layer for layer in config.layer_indices
+        if not _layer_training_complete(out_dir, layer, N)
+    ]
+    skipped = [l for l in config.layer_indices if l not in pending_layers]
+    if skipped:
+        logger.info(f"  Skipping already-complete layers: {skipped}")
 
-        logger.info(f"  Layer {layer:2d}: loading activations for {N} sequences ...")
-        encoder_inputs: dict[int, ProbeInput] = {}
-        decoder_inputs: dict[int, DecoderInput] = {}
+    if pending_layers:
+        n_pairs = len(pending_layers) * N
+        logger.info(
+            f"  Loading activations for {len(pending_layers)} layers × {N} sequences"
+            f" = {n_pairs} (layer, seq) pairs ..."
+        )
+        encoder_inputs: dict[tuple[int, int], ProbeInput] = {}
+        decoder_inputs: dict[tuple[int, int], DecoderInput] = {}
 
-        for seq_i in range(N):
-            acts_post_conv = np.load(act_dir / f"seq_{seq_i}_layer_{layer}.npy")
-            train_acts = acts_post_conv[:split_idx]
-            train_beliefs = all_beliefs[seq_i][P : P + split_idx]
+        for layer in pending_layers:
+            for seq_i in range(N):
+                acts_post_conv = np.load(act_dir / f"seq_{seq_i}_layer_{layer}.npy")
+                train_acts = acts_post_conv[:split_idx]
+                train_beliefs = all_beliefs[seq_i][P : P + split_idx]
 
-            encoder_inputs[seq_i] = ProbeInput(
-                activations=train_acts,
-                gt_belief_states=train_beliefs,
-                tokens=all_tokens[seq_i][P - 1 : P - 1 + split_idx],
-                gt_next_token_preds=np.zeros((split_idx, n_vocab), dtype=np.float32),
-                computed_next_token_preds=np.zeros((split_idx, n_vocab), dtype=np.float32),
-            )
-            decoder_inputs[seq_i] = DecoderInput(
-                activations=train_acts,
-                belief_states=train_beliefs,
-            )
+                encoder_inputs[(layer, seq_i)] = ProbeInput(
+                    activations=train_acts,
+                    gt_belief_states=train_beliefs,
+                    tokens=all_tokens[seq_i][P - 1 : P - 1 + split_idx],
+                    gt_next_token_preds=np.zeros((split_idx, n_vocab), dtype=np.float32),
+                    computed_next_token_preds=np.zeros((split_idx, n_vocab), dtype=np.float32),
+                )
+                decoder_inputs[(layer, seq_i)] = DecoderInput(
+                    activations=train_acts,
+                    belief_states=train_beliefs,
+                )
 
-        logger.info(f"  Layer {layer:2d}: training {N} encoders ...")
-        probe_results: dict[int, ProbeResult] = train_probes_batched(
+        logger.info(f"  Training {n_pairs} encoders (max_per_batch={config.max_probes_per_batch}) ...")
+        probe_results: dict[tuple[int, int], ProbeResult] = train_probes_batched(
             encoder_inputs,
             split=1.0,
             lr=enc_p.get("lr", 1e-3),
@@ -289,8 +300,8 @@ def main() -> None:
             max_probes_per_batch=config.max_probes_per_batch,
         )
 
-        logger.info(f"  Layer {layer:2d}: training {N} decoders ...")
-        decoder_results: dict[int, DecoderResult] = train_decoders_batched(
+        logger.info(f"  Training {n_pairs} decoders (max_per_batch={config.max_decoders_per_batch}) ...")
+        decoder_results: dict[tuple[int, int], DecoderResult] = train_decoders_batched(
             decoder_inputs,
             split=1.0,
             lr=dec_p.get("lr", 1e-3),
@@ -300,12 +311,13 @@ def main() -> None:
             max_decoders_per_batch=config.max_decoders_per_batch,
         )
 
-        for seq_i in range(N):
-            layer_dir = out_dir / f"seq_{seq_i}" / f"layer_{layer}"
-            probe_results[seq_i].save_weights_only(layer_dir)
-            decoder_results[seq_i].save(layer_dir)
+        for layer in pending_layers:
+            for seq_i in range(N):
+                layer_dir = out_dir / f"seq_{seq_i}" / f"layer_{layer}"
+                probe_results[(layer, seq_i)].save_weights_only(layer_dir)
+                decoder_results[(layer, seq_i)].save(layer_dir)
 
-        logger.info(f"  Layer {layer:2d}: saved {N} encoder/decoder pairs")
+        logger.info(f"  Saved {n_pairs} encoder/decoder pairs")
 
     # ── Phase 2c: evaluation + plots ─────────────────────────────────────────
     logger.info("Phase 2c: evaluation and plotting ...")
@@ -401,6 +413,14 @@ def main() -> None:
             log_y=True,
         )
         layer_line_plot(
+            eval_vals=[layer_metrics[l]["eval_dec_norm_loss"] for l in config.layer_indices],
+            layer_indices=config.layer_indices,
+            y_title="MSE / mean_norm²",
+            title=f"Normalised decoder reconstruction loss by layer — Seq {seq_i}",
+            path=fig_dir / "decoder_recon_norm_loss_per_layer",
+            log_y=True,
+        )
+        layer_line_plot(
             eval_vals=[layer_metrics[l]["eval_roundtrip_loss"] for l in config.layer_indices],
             layer_indices=config.layer_indices,
             y_title="Round-trip MSE",
@@ -430,6 +450,14 @@ def main() -> None:
         y_title="Reconstruction MSE",
         title="Decoder reconstruction loss by layer — aggregated",
         path=agg_fig_dir / "decoder_recon_loss_per_layer",
+        log_y=True,
+    )
+    layer_line_plot(
+        eval_vals=[agg_metrics[str(l)]["eval_dec_norm_loss"]["mean"] for l in config.layer_indices],
+        layer_indices=config.layer_indices,
+        y_title="MSE / mean_norm² (mean across sequences)",
+        title="Normalised decoder reconstruction loss by layer — aggregated",
+        path=agg_fig_dir / "decoder_recon_norm_loss_per_layer",
         log_y=True,
     )
     layer_line_plot(
