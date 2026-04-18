@@ -132,7 +132,7 @@ def build_emission_matrix(hmm) -> np.ndarray:
     Shape: (n_tokens, n_states)
     """
     T = hmm.T_3d_matrix.cpu().numpy()   # (n_tokens, n_states, n_states)
-    return T.sum(axis=-1)               # (n_tokens, n_states)
+    return T.sum(axis=1)                # (n_tokens, n_states)  — sum over next_state (axis 1)
 
 
 def compute_optimal_probs(beliefs: np.ndarray, emit: np.ndarray) -> np.ndarray:

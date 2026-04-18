@@ -323,7 +323,7 @@ class Mess3HMM:
 
     def emission_matrix(self):
         """Emission matrix (n_states, vocab_size): P(token | state)."""
-        em = self.T_3d_matrix.sum(dim=2).T  # (n_states, vocab_size)
+        em = self.T_3d_matrix.sum(dim=1).T  # (n_states, vocab_size)  — sum over next_state (dim 1)
         return em / em.sum(dim=1, keepdim=True)
 
     def observation_probability_distribution(self, belief):
