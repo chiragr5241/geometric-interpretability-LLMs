@@ -1,0 +1,53 @@
+experiment_name: suffix_kl_curve_chirag_sweep
+output_user: dani
+
+n_sequences: 1000
+seq_length: 500
+k_max: 25
+n_positions_per_seq: 50
+
+model_empirical_kl: null
+
+random_seed: 42
+
+# Matches the processes and parameters in Chirag's belief state sweep
+# (belief_state_sweep_llama3.1_8b.yaml / belief_state_sweep_qwen2.5_7b.yaml).
+# Leopard (x=0.5, x=0.15) is omitted — not in the pinned simplexity commit.
+# Mess3 parameter "a" (simplexity convention) == "alpha" in our Mess3HMM.
+# Mess3 param_grid is the cartesian product of a=[0.6, 0.2] x x=[0.15, 0.5].
+processes:
+  - process_name: mess3
+    process_params:
+      x: 0.15
+      a: 0.6
+    label: "Mess3 (x=0.15, a=0.6)"
+  - process_name: mess3
+    process_params:
+      x: 0.5
+      a: 0.6
+    label: "Mess3 (x=0.5, a=0.6)"
+  - process_name: mess3
+    process_params:
+      x: 0.15
+      a: 0.2
+    label: "Mess3 (x=0.15, a=0.2)"
+  - process_name: mess3
+    process_params:
+      x: 0.5
+      a: 0.2
+    label: "Mess3 (x=0.5, a=0.2)"
+  - process_name: fern
+    process_params:
+      x: 0.63
+    label: "Fern (x=0.63)"
+  - process_name: fern
+    process_params:
+      x: 0.4
+    label: "Fern (x=0.4)"
+
+# Required by ExperimentConfig base; unused in multi-process mode.
+hmm:
+  process_name: n/a
+  process_params: {}
+
+model_name: "n/a"

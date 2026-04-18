@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""SPAR-27 — Suffix-length KL curve: theoretical prediction quality vs. context depth.
+"""SPAR-27/32 — Suffix-length KL curve: theoretical prediction quality vs. context depth.
 
 For each suffix length K = 1..k_max, a "forgetful" predictor that only has access
 to the last K tokens is compared to the Bayesian-optimal predictor with full history.
 The cost of limited context is KL(p_full || p_suffix), plotted as a function of K.
 
+Supports two config modes:
+  - Single process: set ``hmm.process_name`` / ``hmm.process_params`` as before.
+  - Multi-process: set ``processes`` to a list of dicts with keys
+    ``process_name``, ``process_params``, and optional ``label``.
+    All processes are overlaid on the same pair of figures.
+
 This is a pure HMM computation — no model inference needed.
 
 Usage:
-    python experiments/suffix_kl_curve.py experiments/configs/suffix_kl_curve.yaml
+    python experiments/suffix_kl_curve.py experiments/configs/suffix_kl_curve_mess3.yaml
+    python experiments/suffix_kl_curve.py experiments/configs/suffix_kl_curve_fern.yaml
+    python experiments/suffix_kl_curve.py experiments/configs/suffix_kl_curve_comparison.yaml
 """
 from __future__ import annotations
 
@@ -20,12 +28,25 @@ from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from experiment import ExperimentConfig, apply_runtime_overrides, load_config, setup_output_dir
 from experiment_utils import build_emission_matrix, get_device, setup_logging
-from hmm.hmm import Mess3HMM
+from hmm import build_process_hmm
+
+# Tableau-10 colours (line, semi-transparent fill)
+_COLORS: list[tuple[str, str]] = [
+    ("#1f77b4", "rgba(31,119,180,0.15)"),
+    ("#ff7f0e", "rgba(255,127,14,0.15)"),
+    ("#2ca02c", "rgba(44,160,44,0.15)"),
+    ("#d62728", "rgba(214,39,40,0.15)"),
+    ("#9467bd", "rgba(148,103,189,0.15)"),
+    ("#8c564b", "rgba(140,86,75,0.15)"),
+    ("#e377c2", "rgba(227,119,194,0.15)"),
+    ("#7f7f7f", "rgba(127,127,127,0.15)"),
+]
 
 
 @dataclass
@@ -36,6 +57,9 @@ class SuffixKLCurveConfig(ExperimentConfig):
     n_positions_per_seq: int
     model_empirical_kl: float | None = field(default=None)
     random_seed: int = field(default=42)
+    # Multi-process mode: list of dicts with keys process_name, process_params, label (opt).
+    # If set, the hmm field is ignored.
+    processes: list[dict] | None = field(default=None)
 
 
 def _kl(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
@@ -213,32 +237,45 @@ def _save_plot(
 
 
 def plot_suffix_kl_curves(
-    results: dict[int, dict],
+    all_results: list[tuple[str, dict[int, dict]]],
     model_empirical_kl: float | None,
     fig_dir: Path,
 ) -> None:
-    ks = sorted(results.keys())
+    """Overlay suffix-KL curves for one or more processes on a pair of figures."""
+    fig_fwd = go.Figure()
+    fig_rev = go.Figure()
 
-    fwd_stats = [results[k]["forward"] for k in ks]
-    rev_stats = [results[k]["reverse"] for k in ks]
+    for i, (label, results) in enumerate(all_results):
+        color, fill_color = _COLORS[i % len(_COLORS)]
+        ks = sorted(results.keys())
+        fwd_stats = [results[k]["forward"] for k in ks]
+        rev_stats  = [results[k]["reverse"]  for k in ks]
+        for trace in _kl_trace(ks, fwd_stats, label, color, fill_color):
+            fig_fwd.add_trace(trace)
+        for trace in _kl_trace(ks, rev_stats, label, color, fill_color):
+            fig_rev.add_trace(trace)
 
-    fig_fwd = go.Figure(_kl_trace(ks, fwd_stats, "KL(p_full || p_suffix)", "#1f77b4", "rgba(31,119,180,0.2)"))
+    multi = len(all_results) > 1
+    base_title = "Suffix-length KL curve" + (" comparison" if multi else "")
     _save_plot(
         fig_fwd,
-        "Suffix-length KL curve: prediction quality vs. context depth",
-        "KL(p_full || p_suffix) — mean ± 1 stderr across sampled (sequence, position) pairs",
+        base_title,
+        "KL(p_full ‖ p_suffix) — mean ± 1 stderr across sampled (sequence, position) pairs",
         model_empirical_kl,
         fig_dir / "suffix_kl_forward",
     )
-
-    fig_rev = go.Figure(_kl_trace(ks, rev_stats, "KL(p_suffix || p_full)", "#ff7f0e", "rgba(255,127,14,0.2)"))
     _save_plot(
         fig_rev,
-        "Suffix-length KL curve: prediction quality vs. context depth",
-        "KL(p_suffix || p_full) — mean ± 1 stderr across sampled (sequence, position) pairs",
+        base_title,
+        "KL(p_suffix ‖ p_full) — mean ± 1 stderr across sampled (sequence, position) pairs",
         model_empirical_kl,
         fig_dir / "suffix_kl_reverse",
     )
+
+
+def _make_label(process_name: str, process_params: dict) -> str:
+    parts = ", ".join(f"{k}={v}" for k, v in process_params.items())
+    return f"{process_name} ({parts})"
 
 
 def main() -> None:
@@ -262,51 +299,63 @@ def main() -> None:
     logger.info(f"Positions per seq  : {config.n_positions_per_seq}")
     logger.info(f"Model empirical KL : {config.model_empirical_kl}")
 
+    torch.manual_seed(config.random_seed)
     rng = np.random.default_rng(config.random_seed)
 
-    # ── HMM ──────────────────────────────────────────────────────────────────
-    hmm = Mess3HMM()
-    p = config.hmm.process_params
-    hmm.create_hmm(p["x"], p["alpha"])
-    emit = build_emission_matrix(hmm)   # (n_tokens, n_states)
-    logger.info(f"Mess3 HMM: x={p['x']}, alpha={p['alpha']}")
+    # ── Build the list of process specs ──────────────────────────────────────
+    if config.processes:
+        specs = config.processes
+        logger.info(f"Multi-process mode: {len(specs)} processes")
+    else:
+        p = config.hmm
+        specs = [{"process_name": p.process_name, "process_params": p.process_params}]
 
-    # ── Generate sequences + full-history beliefs ─────────────────────────────
-    logger.info(f"Generating {config.n_sequences} sequences of length {config.seq_length} ...")
-    tokens_torch, _, _ = hmm.generate_dataset(config.n_sequences, config.seq_length)
-    full_beliefs_torch = hmm.compute_belief_state(tokens_torch)  # (N, L+1, n_states)
+    # ── Run each process ──────────────────────────────────────────────────────
+    all_results: list[tuple[str, dict[int, dict]]] = []
+    all_metrics: dict = {}
 
-    tokens       = tokens_torch.cpu().numpy()
-    full_beliefs = full_beliefs_torch.cpu().numpy()
-    logger.info("Sequences and full-history beliefs computed.")
+    for spec in specs:
+        pname   = spec["process_name"]
+        pparams = spec["process_params"]
+        label   = spec.get("label") or _make_label(pname, pparams)
 
-    # ── Compute suffix KL for each K ──────────────────────────────────────────
-    logger.info(f"Computing suffix KL for K = 1..{config.k_max} ...")
-    results = compute_suffix_kl(
-        hmm, tokens, full_beliefs, emit,
-        k_max=config.k_max,
-        n_positions_per_seq=config.n_positions_per_seq,
-        rng=rng,
-    )
-    for K in sorted(results):
-        r = results[K]
-        logger.info(
-            f"  K={K:2d}  "
-            f"fwd={r['forward']['mean']:.3e}  "
-            f"rev={r['reverse']['mean']:.3e}  "
-            f"n_pairs={r['n_pairs']}"
+        logger.info(f"── {label} ──")
+        hmm  = build_process_hmm(pname, pparams)
+        emit = build_emission_matrix(hmm)
+
+        logger.info(f"  Generating {config.n_sequences} sequences of length {config.seq_length} ...")
+        tokens_torch, _, _ = hmm.generate_dataset(config.n_sequences, config.seq_length)
+        full_beliefs_torch  = hmm.compute_belief_state(tokens_torch)
+        tokens       = tokens_torch.cpu().numpy()
+        full_beliefs = full_beliefs_torch.cpu().numpy()
+        logger.info("  Sequences and beliefs computed.")
+
+        logger.info(f"  Computing suffix KL for K = 1..{config.k_max} ...")
+        results = compute_suffix_kl(
+            hmm, tokens, full_beliefs, emit,
+            k_max=config.k_max,
+            n_positions_per_seq=config.n_positions_per_seq,
+            rng=rng,
         )
+        for K in sorted(results):
+            r = results[K]
+            logger.info(
+                f"    K={K:2d}  fwd={r['forward']['mean']:.3e}  "
+                f"rev={r['reverse']['mean']:.3e}  n={r['n_pairs']}"
+            )
+
+        all_results.append((label, results))
+        all_metrics[label] = {str(K): v for K, v in results.items()}
 
     # ── Save metrics ──────────────────────────────────────────────────────────
-    metrics: dict = {str(K): v for K, v in results.items()}
     if config.model_empirical_kl is not None:
-        metrics["model_empirical_kl"] = config.model_empirical_kl
+        all_metrics["model_empirical_kl"] = config.model_empirical_kl
     with open(out_dir / "metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(all_metrics, f, indent=2)
     logger.info("Saved metrics.json")
 
     # ── Plots ─────────────────────────────────────────────────────────────────
-    plot_suffix_kl_curves(results, config.model_empirical_kl, fig_dir)
+    plot_suffix_kl_curves(all_results, config.model_empirical_kl, fig_dir)
     logger.info("Saved suffix_kl_forward.png and suffix_kl_reverse.png")
     logger.info(f"All outputs written to {out_dir}")
 

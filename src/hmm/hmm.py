@@ -162,7 +162,116 @@ def belief_to_barycentric_evolution(probs, belief_states):
     fig.show()
 
 
-class Mess3HMM:
+class BeliefHMM:
+    """Base class for HMMs that support belief-state computation.
+
+    Subclasses must set:
+        self.num_states      : int
+        self.T_3d_matrix     : torch.Tensor (n_tokens, n_states, n_states)
+                               column convention — T[v, next_state, cur_state]
+        self.reverse_mapping : dict {vocab_idx -> internal_idx}
+    """
+
+    def generate_dataset(self, num_sequences, seq_length, return_states=False):
+        """Generate sequences from the HMM.
+
+        Returns:
+            tokens, tokens_y if return_states=False
+            tokens, tokens_y, states if return_states=True
+        """
+        vocab_size, n_states, _ = self.T_3d_matrix.shape
+        prior = torch.ones(n_states, dtype=torch.float, device=device) / n_states
+
+        tokens = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
+        tokens_y = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
+        if return_states:
+            states = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
+        state_idx = torch.multinomial(prior, num_sequences, replacement=True)
+
+        for i in range(seq_length + 1):
+            if return_states and i < seq_length:
+                states[:, i] = state_idx
+
+            test = self.T_3d_matrix[:, :, state_idx].T.unsqueeze(0).reshape(num_sequences, -1)
+            test_pairs = torch.multinomial(test, 1, replacement=True).squeeze()
+            state_idx = test_pairs // vocab_size
+            if i != seq_length:
+                tokens[:, i] = test_pairs % vocab_size
+            if i != 0:
+                tokens_y[:, i - 1] = test_pairs % vocab_size
+
+        if return_states:
+            return tokens, tokens_y, states
+        return tokens, tokens_y, None
+
+    def compute_belief_state(self, tokens, initial_belief=None):
+        """Compute belief states given a sequence of tokens."""
+        if initial_belief is None:
+            belief = torch.ones(self.num_states, device=device) / self.num_states
+        else:
+            belief = torch.tensor(initial_belief, dtype=torch.float, device=device)
+
+        num_sequences, length = tokens.shape
+        beliefs = torch.zeros(num_sequences, length + 1, self.num_states, dtype=torch.float, device=device)
+        beliefs[:, 0] = belief
+
+        internal_tokens = torch.zeros_like(tokens)
+        for vocab_idx, internal_idx in self.reverse_mapping.items():
+            internal_tokens[tokens == vocab_idx] = internal_idx
+
+        for i in range(length):
+            beliefs[:, i + 1] = (self.T_3d_matrix[internal_tokens[:, i]] @ beliefs[:, i, :, None]).squeeze()
+            beliefs[:, i + 1] = beliefs[:, i + 1] / beliefs[:, i + 1].sum(-1, keepdim=True)
+
+        return beliefs
+
+    def emission_matrix(self):
+        """Emission matrix (n_states, vocab_size): P(token | state)."""
+        em = self.T_3d_matrix.sum(dim=1).T  # (n_states, vocab_size)  — sum over next_state (dim 1)
+        return em / em.sum(dim=1, keepdim=True)
+
+
+class FernHMM(BeliefHMM):
+    """HMM for the Fern process (2 tokens, 3 states).
+
+    Matrix from Xavier's xavier/processes branch, converted from row convention
+    (belief @ T[tok]) to our column convention (T[tok] @ belief) via transpose(-1, -2).
+    """
+
+    def __init__(self, vocab_mapping=None):
+        self.tokens = ['A', 'B']
+        self.states = ['1', '2', '3']
+        self.num_states = len(self.states)
+        self.token_to_idx = {token: idx for idx, token in enumerate(self.tokens)}
+        self.idx_to_token = {idx: token for idx, token in enumerate(self.tokens)}
+
+        if vocab_mapping is None:
+            self.vocab_mapping = {0: 0, 1: 1}
+        else:
+            self.vocab_mapping = vocab_mapping
+        self.reverse_mapping = {v: k for k, v in self.vocab_mapping.items()}
+
+        self.T_3d_matrix = torch.zeros((2, 3, 3), device=device)
+
+    def create_hmm(self, x: float):
+        """Build the Fern transition tensor for parameter x.
+
+        Xavier's row-convention matrix is transposed to our column convention:
+        T_col[v, next_state, cur_state] = T_xavier[v, cur_state, next_state]
+        """
+        T_xavier = torch.tensor([
+            [[0.3942,       0.00512,        0.0381],
+             [0.0,          0.53,           0.0],
+             [0.0,          0.326 * x,      0.554]],
+            [[0.3358,       0.01088,        0.2159],
+             [0.0,          0.0,            0.47],
+             [0.12,         0.326 * (1-x),  0.0]],
+        ], dtype=torch.float32, device=device)
+        self.T_3d_matrix = T_xavier.transpose(-1, -2)
+        return self.T_3d_matrix
+
+
+class Mess3HMM(BeliefHMM):
     """Hidden Markov Model for the Mess3 process with 3 states and 3 tokens."""
 
     def __init__(self, vocab_mapping=None, seed=42):
@@ -231,70 +340,6 @@ class Mess3HMM:
         self.T_3d_matrix = T
         return T
 
-    def generate_dataset(self, num_sequences, seq_length, return_states=False):
-        """Generate sequences from the HMM.
-        
-        Args:
-            num_sequences: Number of sequences to generate.
-            seq_length: Length of each sequence.
-            return_states: If True, also return hidden states.
-            
-        Returns:
-            tokens, tokens_y if return_states=False
-            tokens, tokens_y, states if return_states=True
-        """
-        vocab_size, n_states, _ = self.T_3d_matrix.shape
-        prior = torch.ones(n_states, dtype=torch.float, device=device) / n_states
-
-        tokens = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
-        tokens_y = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
-        if return_states:
-            states = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
-        state_idx = torch.multinomial(prior, num_sequences, replacement=True)
-        # print(state_idx)
-
-        for i in range(seq_length + 1):
-            # Store current state before transition
-            if return_states and i < seq_length:
-                states[:, i] = state_idx
-
-            # T_3d_matrix[:, :, state] not T_3d_matrix[:, state, :]
-            test = self.T_3d_matrix[:, :, state_idx].T.unsqueeze(0).reshape(num_sequences, -1)
-            test_pairs = torch.multinomial(test, 1, replacement=True).squeeze()
-            # Divide because eg: [AS1S1, BS1S1, CS1S2, AS1S2, BS1S2, CS1S2, CS1S3, AS1S3, BS1S3, CS1S3] where A=emit, S_=current state, S_=next state
-            state_idx = test_pairs // vocab_size
-            if i != seq_length:
-                tokens[:, i] = test_pairs % vocab_size
-            if i != 0:
-                # y is shifted by one: x = [0, 1, 2] -> y = [1, 2, next]
-                tokens_y[:, i - 1] = test_pairs % vocab_size
-
-        if return_states:
-            return tokens, tokens_y, states
-        return tokens, tokens_y, None
-
-    def compute_belief_state(self, tokens, initial_belief=None):
-        """Compute belief states given a sequence of tokens."""
-        if initial_belief is None:
-            belief = torch.ones(self.num_states, device=device) / self.num_states
-        else:
-            belief = torch.tensor(initial_belief, dtype=torch.float, device=device)
-
-        num_sequences, length = tokens.shape
-        beliefs = torch.zeros(num_sequences, length + 1, self.num_states, dtype=torch.float, device=device)
-        beliefs[:, 0] = belief
-
-        internal_tokens = torch.zeros_like(tokens)
-
-        for vocab_idx, internal_idx in self.reverse_mapping.items():
-            internal_tokens[tokens == vocab_idx] = internal_idx
-
-        for i in range(length):
-            beliefs[:, i + 1] = (self.T_3d_matrix[internal_tokens[:, i]] @ beliefs[:, i, :, None]).squeeze()
-            beliefs[:, i + 1] = beliefs[:, i + 1] / beliefs[:, i + 1].sum(-1, keepdim=True) # normalize it for the n states
-
-        return beliefs
-
     def sample_continuation(
         self,
         initial_belief: np.ndarray,
@@ -320,11 +365,6 @@ class Mess3HMM:
             beliefs[idx] = belief
 
         return tokens, beliefs
-
-    def emission_matrix(self):
-        """Emission matrix (n_states, vocab_size): P(token | state)."""
-        em = self.T_3d_matrix.sum(dim=1).T  # (n_states, vocab_size)  — sum over next_state (dim 1)
-        return em / em.sum(dim=1, keepdim=True)
 
     def observation_probability_distribution(self, belief):
         """P(symbol | belief) for each symbol. belief: (n_states,) or (batch, n_states)."""

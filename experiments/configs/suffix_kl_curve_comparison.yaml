@@ -1,0 +1,38 @@
+experiment_name: suffix_kl_curve_comparison
+output_user: dani
+
+n_sequences: 1000
+seq_length: 500
+k_max: 25
+n_positions_per_seq: 50
+
+model_empirical_kl: null
+
+random_seed: 42
+
+processes:
+  - process_name: mess3
+    process_params:
+      x: 0.05
+      alpha: 0.9
+    label: "Mess3 (x=0.05, α=0.9)"
+  - process_name: mess3
+    process_params:
+      x: 0.2
+      alpha: 0.7
+    label: "Mess3 (x=0.2, α=0.7)"
+  - process_name: fern
+    process_params:
+      x: 0.63
+    label: "Fern (x=0.63)"
+  - process_name: fern
+    process_params:
+      x: 0.4
+    label: "Fern (x=0.4)"
+
+# Required by ExperimentConfig base; unused in multi-process mode.
+hmm:
+  process_name: n/a
+  process_params: {}
+
+model_name: "n/a"
