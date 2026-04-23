@@ -75,7 +75,6 @@ class TrainSingleSeqEncoderDecoderConfig(ExperimentConfig):
     post_convergence_start: int = 30
     train_eval_split: float = 0.7
     balance: bool = True
-    train_frac: float = 0.8
     layer_indices: list[int] = field(default_factory=list)
     vocab_mapping: dict[str, int] = field(default_factory=dict)
     encoder_params: dict[str, Any] = field(default_factory=dict)
@@ -96,55 +95,48 @@ def _bin_label(p_t: float) -> int:
     return 2
 
 
-def _compute_balanced_indices(
+def _compute_balanced_train_indices(
     tokens: np.ndarray,
     beliefs: np.ndarray,
     emit_np: np.ndarray,
     P: int,
-    train_frac: float,
+    split_idx: int,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[int], int]:
-    """Bin post-convergence positions by HMM token probability p_t, subsample to equal
-    bin sizes, then stratify into train/eval sets.
+) -> tuple[np.ndarray, np.ndarray, list[int], int]:
+    """Bin train-split positions [0, split_idx) by HMM token probability p_t and
+    subsample to equal bin sizes.
 
-    p_t for post-conv position k is:  belief[P-1+k] · emit_row[token[P-1+k]]
-    (probability of observing the token given the prior belief state).
+    The eval split [split_idx, n_post_conv) is kept contiguous and untouched so
+    that training never sees eval positions. p_t for post-conv position k is:
+        belief[P-1+k] · emit_row[token[P-1+k]]
 
     Returns:
-        train_idx    – indices into the post-conv slice for training (sorted)
-        eval_idx     – indices into the post-conv slice for evaluation (sorted)
-        p_t          – per-position token probabilities (length n_post_conv)
+        train_idx     – balanced subset of [0, split_idx), sorted
+        p_t_train     – p_t values for all positions in [0, split_idx)
         counts_before – bin counts before subsampling [surprise, ambiguous, expected]
-        min_bin_cap  – the per-bin size after subsampling (= min of counts_before)
+        min_bin_cap   – per-bin size after subsampling (= min of counts_before)
     """
-    L = len(tokens)
-    n_post_conv = L - P + 1
-    p_t = np.array(
-        [float((beliefs[P - 1 + k] * emit_np[int(tokens[P - 1 + k])]).sum()) for k in range(n_post_conv)],
+    p_t_train = np.array(
+        [float((beliefs[P - 1 + k] * emit_np[int(tokens[P - 1 + k])]).sum()) for k in range(split_idx)],
         dtype=np.float32,
     )
 
     bin_indices: list[list[int]] = [[], [], []]
-    for k, p in enumerate(p_t):
+    for k, p in enumerate(p_t_train):
         bin_indices[_bin_label(float(p))].append(k)
 
     counts_before = [len(b) for b in bin_indices]
     min_cap = min(counts_before)
 
     train_list: list[int] = []
-    eval_list: list[int] = []
     for b in range(3):
         idx = np.array(bin_indices[b], dtype=np.int64)
         rng.shuffle(idx)
-        idx = idx[:min_cap]
-        n_tr = max(1, int(len(idx) * train_frac))
-        train_list.extend(idx[:n_tr].tolist())
-        eval_list.extend(idx[n_tr:].tolist())
+        train_list.extend(idx[:min_cap].tolist())
 
     return (
         np.array(sorted(train_list), dtype=np.int64),
-        np.array(sorted(eval_list), dtype=np.int64),
-        p_t,
+        p_t_train,
         counts_before,
         min_cap,
     )
@@ -265,49 +257,54 @@ def main() -> None:
     N = all_tokens.shape[0]
 
     # ── Train / eval index computation ───────────────────────────────────────
-    # When balance=True: bin each post-conv position by p_t, subsample to equal
-    # bin sizes, then stratify into train/eval.  When balance=False: use a
-    # contiguous split at split_idx (original behaviour).
+    # The eval split [split_idx, n_post_conv) is always a contiguous suffix —
+    # never seen during training and used as-is for eval and interventions.
+    # When balance=True: the train split [0, split_idx) is subsampled so all
+    # three p_t bins (surprise / ambiguous / expected) are equally represented.
+    # When balance=False: the full train split is used (original behaviour).
+    split_idx = _eval_split_idx(L, P, config.train_eval_split)
+    eval_idx_all = np.arange(split_idx, n_post_conv, dtype=np.int64)
+
     seq_train_idx: list[np.ndarray] = []
-    seq_eval_idx: list[np.ndarray] = []
-    split_idx: int = -1  # used only when balance=False
+    seq_eval_idx: list[np.ndarray] = [eval_idx_all] * N  # same contiguous suffix for every seq
+
+    logger.info(
+        f"Train/eval split : {split_idx} / {n_post_conv} post-conv positions"
+        f" (eval window size={n_post_conv - split_idx})"
+    )
 
     if config.balance:
         emit_np = build_emission_matrix(hmm)
         balance_rng = np.random.default_rng(config.random_seed)
         balance_stats: list[dict] = []
-        logger.info("Computing per-sequence balanced train/eval indices ...")
+        logger.info("Balancing train split by p_t bin ...")
         for seq_i in range(N):
-            tr_idx, ev_idx, _p_t, counts_before, min_cap = _compute_balanced_indices(
+            tr_idx, _p_t, counts_before, min_cap = _compute_balanced_train_indices(
                 all_tokens[seq_i], all_beliefs[seq_i], emit_np,
-                P, config.train_frac, balance_rng,
+                P, split_idx, balance_rng,
             )
             if min_cap == 0:
                 raise RuntimeError(
-                    f"Seq {seq_i}: smallest p_t bin is empty. "
-                    "Increase seq_length or post_convergence_start."
+                    f"Seq {seq_i}: smallest p_t bin in the train split is empty. "
+                    "Increase seq_length or train_eval_split."
                 )
             seq_train_idx.append(tr_idx)
-            seq_eval_idx.append(ev_idx)
             balance_stats.append({
                 "seq_i": seq_i,
                 "counts_before_balance": counts_before,
                 "min_bin_cap": min_cap,
-                "n_train": int(len(tr_idx)),
-                "n_eval": int(len(ev_idx)),
+                "n_train_balanced": int(len(tr_idx)),
+                "n_eval": int(len(eval_idx_all)),
             })
             logger.info(
-                f"  Seq {seq_i}: bins (surprise/ambiguous/expected)={counts_before}, "
-                f"cap={min_cap}, train={len(tr_idx)}, eval={len(ev_idx)}"
+                f"  Seq {seq_i}: train bins (surprise/ambiguous/expected)={counts_before}, "
+                f"cap={min_cap} → {len(tr_idx)} balanced training positions"
             )
         with open(out_dir / "balance_stats.json", "w") as f:
             json.dump(balance_stats, f, indent=2)
     else:
-        split_idx = _eval_split_idx(L, P, config.train_eval_split)
-        logger.info(f"Unbalanced split idx: {split_idx} / {n_post_conv} post-conv positions")
         for seq_i in range(N):
             seq_train_idx.append(np.arange(split_idx, dtype=np.int64))
-            seq_eval_idx.append(np.arange(split_idx, n_post_conv, dtype=np.int64))
 
     # ── Phase 2a: forward passes ─────────────────────────────────────────────
     act_dir = out_dir / "activations"

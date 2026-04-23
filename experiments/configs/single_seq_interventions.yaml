@@ -7,7 +7,7 @@ training_dir: "outputs/dani/20260409_175054_train_single_seq_encoder_decoder"
 
 random_seed: 42
 
-# Must match training script config
+# Must match training script config — defines the shared train/eval boundary
 post_convergence_start: 30
 train_eval_split: 0.7
 

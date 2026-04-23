@@ -6,8 +6,8 @@ random_seed: 42
 n_sequences: 15
 seq_length: 6000
 post_convergence_start: 30
+train_eval_split: 0.7
 balance: true
-train_frac: 0.8
 
 hmm:
   process_name: mess3
