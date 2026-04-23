@@ -117,6 +117,76 @@ def find_kl_threshold(
     return int(np.argmin(kl_search)) + min_position, False
 
 
+def find_kl_convergence_patience(
+    kl_smooth: np.ndarray,
+    patience: int = 50,
+    min_rel_improvement: float = 0.01,
+    min_position: int = 0,
+) -> tuple[int, bool]:
+    """Patience-based KL convergence detector.
+
+    Scans forward from ``min_position + patience``.  At each position t, checks
+    whether the smoothed KL has decreased by more than ``min_rel_improvement``
+    (relative to kl_smooth[t - patience]) over the preceding ``patience`` steps.
+    The first t where it hasn't is declared as the convergence point, returned as
+    ``t - patience`` (the position where the plateau began), with ``crossed=True``.
+
+    Falls back to the argmin of kl_smooth[min_position:] with ``crossed=False``
+    if the criterion never fires.
+
+    Returns (t_conv, crossed).
+    """
+    L = len(kl_smooth)
+    for t in range(min_position + patience, L):
+        ref = kl_smooth[t - patience]
+        if ref <= 0.0:
+            return t - patience, True
+        rel_decrease = (ref - kl_smooth[t]) / ref
+        if rel_decrease < min_rel_improvement:
+            return t - patience, True
+    return int(np.argmin(kl_smooth[min_position:])) + min_position, False
+
+
+def find_r2_emergence_patience(
+    sw_r2: np.ndarray,
+    patience: int = 50,
+    min_rel_improvement: float = 0.01,
+    min_position: int = 0,
+) -> tuple[int | None, bool]:
+    """Patience-based R² emergence detector.
+
+    Scans forward from ``min_position + patience``.  At each position t, checks
+    whether sliding R² has improved by more than ``min_rel_improvement`` relative
+    to sw_r2[t - patience] over the preceding ``patience`` steps.
+    The first t where it hasn't is declared as the emergence point, returned as
+    ``t - patience``, with ``crossed=True``.
+
+    NaN positions in sw_r2 (undefined R² due to near-constant beliefs in window)
+    are skipped when searching for the patience reference value.
+
+    Falls back to ``(nanargmax, False)`` if the criterion never fires.
+    Unlike the hard-threshold variant, this never returns ``None`` — it always
+    finds when R² stops meaningfully improving, regardless of the absolute level.
+
+    Returns (t_r2, crossed).
+    """
+    L = len(sw_r2)
+    for t in range(min_position + patience, L):
+        if np.isnan(sw_r2[t]):
+            continue
+        ref = sw_r2[t - patience]
+        if np.isnan(ref):
+            continue
+        denom = max(abs(ref), 1e-6)
+        rel_improvement = (sw_r2[t] - ref) / denom
+        if rel_improvement < min_rel_improvement:
+            return t - patience, True
+    valid = np.where(~np.isnan(sw_r2[min_position:]))[0]
+    if len(valid) == 0:
+        return min_position, False
+    return int(valid[np.nanargmax(sw_r2[min_position:][valid])]) + min_position, False
+
+
 def _column_cosine_similarity(W_a: np.ndarray, W_b: np.ndarray) -> np.ndarray:
     """
     Compute pairwise cosine similarities between columns of W_a and W_b.
