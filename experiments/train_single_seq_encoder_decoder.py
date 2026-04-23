@@ -450,8 +450,8 @@ def main() -> None:
             continue
 
         logger.info(f"  Seq {seq_i}/{N-1}: evaluating ...")
-        seq_beliefs = all_beliefs[seq_i]
-        eval_beliefs_arr = seq_beliefs[P + split_idx : L + 1]
+        ev_idx = seq_eval_idx[seq_i]
+        eval_beliefs_arr = all_beliefs[seq_i][P + ev_idx]
 
         probe_results_seq: dict[int, ProbeResult] = {}
         decoder_results_seq: dict[int, DecoderResult] = {}
@@ -465,7 +465,7 @@ def main() -> None:
             decoder_results_seq[layer] = dr
 
             acts_post_conv = np.load(act_dir / f"seq_{seq_i}_layer_{layer}.npy")
-            eval_acts = acts_post_conv[split_idx:]
+            eval_acts = acts_post_conv[ev_idx]
 
             enc_mse, enc_r2 = evaluate_encoder(pr.probe, eval_acts, eval_beliefs_arr)
             dec_loss, dec_norm = evaluate_decoder(dr.decoder, eval_beliefs_arr, eval_acts)
@@ -489,9 +489,9 @@ def main() -> None:
             pr = probe_results_seq[layer]
             enc_dev = next(pr.probe.parameters()).device
             acts_post_conv = np.load(act_dir / f"seq_{seq_i}_layer_{layer}.npy")
-            eval_acts = acts_post_conv[split_idx:]
+            simplex_eval_acts = acts_post_conv[ev_idx]
             with torch.no_grad():
-                pred = pr.probe(torch.from_numpy(eval_acts).float().to(enc_dev)).cpu().numpy()
+                pred = pr.probe(torch.from_numpy(simplex_eval_acts).float().to(enc_dev)).cpu().numpy()
             simplex_scatter(pred, eval_beliefs_arr, layer, fig_dir / f"simplex_layer_{layer}")
 
         per_seq_metrics.append(layer_metrics)
