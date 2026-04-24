@@ -1,0 +1,167 @@
+[
+  {
+    "seq_i": 0,
+    "counts_before_balance": [
+      794,
+      627,
+      2758
+    ],
+    "min_bin_cap": 627,
+    "n_train_balanced": 1881,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 1,
+    "counts_before_balance": [
+      783,
+      650,
+      2746
+    ],
+    "min_bin_cap": 650,
+    "n_train_balanced": 1950,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 2,
+    "counts_before_balance": [
+      766,
+      644,
+      2769
+    ],
+    "min_bin_cap": 644,
+    "n_train_balanced": 1932,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 3,
+    "counts_before_balance": [
+      831,
+      639,
+      2709
+    ],
+    "min_bin_cap": 639,
+    "n_train_balanced": 1917,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 4,
+    "counts_before_balance": [
+      836,
+      674,
+      2669
+    ],
+    "min_bin_cap": 674,
+    "n_train_balanced": 2022,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 5,
+    "counts_before_balance": [
+      835,
+      657,
+      2687
+    ],
+    "min_bin_cap": 657,
+    "n_train_balanced": 1971,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 6,
+    "counts_before_balance": [
+      768,
+      648,
+      2763
+    ],
+    "min_bin_cap": 648,
+    "n_train_balanced": 1944,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 7,
+    "counts_before_balance": [
+      838,
+      659,
+      2682
+    ],
+    "min_bin_cap": 659,
+    "n_train_balanced": 1977,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 8,
+    "counts_before_balance": [
+      806,
+      635,
+      2738
+    ],
+    "min_bin_cap": 635,
+    "n_train_balanced": 1905,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 9,
+    "counts_before_balance": [
+      776,
+      616,
+      2787
+    ],
+    "min_bin_cap": 616,
+    "n_train_balanced": 1848,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 10,
+    "counts_before_balance": [
+      752,
+      580,
+      2847
+    ],
+    "min_bin_cap": 580,
+    "n_train_balanced": 1740,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 11,
+    "counts_before_balance": [
+      784,
+      636,
+      2759
+    ],
+    "min_bin_cap": 636,
+    "n_train_balanced": 1908,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 12,
+    "counts_before_balance": [
+      793,
+      647,
+      2739
+    ],
+    "min_bin_cap": 647,
+    "n_train_balanced": 1941,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 13,
+    "counts_before_balance": [
+      810,
+      663,
+      2706
+    ],
+    "min_bin_cap": 663,
+    "n_train_balanced": 1989,
+    "n_eval": 1792
+  },
+  {
+    "seq_i": 14,
+    "counts_before_balance": [
+      804,
+      623,
+      2752
+    ],
+    "min_bin_cap": 623,
+    "n_train_balanced": 1869,
+    "n_eval": 1792
+  }
+]
