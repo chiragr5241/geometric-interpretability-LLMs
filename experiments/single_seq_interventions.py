@@ -84,6 +84,8 @@ DRY_RUN_K_VALUES = [1, 3]
 PATCH_CONDITIONS = ["optimal", "round_trip", "past_consistent", "random"]
 STEER_CONDITIONS = ["optimal", "past_consistent", "random"]
 
+CHECKPOINT_FILENAME = "phase_c_checkpoint.json"
+
 _PATCH_COLORS: dict[str, str] = {
     "optimal": "#1f77b4",
     "round_trip": "#ff7f0e",
@@ -109,6 +111,7 @@ class SingleSeqInterventionsConfig(ExperimentConfig):
     n_past_consistent_draws: int = 3
     n_random_patch_draws: int = 3
     max_intervention_batch: int | None = None
+    max_variants_per_pass: int | None = None
     n_ctx_override: int | None = None
     post_convergence_start: int = 30
     train_eval_split: float = 0.7
@@ -176,6 +179,121 @@ def _agg_records(records: list[tuple[int, int, float]]) -> dict:
         "std": float(np.std(seq_means)),
         "stderr": float(np.std(seq_means) / max(np.sqrt(n), 1.0)),
         "n_seqs": n,
+    }
+
+
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+def _serialize_ckl(src: dict) -> dict:
+    """Serialize cond->k->layer->list[tuple] to all-string-key JSON-safe dict."""
+    return {
+        cond: {
+            str(k): {str(l): [list(t) for t in records] for l, records in by_layer.items()}
+            for k, by_layer in by_k.items()
+        }
+        for cond, by_k in src.items()
+    }
+
+
+def _deserialize_ckl(
+    raw: dict, conds: list[str], k_values: list[int], layer_indices: list[int]
+) -> dict:
+    """Restore cond->k->layer->list[tuple] from JSON checkpoint."""
+    result: dict = {
+        cond: {k: {l: [] for l in layer_indices} for k in k_values}
+        for cond in conds
+    }
+    for cond in conds:
+        if cond not in raw:
+            continue
+        for k in k_values:
+            sk = str(k)
+            if sk not in raw[cond]:
+                continue
+            for l in layer_indices:
+                if str(l) not in raw[cond][sk]:
+                    continue
+                result[cond][k][l] = [tuple(t) for t in raw[cond][sk][str(l)]]
+    return result
+
+
+def _serialize_abl(src: dict) -> dict:
+    """Serialize variant->layer->list[tuple] to all-string-key JSON-safe dict."""
+    return {
+        variant: {str(l): [list(t) for t in records] for l, records in by_layer.items()}
+        for variant, by_layer in src.items()
+    }
+
+
+def _deserialize_abl(raw: dict, variants: list[str], layer_indices: list[int]) -> dict:
+    """Restore variant->layer->list[tuple] from JSON checkpoint."""
+    result: dict = {v: {l: [] for l in layer_indices} for v in variants}
+    for v in variants:
+        if v not in raw:
+            continue
+        for l in layer_indices:
+            if str(l) not in raw[v]:
+                continue
+            result[v][l] = [tuple(t) for t in raw[v][str(l)]]
+    return result
+
+
+def _save_checkpoint(
+    out_dir: Path,
+    completed_layers: list[int],
+    patch_kl_to_target: dict,
+    patch_kl_to_factual: dict,
+    patch_kl_to_clean: dict,
+    baseline_kl_to_target_patch: dict,
+    steer_kl_to_target: dict,
+    steer_kl_to_factual: dict,
+    steer_kl_to_clean: dict,
+    baseline_kl_to_target_steer: dict,
+    ablation_kl: dict,
+    ablation_kl_to_clean: dict,
+) -> None:
+    """Atomically save Phase C progress after completing each layer."""
+    chk = {
+        "completed_layers": completed_layers,
+        "patch_kl_to_target": _serialize_ckl(patch_kl_to_target),
+        "patch_kl_to_factual": _serialize_ckl(patch_kl_to_factual),
+        "patch_kl_to_clean": _serialize_ckl(patch_kl_to_clean),
+        "baseline_kl_to_target_patch": _serialize_ckl(baseline_kl_to_target_patch),
+        "steer_kl_to_target": _serialize_ckl(steer_kl_to_target),
+        "steer_kl_to_factual": _serialize_ckl(steer_kl_to_factual),
+        "steer_kl_to_clean": _serialize_ckl(steer_kl_to_clean),
+        "baseline_kl_to_target_steer": _serialize_ckl(baseline_kl_to_target_steer),
+        "ablation_kl": _serialize_abl(ablation_kl),
+        "ablation_kl_to_clean": _serialize_abl(ablation_kl_to_clean),
+    }
+    tmp = out_dir / f"{CHECKPOINT_FILENAME}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(chk, f)
+    tmp.rename(out_dir / CHECKPOINT_FILENAME)
+
+
+def _load_checkpoint(
+    chk_path: Path,
+    conds_patch: list[str],
+    conds_steer: list[str],
+    k_values: list[int],
+    layer_indices: list[int],
+) -> dict:
+    """Load Phase C checkpoint and deserialize all result dicts."""
+    with open(chk_path) as f:
+        raw = json.load(f)
+    return {
+        "completed_layers": raw["completed_layers"],
+        "patch_kl_to_target": _deserialize_ckl(raw["patch_kl_to_target"], conds_patch, k_values, layer_indices),
+        "patch_kl_to_factual": _deserialize_ckl(raw["patch_kl_to_factual"], conds_patch, k_values, layer_indices),
+        "patch_kl_to_clean": _deserialize_ckl(raw["patch_kl_to_clean"], conds_patch, k_values, layer_indices),
+        "baseline_kl_to_target_patch": _deserialize_ckl(raw["baseline_kl_to_target_patch"], conds_patch, k_values, layer_indices),
+        "steer_kl_to_target": _deserialize_ckl(raw["steer_kl_to_target"], conds_steer, k_values, layer_indices),
+        "steer_kl_to_factual": _deserialize_ckl(raw["steer_kl_to_factual"], conds_steer, k_values, layer_indices),
+        "steer_kl_to_clean": _deserialize_ckl(raw["steer_kl_to_clean"], conds_steer, k_values, layer_indices),
+        "baseline_kl_to_target_steer": _deserialize_ckl(raw["baseline_kl_to_target_steer"], conds_steer, k_values, layer_indices),
+        "ablation_kl": _deserialize_abl(raw["ablation_kl"], ["belief", "random"], layer_indices),
+        "ablation_kl_to_clean": _deserialize_abl(raw["ablation_kl_to_clean"], ["belief", "random"], layer_indices),
     }
 
 
@@ -769,6 +887,10 @@ def main() -> None:
     parser.add_argument("--output-user", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true",
                         help=f"Quick test: {DRY_RUN_N_SEQ} seqs, {DRY_RUN_N_EVAL_POSITIONS} eval positions")
+    parser.add_argument(
+        "--resume", type=str, default=None, metavar="DIR",
+        help="Resume an interrupted run from DIR (loads phase_c_checkpoint.json; re-runs Phase A+B, skips completed Phase C layers)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config, SingleSeqInterventionsConfig)
@@ -782,8 +904,17 @@ def main() -> None:
 
     rng = np.random.default_rng(config.random_seed)
     device = get_device()
-    out_dir = setup_output_dir(config)
+
+    resume_dir = Path(args.resume).resolve() if args.resume else None
+    if resume_dir is not None:
+        out_dir = resume_dir
+        (out_dir / "figures").mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = setup_output_dir(config)
+
     logger = setup_logging(out_dir, name="interventions")
+    if resume_dir is not None:
+        logger.info(f"=== RESUMING from {resume_dir} ===")
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -930,6 +1061,13 @@ def main() -> None:
             clean_acts_tail=clean_acts_tail,
         ))
 
+    # Clear TransformerLens hook contexts: run_with_cache writes
+    # hook.ctx["activation"] on every HookPoint; with clear_contexts=False
+    # (the default) those GPU tensors persist on the model indefinitely.
+    model.reset_hooks(clear_contexts=True)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     # ── Phase B: Pre-compute all targets ─────────────────────────────────────
     logger.info("=== Phase B: Pre-computing targets ===")
 
@@ -1031,6 +1169,31 @@ def main() -> None:
 
             del encoder, decoder
 
+    # ── Load checkpoint (resume) ──────────────────────────────────────────────
+    completed_layers: list[int] = []
+    if resume_dir is not None:
+        chk_path = out_dir / CHECKPOINT_FILENAME
+        if chk_path.exists():
+            logger.info(f"Loading checkpoint: {chk_path}")
+            chk = _load_checkpoint(
+                chk_path, PATCH_CONDITIONS, STEER_CONDITIONS,
+                config.k_values, config.layer_indices,
+            )
+            completed_layers = chk["completed_layers"]
+            patch_kl_to_target = chk["patch_kl_to_target"]
+            patch_kl_to_factual = chk["patch_kl_to_factual"]
+            patch_kl_to_clean = chk["patch_kl_to_clean"]
+            baseline_kl_to_target_patch = chk["baseline_kl_to_target_patch"]
+            steer_kl_to_target = chk["steer_kl_to_target"]
+            steer_kl_to_factual = chk["steer_kl_to_factual"]
+            steer_kl_to_clean = chk["steer_kl_to_clean"]
+            baseline_kl_to_target_steer = chk["baseline_kl_to_target_steer"]
+            ablation_kl = chk["ablation_kl"]
+            ablation_kl_to_clean = chk["ablation_kl_to_clean"]
+            logger.info(f"  Restored {len(completed_layers)} completed layers: {completed_layers}")
+        else:
+            logger.warning(f"  No checkpoint found at {chk_path}; Phase C will run from scratch")
+
     # ── Phase C: Batched interventions ────────────────────────────────────────
     logger.info("=== Phase C: Batched interventions ===")
 
@@ -1075,6 +1238,9 @@ def main() -> None:
     layer_times: list[float] = []
 
     for layer_idx, layer in enumerate(config.layer_indices):
+        if layer in completed_layers:
+            logger.info(f"  Layer {layer} ({layer_idx + 1}/{n_layers}) — skipped (checkpoint)")
+            continue
         layer_start = time.perf_counter()
         pass_count = 0
         logger.info(f"  Layer {layer} ({layer_idx + 1}/{n_layers})")
@@ -1115,21 +1281,48 @@ def main() -> None:
 
             def _run_comb_safe(batch: list[SequenceData], _k: int = k, _pos: list[int] = positions) -> None:
                 tb, np_b, pt_b, sd_b = _build_combined_batch(batch, layer, _k)
-                try:
-                    P_out = _run_combined(
-                        model, tb, layer, _pos,
-                        np_b, pt_b, sd_b,
-                        measure_pos, mid_tok_ids, device, model_dtype,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    if len(batch) <= 1:
-                        raise
-                    mid = max(1, len(batch) // 2)
-                    logger.warning(f"    OOM on combined ({len(batch)} seqs), splitting → {mid}+{len(batch)-mid}")
-                    _run_comb_safe(batch[:mid], _k, _pos)
-                    _run_comb_safe(batch[mid:], _k, _pos)
-                    return
+
+                max_v = config.max_variants_per_pass
+                if max_v is not None and tb.shape[0] > max_v:
+                    # Variant-level chunking: split patch items then steer items into
+                    # sub-passes of ≤ max_variants_per_pass, limiting attention-pattern
+                    # peak memory to max_v × n_heads × seq_len² × dtype_bytes.
+                    patch_tb = tb[:np_b]
+                    steer_tb = tb[np_b:]
+                    n_steer = tb.shape[0] - np_b
+                    pieces: list[np.ndarray] = []
+                    for start in range(0, np_b, max_v):
+                        end = min(start + max_v, np_b)
+                        pieces.append(_run_combined(
+                            model, patch_tb[start:end], layer, _pos,
+                            end - start, pt_b[start:end], sd_b[:0],
+                            measure_pos, mid_tok_ids, device, model_dtype,
+                        ))
+                    for start in range(0, n_steer, max_v):
+                        end = min(start + max_v, n_steer)
+                        pieces.append(_run_combined(
+                            model, steer_tb[start:end], layer, _pos,
+                            0, pt_b[:0], sd_b[start:end],
+                            measure_pos, mid_tok_ids, device, model_dtype,
+                        ))
+                    P_out = np.concatenate(pieces, axis=0)
+                else:
+                    try:
+                        P_out = _run_combined(
+                            model, tb, layer, _pos,
+                            np_b, pt_b, sd_b,
+                            measure_pos, mid_tok_ids, device, model_dtype,
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        if len(batch) <= 1:
+                            raise
+                        mid = max(1, len(batch) // 2)
+                        logger.warning(f"    OOM on combined ({len(batch)} seqs), splitting → {mid}+{len(batch)-mid}")
+                        _run_comb_safe(batch[:mid], _k, _pos)
+                        _run_comb_safe(batch[mid:], _k, _pos)
+                        return
+
                 _scatter_combined_results(
                     P_out, np_b, batch, layer, _k,
                     patch_kl_to_target, patch_kl_to_factual,
@@ -1147,11 +1340,24 @@ def main() -> None:
             logger.info(
                 f"    k={k} done ({pass_count}/{passes_per_layer} passes, {k_elapsed:.1f}s)"
             )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        completed_layers.append(layer)
+        _save_checkpoint(
+            out_dir, completed_layers,
+            patch_kl_to_target, patch_kl_to_factual, patch_kl_to_clean,
+            baseline_kl_to_target_patch,
+            steer_kl_to_target, steer_kl_to_factual, steer_kl_to_clean,
+            baseline_kl_to_target_steer,
+            ablation_kl, ablation_kl_to_clean,
+        )
 
         elapsed = time.perf_counter() - layer_start
         layer_times.append(elapsed)
-        avg_layer = sum(layer_times) / len(layer_times)
-        layers_left = n_layers - (layer_idx + 1)
+        layers_done = len(layer_times)
+        avg_layer = sum(layer_times) / layers_done
+        layers_left = n_layers - (len(completed_layers))
         eta_s = avg_layer * layers_left
         logger.info(
             f"  Layer {layer} done in {elapsed:.1f}s  |  ETA: {eta_s / 60:.1f} min"

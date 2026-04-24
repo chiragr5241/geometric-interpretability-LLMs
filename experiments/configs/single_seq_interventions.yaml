@@ -3,7 +3,7 @@ output_user: dani
 
 # Path to Phase 1+2 output directory (from train_single_seq_encoder_decoder.py)
 # Update this after running training with n_sequences=15, seq_length=1500
-training_dir: "outputs/dani/20260409_175054_train_single_seq_encoder_decoder"
+training_dir: "outputs/dani/20260423_171757_train_single_seq_encoder_decoder"
 
 random_seed: 42
 
@@ -33,4 +33,10 @@ n_random_ablation_draws: 3
 n_past_consistent_draws: 3
 n_random_patch_draws: 3
 # null = auto-detect from VRAM on CUDA, 96 on MPS/CPU; set an integer to override
-max_intervention_batch: null
+# Setting to n_abl_per_seq (= 1 + n_random_ablation_draws = 4) avoids OOM-and-retry on ablation.
+max_intervention_batch: 4
+# Maximum variants (patch + steer items) batched into a single forward pass.
+# Peak attention-pattern memory ≈ max_variants_per_pass × n_heads × seq_len² × 2 bytes.
+# For Llama-3.2-3B (24 heads) at seq_len≈4211: each variant costs ~853 MB of attn memory.
+# Set to 4 to keep the peak under ~3.5 GB; null = no limit (all variants in one pass).
+max_variants_per_pass: 4

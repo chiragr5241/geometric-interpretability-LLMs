@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,18 @@ from plotly.subplots import make_subplots
 
 from decoder import Decoder, DecoderResult
 from probes import Probe, ProbeResult
+
+logger = logging.getLogger(__name__)
+
+
+def _save_fig(fig: go.Figure, path: Path) -> None:
+    """Save a Plotly figure as PNG, falling back to HTML if Chrome is unavailable."""
+    png_path = path.with_suffix(".png")
+    try:
+        fig.write_image(str(png_path))
+    except Exception as e:
+        logger.warning("Could not write PNG (Chrome missing?): %s — saving HTML instead.", e)
+        fig.write_html(str(path.with_suffix(".html")))
 
 
 def r2(pred: np.ndarray, gt: np.ndarray) -> float:
@@ -167,7 +180,7 @@ def simplex_scatter(
         width=520,
         margin=dict(t=50, b=20, l=20, r=20),
     )
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path)
 
 
 def decoder_loss_curves(
@@ -208,7 +221,7 @@ def decoder_loss_curves(
         height=260 * n_rows,
         width=320 * n_cols,
     )
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path)
 
 
 def encoder_mse_curves(
@@ -242,7 +255,7 @@ def encoder_mse_curves(
         height=260 * n_rows,
         width=320 * n_cols,
     )
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path)
 
 
 def layer_line_plot(
@@ -274,7 +287,7 @@ def layer_line_plot(
         width=720,
         margin=dict(t=70, b=60, l=70, r=40),
     )
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path)
 
 
 def make_grid_figure(
