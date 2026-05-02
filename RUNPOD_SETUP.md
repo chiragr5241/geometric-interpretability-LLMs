@@ -44,7 +44,30 @@ torch = [{ index = "pytorch-cu126" }]
 This change is already committed to the repo, so `uv sync --active` (step 2) will automatically
 pull the right build.
 
-## 4. Set up the Hugging Face CLI
+## 4. Install Kaleido/Chromium system dependencies
+
+Plotly uses [Kaleido](https://github.com/plotly/Kaleido) to export static images (PNG, SVG, PDF).
+Kaleido bundles its own Chromium binary, but that binary requires several shared libraries that are
+not present on a bare RunPod instance by default.
+
+```bash
+apt-get install -y \
+  libglib2.0-0 \
+  libnss3 \
+  libatk1.0-0 \
+  libatk-bridge2.0-0 \
+  libcups2 \
+  libdrm2 \
+  libxkbcommon0 \
+  libxcomposite1 \
+  libxdamage1 \
+  libxfixes3 \
+  libxrandr2 \
+  libgbm1 \
+  libasound2
+```
+
+## 5. Set up the Hugging Face CLI
 
 ```bash
 uv tool install "huggingface_hub[cli]"
