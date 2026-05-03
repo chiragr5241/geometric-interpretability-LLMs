@@ -1,0 +1,38 @@
+experiment_name: emergence_curve_single_seq_wing
+output_user: dani
+
+device: cuda:1
+model_n_devices: 1
+
+# Update after the corresponding train_single_seq_encoder_decoder_wing run.
+probe_dir: "outputs/dani/REPLACE_WITH_WING_TRAINING_DIR"
+
+sliding_window: 30
+max_plot_position: 250
+strip_bos: true
+
+hmm:
+  process_name: wing
+  process_params:
+    x: 0.96
+    y: 0.4
+
+model_name: "meta-llama/Llama-3.2-3B"
+n_ctx_override: 6050
+
+layer_indices: [0, 1, 2, 3, 4, 5, 6, 10, 15, 20, 25, 27]
+
+kl_params:
+  smooth_window: 5
+  min_position: 20
+  patience: 50
+  min_rel_improvement: 0.01
+
+r2_params:
+  min_position: 5
+  patience: 50
+  min_rel_improvement: 0.01
+
+vocab_mapping:
+  "A": 0
+  "B": 1
