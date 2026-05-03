@@ -22,6 +22,8 @@ class ExperimentConfig:
     experiment_name: str
     hmm: HMMConfig
     model_name: str
+    device: str | None = field(default=None, kw_only=True)
+    model_n_devices: int | None = field(default=None, kw_only=True)
     output_user: str = field(default="SPAR", kw_only=True)
 
 

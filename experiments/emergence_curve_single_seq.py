@@ -41,12 +41,13 @@ from experiment_utils import (
     resolve_hmm_token_ids,
     setup_logging,
 )
-from hmm.hmm import Mess3HMM
+from hmm import build_process_hmm
 from metrics.probe_metrics import (
     compute_kl,
     find_kl_convergence_patience,
     find_r2_emergence_patience,
 )
+from plot_titles import format_hmm_process
 from probes import Probe, ProbeResult
 
 DRY_RUN_N_SEQ = 2
@@ -102,18 +103,13 @@ def _validate_against_probe_dir(
     logger,
 ) -> None:
     """Error out if key params don't match the probe dir's config."""
+    probe_hmm = probe_dir_config.get("hmm", {})
     checks = {
         "n_sequences": (None, probe_dir_config.get("n_sequences")),
         "seq_length": (None, probe_dir_config.get("seq_length")),
         "vocab_mapping": (config.vocab_mapping, probe_dir_config.get("vocab_mapping")),
-        "hmm_x": (
-            config.hmm.process_params.get("x"),
-            probe_dir_config.get("hmm", {}).get("process_params", {}).get("x"),
-        ),
-        "hmm_alpha": (
-            config.hmm.process_params.get("alpha"),
-            probe_dir_config.get("hmm", {}).get("process_params", {}).get("alpha"),
-        ),
+        "hmm_process_name": (config.hmm.process_name, probe_hmm.get("process_name")),
+        "hmm_process_params": (config.hmm.process_params, probe_hmm.get("process_params")),
     }
     for key, (mine, theirs) in checks.items():
         if theirs is None:
@@ -144,6 +140,21 @@ def _apply_probe(
         preds = probe(torch.from_numpy(acts).float().to(device)).cpu().numpy()
     se = ((preds - beliefs) ** 2).sum(axis=-1)
     return se, preds
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _save_fig(fig: go.Figure, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(path.with_suffix(".html")))
+    try:
+        fig.write_image(str(path.with_suffix(".png")))
+    except Exception:
+        pass
 
 
 _SS_TOT_MIN = 1e-3  # below this the window beliefs are near-constant; R² is undefined
@@ -225,6 +236,7 @@ def _plot_convergence(
     log_kl: bool,
     t_kl_rep: int,
     sliding_window: int,
+    hmm_subtitle: str,
     path: Path,
 ) -> None:
     """One convergence figure: one line per layer (metric) + one KL line."""
@@ -271,7 +283,7 @@ def _plot_convergence(
     fig.update_layout(
         title=(
             f"{metric_name} + KL ({kl_type}) — per-sequence probes<br>"
-            f"<sup>Mean ± std across sequences | t_KL={t_kl_rep}</sup>"
+            f"<sup>{hmm_subtitle} | Mean ± std across sequences | t_KL={t_kl_rep}</sup>"
         ),
         height=500, width=1020,
         margin=dict(t=80, b=110, l=70, r=140),
@@ -287,8 +299,7 @@ def _plot_convergence(
             showgrid=False, type=kl_axis_type,
         ),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path)
 
 
 def _plot_lag_summary(
@@ -298,6 +309,7 @@ def _plot_lag_summary(
     n_seqs_reached: list[int],
     r2_patience: int,
     kl_patience: int,
+    hmm_subtitle: str,
     path: Path,
 ) -> None:
     labels = [str(l) for l in layer_indices]
@@ -325,7 +337,7 @@ def _plot_lag_summary(
     fig.update_layout(
         title=(
             "Lag: t_R² − t_KL per layer (patience-based)<br>"
-            f"<sup>R² patience={r2_patience}, KL patience={kl_patience} | "
+            f"<sup>{hmm_subtitle} | R² patience={r2_patience}, KL patience={kl_patience} | "
             "Positive = geometry lags output; Negative = geometry leads</sup>"
         ),
         xaxis_title="Layer",
@@ -333,7 +345,7 @@ def _plot_lag_summary(
         height=420, width=760,
         margin=dict(t=80, b=60, l=70, r=40),
     )
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -353,12 +365,14 @@ def main() -> None:
         config.layer_indices = [l for l in DRY_RUN_LAYERS if l in config.layer_indices]
         config.experiment_name = f"{config.experiment_name}_dry_run"
 
-    device = get_device()
+    device = get_device(config.device)
 
     out_dir = setup_output_dir(config)
     logger = setup_logging(out_dir, name="emergence_curve_single_seq")
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
+    plot_data_dir = out_dir / "plot_data"
+    plot_data_dir.mkdir(parents=True, exist_ok=True)
 
     probe_dir = Path(config.probe_dir)
     if not probe_dir.is_absolute():
@@ -413,13 +427,21 @@ def main() -> None:
     probes = _load_per_seq_probes(probe_dir, seq_run_indices, config.layer_indices, device, logger)
 
     # ── Model + HMM ──────────────────────────────────────────────────────────
-    model = load_model(config.model_name, device, logger, n_ctx=config.n_ctx_override)
+    model = load_model(
+        config.model_name,
+        device,
+        logger,
+        n_ctx=config.n_ctx_override,
+        model_n_devices=config.model_n_devices,
+    )
 
-    hmm = Mess3HMM()
-    p = config.hmm.process_params
-    if "x" in p and "alpha" in p:
-        hmm.create_hmm(p["x"], p["alpha"])
-        logger.info(f"Mess3 HMM: x={p['x']}, alpha={p['alpha']}")
+    hmm = build_process_hmm(
+        config.hmm.process_name,
+        config.hmm.process_params,
+        hmm_device=device,
+    )
+    logger.info(f"HMM         : {config.hmm.process_name} {config.hmm.process_params}")
+    hmm_subtitle = format_hmm_process(config.hmm.process_name, config.hmm.process_params)
 
     idx_to_token = {v: k for k, v in config.vocab_mapping.items()}
     n_hmm_tokens = len(config.vocab_mapping)
@@ -634,6 +656,7 @@ def main() -> None:
                 log_kl=log_kl,
                 t_kl_rep=t_kl_rep,
                 sliding_window=config.sliding_window,
+                hmm_subtitle=hmm_subtitle,
                 path=fig_dir / f"emergence_{suffix}",
             )
 
@@ -646,10 +669,36 @@ def main() -> None:
         n_seqs_reached=n_seqs_reached,
         r2_patience=r2_patience,
         kl_patience=kl_patience,
+        hmm_subtitle=hmm_subtitle,
         path=fig_dir / "lag_summary",
     )
 
     # ── Save JSON outputs ─────────────────────────────────────────────────────
+    _write_json(
+        plot_data_dir / "emergence_curves.json",
+        {
+            "seq_indices": seq_run_indices,
+            "positions": positions.tolist(),
+            "kl_positions": kl_positions.tolist(),
+            "kl_mean": kl_mean.tolist(),
+            "kl_std": kl_std.tolist(),
+            "t_kl_per_seq": t_kl_per_seq,
+            "kl_crossed_per_seq": kl_crossed_per_seq,
+            "layers": {
+                str(layer): {
+                    "sw_r2_mean": sw_r2_mean[layer].tolist(),
+                    "sw_r2_std": sw_r2_std[layer].tolist(),
+                    "mse_mean": mse_mean[layer].tolist(),
+                    "mse_std": mse_std[layer].tolist(),
+                    "t_r2_per_seq": t_r2_per_seq[layer],
+                    "r2_crossed_per_seq": r2_crossed_per_seq[layer],
+                    "lag_mean": metrics_out["layers"][str(layer)]["lag_mean"],
+                    "lag_std": metrics_out["layers"][str(layer)]["lag_std"],
+                }
+                for layer in config.layer_indices
+            },
+        },
+    )
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(metrics_out, f, indent=2)
 

@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import shutil
 import sys
@@ -59,7 +60,8 @@ from encoder_decoder_utils import (
 )
 from experiment import ExperimentConfig, apply_runtime_overrides, load_config, setup_output_dir
 from experiment_utils import build_emission_matrix, get_device, load_model, setup_logging
-from hmm.hmm import Mess3HMM
+from hmm import build_process_hmm
+from plot_titles import format_hmm_process, with_hmm_subtitle
 from probes import ProbeInput, ProbeResult, train_probes_batched
 
 DRY_RUN_N_SEQ = 2
@@ -85,6 +87,7 @@ class TrainSingleSeqEncoderDecoderConfig(ExperimentConfig):
     n_ctx_override: int | None = None
     random_seed: int = 42
     keep_activations: bool = False
+    eval_workers: int | None = None
 
 
 def _bin_label(p_t: float) -> int:
@@ -179,6 +182,12 @@ def _aggregate_layer_metrics(
     return out
 
 
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description="Per-sequence encoder-decoder training (SPAR-29)")
@@ -196,16 +205,22 @@ def main() -> None:
         config.n_sequences = DRY_RUN_N_SEQ
         config.seq_length = DRY_RUN_SEQ_LEN
         config.post_convergence_start = DRY_RUN_TRANSIENT
+        config.balance = False
         config.layer_indices = [l for l in DRY_RUN_LAYERS if l in config.layer_indices]
         config.experiment_name = f"{config.experiment_name}_dry_run"
-        config.encoder_params = {**config.encoder_params, "epochs": 60}
+        config.encoder_params = {
+            **config.encoder_params,
+            "epochs": 60,
+            "max_epochs": 60,
+            "patience": 30,
+        }
         config.decoder_params = {
             **config.decoder_params,
             "max_epochs": 300,
             "patience": 30,
         }
 
-    device = get_device()
+    device = get_device(config.device)
     if args.resume:
         out_dir = Path(args.resume).resolve()
         if not out_dir.exists():
@@ -214,6 +229,8 @@ def main() -> None:
     else:
         out_dir = setup_output_dir(config)
     logger = setup_logging(out_dir, name="train_singleseq")
+    plot_data_dir = out_dir / "plot_data"
+    plot_data_dir.mkdir(exist_ok=True)
 
     L = config.seq_length
     P = config.post_convergence_start
@@ -229,10 +246,16 @@ def main() -> None:
     logger.info(f"Post-conv positions/seq: {n_post_conv}")
     logger.info(f"Layers           : {config.layer_indices}")
 
-    hmm = Mess3HMM()
-    p = config.hmm.process_params
-    hmm.create_hmm(p["x"], p["alpha"])
-    logger.info(f"Mess3 HMM: x={p['x']}, alpha={p['alpha']}")
+    hmm = build_process_hmm(
+        config.hmm.process_name,
+        config.hmm.process_params,
+        hmm_device=device,
+    )
+    logger.info(
+        f"HMM              : {config.hmm.process_name} "
+        f"{config.hmm.process_params}"
+    )
+    hmm_subtitle = format_hmm_process(config.hmm.process_name, config.hmm.process_params)
 
     idx_to_token = {v: k for k, v in config.vocab_mapping.items()}
     n_vocab = len(config.vocab_mapping)
@@ -317,7 +340,13 @@ def main() -> None:
 
     if needs_forward:
         logger.info("Phase 2a: running forward passes ...")
-        model = load_model(config.model_name, device, logger, n_ctx=config.n_ctx_override)
+        model = load_model(
+            config.model_name,
+            device,
+            logger,
+            n_ctx=config.n_ctx_override,
+            model_n_devices=config.model_n_devices,
+        )
 
         for seq_i in range(N):
             if _fwd_pass_complete(act_dir, seq_i, config.layer_indices):
@@ -386,14 +415,20 @@ def main() -> None:
                 train_acts = acts_post_conv[tr_idx]
                 train_beliefs = all_beliefs[seq_i][P + tr_idx]
                 train_tokens = all_tokens[seq_i][(P - 1) + tr_idx]
+                ev_idx = seq_eval_idx[seq_i]
+                eval_acts = acts_post_conv[ev_idx]
+                eval_beliefs = all_beliefs[seq_i][P + ev_idx]
+                eval_tokens = all_tokens[seq_i][(P - 1) + ev_idx]
                 n_tr = len(tr_idx)
+                n_enc = n_tr + len(ev_idx)
 
                 encoder_inputs[(layer, seq_i)] = ProbeInput(
-                    activations=train_acts,
-                    gt_belief_states=train_beliefs,
-                    tokens=train_tokens,
-                    gt_next_token_preds=np.zeros((n_tr, n_vocab), dtype=np.float32),
-                    computed_next_token_preds=np.zeros((n_tr, n_vocab), dtype=np.float32),
+                    activations=np.concatenate([train_acts, eval_acts], axis=0),
+                    gt_belief_states=np.concatenate([train_beliefs, eval_beliefs], axis=0),
+                    tokens=np.concatenate([train_tokens, eval_tokens], axis=0),
+                    gt_next_token_preds=np.zeros((n_enc, n_vocab), dtype=np.float32),
+                    computed_next_token_preds=np.zeros((n_enc, n_vocab), dtype=np.float32),
+                    split_idx=n_tr,
                 )
                 decoder_inputs[(layer, seq_i)] = DecoderInput(
                     activations=train_acts,
@@ -406,6 +441,10 @@ def main() -> None:
             split=1.0,
             lr=enc_p.get("lr", 1e-3),
             epochs=enc_p.get("epochs", 1000),
+            max_epochs=enc_p.get("max_epochs"),
+            patience=enc_p.get("patience"),
+            min_relative_improvement=enc_p.get("min_relative_improvement", 1e-3),
+            device=device,
             max_probes_per_batch=config.max_probes_per_batch,
         )
 
@@ -417,6 +456,7 @@ def main() -> None:
             max_epochs=dec_p.get("max_epochs", 50000),
             patience=dec_p.get("patience", 400),
             min_relative_improvement=dec_p.get("min_relative_improvement", 0.01),
+            device=device,
             max_decoders_per_batch=config.max_decoders_per_batch,
         )
 
@@ -430,21 +470,31 @@ def main() -> None:
 
     # ── Phase 2c: evaluation + plots ─────────────────────────────────────────
     logger.info("Phase 2c: evaluation and plotting ...")
-    per_seq_metrics: list[dict[int, dict[str, float]]] = []
+    per_seq_metrics: list[dict[int, dict[str, float]] | None] = [None] * N
 
-    for seq_i in range(N):
+    # Returns metrics + all data needed for plotting. Plotly calls are intentionally
+    # excluded here because kaleido (the static image renderer) is not thread-safe:
+    # concurrent write_image calls from multiple workers deadlock the subprocess pool.
+    def _evaluate_sequence(seq_i: int) -> tuple[
+        int,
+        dict[int, dict[str, float]],
+        dict[int, ProbeResult] | None,
+        dict[int, DecoderResult] | None,
+        dict[int, np.ndarray] | None,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
         seq_dir = out_dir / f"seq_{seq_i}"
-        fig_dir = seq_dir / "figures"
-        fig_dir.mkdir(exist_ok=True)
+        seq_dir.mkdir(parents=True, exist_ok=True)
 
         if (seq_dir / "metrics.json").exists():
             logger.info(f"  Seq {seq_i}: metrics already exist, loading")
             metrics_i = json.loads((seq_dir / "metrics.json").read_text())
-            per_seq_metrics.append({
-                layer: metrics_i.get(str(layer), {})
-                for layer in config.layer_indices
-            })
-            continue
+            return (
+                seq_i,
+                {layer: metrics_i.get(str(layer), {}) for layer in config.layer_indices},
+                None, None, None, None, None,
+            )
 
         logger.info(f"  Seq {seq_i}/{N-1}: evaluating ...")
         ev_idx = seq_eval_idx[seq_i]
@@ -469,7 +519,8 @@ def main() -> None:
             rt_loss = evaluate_roundtrip(pr.probe, dr.decoder, eval_acts)
 
             layer_metrics[layer] = {
-                "train_mse": float(pr.test_mse),
+                "train_mse": float(pr.train_mse_curve[-1]) if pr.train_mse_curve else float("nan"),
+                "probe_eval_mse": float(pr.test_mse),
                 "eval_enc_mse": enc_mse,
                 "eval_enc_r2": enc_r2,
                 "eval_dec_loss": dec_loss,
@@ -480,6 +531,7 @@ def main() -> None:
                 f"    Layer {layer:2d}: enc_r2={enc_r2:.3f}  dec_loss={dec_loss:.3e}  rt={rt_loss:.3e}"
             )
 
+        simplex_preds: dict[int, np.ndarray] = {}
         for layer in config.simplex_layers:
             if layer not in config.layer_indices:
                 continue
@@ -489,15 +541,120 @@ def main() -> None:
             simplex_eval_acts = acts_post_conv[ev_idx]
             with torch.no_grad():
                 pred = pr.probe(torch.from_numpy(simplex_eval_acts).float().to(enc_dev)).cpu().numpy()
-            simplex_scatter(pred, eval_beliefs_arr, layer, fig_dir / f"simplex_layer_{layer}")
-
-        per_seq_metrics.append(layer_metrics)
+            simplex_preds[layer] = pred
+            _write_json(
+                plot_data_dir / f"seq_{seq_i}_simplex_layer_{layer}.json",
+                {
+                    "seq_i": seq_i,
+                    "layer": layer,
+                    "eval_indices": ev_idx.tolist(),
+                    "predicted_beliefs": pred.tolist(),
+                    "gt_beliefs": eval_beliefs_arr.tolist(),
+                },
+            )
 
         with open(seq_dir / "metrics.json", "w") as f:
             json.dump({str(l): v for l, v in layer_metrics.items()}, f, indent=2)
+        _write_json(
+            plot_data_dir / f"seq_{seq_i}_layer_metrics.json",
+            {
+                "seq_i": seq_i,
+                "layer_indices": config.layer_indices,
+                "metrics": {str(l): v for l, v in layer_metrics.items()},
+            },
+        )
+        _write_json(
+            plot_data_dir / f"seq_{seq_i}_decoder_loss_curves.json",
+            {
+                "seq_i": seq_i,
+                "layers": {
+                    str(layer): {
+                        "train_loss_curve": decoder_results_seq[layer].train_loss_curve,
+                        "eval_loss_curve": decoder_results_seq[layer].eval_loss_curve,
+                    }
+                    for layer in config.layer_indices
+                },
+            },
+        )
+        _write_json(
+            plot_data_dir / f"seq_{seq_i}_encoder_mse_curves.json",
+            {
+                "seq_i": seq_i,
+                "layers": {
+                    str(layer): {
+                        "train_mse_curve": probe_results_seq[layer].train_mse_curve,
+                        "eval_mse_curve": probe_results_seq[layer].test_mse_curve,
+                    }
+                    for layer in config.layer_indices
+                },
+            },
+        )
 
-        decoder_loss_curves(decoder_results_seq, config.layer_indices, fig_dir / "decoder_loss_curves")
-        encoder_mse_curves(probe_results_seq, config.layer_indices, fig_dir / "encoder_mse_curves")
+        return (
+            seq_i,
+            layer_metrics,
+            probe_results_seq,
+            decoder_results_seq,
+            simplex_preds,
+            eval_beliefs_arr,
+            ev_idx,
+        )
+
+    eval_workers = config.eval_workers or N
+    eval_workers = max(1, min(eval_workers, N))
+    logger.info(f"Evaluating {N} sequences with {eval_workers} worker(s) ...")
+
+    eval_plot_queue: list[tuple] = []
+    with ThreadPoolExecutor(max_workers=eval_workers) as executor:
+        futures = [executor.submit(_evaluate_sequence, seq_i) for seq_i in range(N)]
+        for future in as_completed(futures):
+            result = future.result()
+            per_seq_metrics[result[0]] = result[1]
+            eval_plot_queue.append(result)
+
+    # Plotly static image export (kaleido) is not thread-safe, so all plot
+    # calls are serialised here after the parallel evaluation is complete.
+    eval_plot_queue.sort(key=lambda r: r[0])
+    logger.info("Generating per-sequence plots ...")
+    for (seq_i, layer_metrics, probe_results_seq,
+         decoder_results_seq, simplex_preds,
+         eval_beliefs_arr, ev_idx) in eval_plot_queue:
+
+        if probe_results_seq is None:
+            continue  # resume: plots already exist
+
+        seq_dir = out_dir / f"seq_{seq_i}"
+        fig_dir = seq_dir / "figures"
+        fig_dir.mkdir(exist_ok=True)
+
+        for layer in config.simplex_layers:
+            if layer not in config.layer_indices:
+                continue
+            pred = simplex_preds[layer]
+            simplex_scatter(
+                pred,
+                eval_beliefs_arr,
+                layer,
+                fig_dir / f"simplex_layer_{layer}",
+                title=with_hmm_subtitle(
+                    f"Encoder predictions — Layer {layer} (eval, N={len(pred)})",
+                    config.hmm.process_name,
+                    config.hmm.process_params,
+                ),
+            )
+
+        decoder_loss_curves(
+            decoder_results_seq,
+            config.layer_indices,
+            fig_dir / "decoder_loss_curves",
+            subtitle=hmm_subtitle,
+        )
+        encoder_mse_curves(
+            probe_results_seq,
+            config.layer_indices,
+            fig_dir / "encoder_mse_curves",
+            subtitle=hmm_subtitle,
+        )
         layer_line_plot(
             train_vals=[layer_metrics[l]["train_mse"] for l in config.layer_indices],
             eval_vals=[layer_metrics[l]["eval_enc_mse"] for l in config.layer_indices],
@@ -505,6 +662,7 @@ def main() -> None:
             y_title="MSE",
             title=f"Encoder MSE by layer — Seq {seq_i}",
             path=fig_dir / "encoder_mse_per_layer",
+            subtitle=hmm_subtitle,
         )
         layer_line_plot(
             eval_vals=[layer_metrics[l]["eval_enc_r2"] for l in config.layer_indices],
@@ -512,6 +670,7 @@ def main() -> None:
             y_title="R²",
             title=f"Encoder R² by layer — Seq {seq_i}",
             path=fig_dir / "encoder_r2_per_layer",
+            subtitle=hmm_subtitle,
         )
         layer_line_plot(
             eval_vals=[layer_metrics[l]["eval_dec_loss"] for l in config.layer_indices],
@@ -520,6 +679,7 @@ def main() -> None:
             title=f"Decoder reconstruction loss by layer — Seq {seq_i}",
             path=fig_dir / "decoder_recon_loss_per_layer",
             log_y=True,
+            subtitle=hmm_subtitle,
         )
         layer_line_plot(
             eval_vals=[layer_metrics[l]["eval_dec_norm_loss"] for l in config.layer_indices],
@@ -528,6 +688,7 @@ def main() -> None:
             title=f"Normalised decoder reconstruction loss by layer — Seq {seq_i}",
             path=fig_dir / "decoder_recon_norm_loss_per_layer",
             log_y=True,
+            subtitle=hmm_subtitle,
         )
         layer_line_plot(
             eval_vals=[layer_metrics[l]["eval_roundtrip_loss"] for l in config.layer_indices],
@@ -536,13 +697,30 @@ def main() -> None:
             title=f"Round-trip loss by layer — Seq {seq_i}",
             path=fig_dir / "roundtrip_loss_per_layer",
             log_y=True,
+            subtitle=hmm_subtitle,
         )
+        logger.info(f"  Seq {seq_i}: plots saved")
+
+    per_seq_metrics_complete = [m for m in per_seq_metrics if m is not None]
 
     # ── Aggregate metrics + plots ─────────────────────────────────────────────
     logger.info("Aggregating metrics across sequences ...")
-    agg_metrics = _aggregate_layer_metrics(per_seq_metrics, config.layer_indices)
+    agg_metrics = _aggregate_layer_metrics(per_seq_metrics_complete, config.layer_indices)
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(agg_metrics, f, indent=2)
+    _write_json(
+        plot_data_dir / "aggregate_layer_metrics.json",
+        {
+            "layer_indices": config.layer_indices,
+            "metrics": agg_metrics,
+            "series": {
+                "encoder_r2": [agg_metrics[str(l)]["eval_enc_r2"]["mean"] for l in config.layer_indices],
+                "decoder_recon_loss": [agg_metrics[str(l)]["eval_dec_loss"]["mean"] for l in config.layer_indices],
+                "decoder_recon_norm_loss": [agg_metrics[str(l)]["eval_dec_norm_loss"]["mean"] for l in config.layer_indices],
+                "roundtrip_loss": [agg_metrics[str(l)]["eval_roundtrip_loss"]["mean"] for l in config.layer_indices],
+            },
+        },
+    )
 
     agg_fig_dir = out_dir / "figures"
 
@@ -552,6 +730,7 @@ def main() -> None:
         y_title="R² (mean ± std)",
         title="Encoder R² by layer — aggregated across sequences",
         path=agg_fig_dir / "encoder_r2_per_layer",
+        subtitle=hmm_subtitle,
     )
     layer_line_plot(
         eval_vals=[agg_metrics[str(l)]["eval_dec_loss"]["mean"] for l in config.layer_indices],
@@ -560,6 +739,7 @@ def main() -> None:
         title="Decoder reconstruction loss by layer — aggregated",
         path=agg_fig_dir / "decoder_recon_loss_per_layer",
         log_y=True,
+        subtitle=hmm_subtitle,
     )
     layer_line_plot(
         eval_vals=[agg_metrics[str(l)]["eval_dec_norm_loss"]["mean"] for l in config.layer_indices],
@@ -568,6 +748,7 @@ def main() -> None:
         title="Normalised decoder reconstruction loss by layer — aggregated",
         path=agg_fig_dir / "decoder_recon_norm_loss_per_layer",
         log_y=True,
+        subtitle=hmm_subtitle,
     )
     layer_line_plot(
         eval_vals=[agg_metrics[str(l)]["eval_roundtrip_loss"]["mean"] for l in config.layer_indices],
@@ -576,6 +757,7 @@ def main() -> None:
         title="Round-trip loss by layer — aggregated",
         path=agg_fig_dir / "roundtrip_loss_per_layer",
         log_y=True,
+        subtitle=hmm_subtitle,
     )
 
     # ── Cleanup ──────────────────────────────────────────────────────────────

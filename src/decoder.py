@@ -142,8 +142,8 @@ def train_batched(
     d_model dimensions) loss and an 80/20 token-position train/eval split.
 
     Training stops per-decoder when eval loss has not improved by at least
-    ``min_relative_improvement`` (fractional) for ``patience`` consecutive
-    epochs, or when ``max_epochs`` is reached for all decoders.
+    ``min_relative_improvement`` relative to the running best for ``patience``
+    consecutive epochs, or when ``max_epochs`` is reached for all decoders.
 
     Dict overload: when *inputs* is a ``dict[K, DecoderInput]``, the return
     value is a ``dict[K, DecoderResult]`` with matching keys::
@@ -160,8 +160,9 @@ def train_batched(
         max_epochs: Maximum number of gradient-descent steps.
         patience: Number of epochs without sufficient improvement before a
             decoder is considered converged.
-        min_relative_improvement: Fractional improvement in eval loss required
-            to reset the patience counter, i.e. ``(best - new) / best``.
+        min_relative_improvement: Minimum fractional improvement over the
+            running best eval loss required to reset the patience counter,
+            i.e. ``(best - new) / best >= min_relative_improvement``.
         device: Training device.  Defaults to CUDA > MPS > CPU.
         max_decoders_per_batch: If set, inputs are split into chunks of at
             most this size and trained sequentially, with results merged.
@@ -241,12 +242,10 @@ def _train_batched_impl(
 
     train_loss_curves: list[list[float]] = [[] for _ in range(N)]
     eval_loss_curves: list[list[float]] = [[] for _ in range(N)]
-
-    # Circular buffer storing the last `patience` eval losses per decoder.
-    # Once full, we stop a decoder when its fractional improvement over the
-    # window (loss[t-patience] → loss[t]) falls below min_relative_improvement.
-    eval_window = torch.full((N, patience), float("inf"), device=device)
+    convergence_epoch: list[int | None] = [None] * N
     converged = torch.zeros(N, dtype=torch.bool, device=device)
+    best_loss = torch.full((N,), float("inf"), device=device)
+    epochs_since_best = torch.zeros(N, dtype=torch.long, device=device)
 
     for epoch in range(max_epochs):
         active = ~converged  # (N,) — decoders still being trained
@@ -267,18 +266,22 @@ def _train_batched_impl(
             else:
                 per_decoder_eval = per_decoder_train.detach()
 
-            buf_idx = epoch % patience
-            eval_window[:, buf_idx] = per_decoder_eval
-
-            if epoch >= patience:
-                window_start = eval_window[:, (epoch + 1) % patience]
-                window_improvement = (window_start - per_decoder_eval) / window_start.clamp(min=1e-10)
-                converged |= window_improvement < min_relative_improvement
+            convergence_loss = per_decoder_eval
+            improved = convergence_loss < best_loss * (1.0 - min_relative_improvement)
+            best_loss[improved] = convergence_loss[improved]
+            epochs_since_best[improved] = 0
+            epochs_since_best[~improved & active] += 1
+            newly_converged = active & (epochs_since_best >= patience)
+            if newly_converged.any():
+                for i in torch.nonzero(newly_converged, as_tuple=False).flatten().tolist():
+                    convergence_epoch[i] = epoch
+            converged |= newly_converged
 
         train_d = per_decoder_train.detach()
         for i in range(N):
-            train_loss_curves[i].append(train_d[i].item())
-            eval_loss_curves[i].append(per_decoder_eval[i].item())
+            if convergence_epoch[i] is None:
+                train_loss_curves[i].append(train_d[i].item())
+                eval_loss_curves[i].append(per_decoder_eval[i].item())
 
     with torch.no_grad():
         final_preds = torch.bmm(beliefs_pad, W_batch) + bias_batch.unsqueeze(1)

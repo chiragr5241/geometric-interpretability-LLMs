@@ -15,14 +15,15 @@ from probes import Probe, ProbeResult
 logger = logging.getLogger(__name__)
 
 
+def _with_subtitle(title: str, subtitle: str | None) -> str:
+    if subtitle is None:
+        return title
+    return f"{title}<br><sup>{subtitle}</sup>"
+
+
 def _save_fig(fig: go.Figure, path: Path) -> None:
-    """Save a Plotly figure as PNG, falling back to HTML if Chrome is unavailable."""
-    png_path = path.with_suffix(".png")
-    try:
-        fig.write_image(str(png_path))
-    except Exception as e:
-        logger.warning("Could not write PNG (Chrome missing?): %s — saving HTML instead.", e)
-        fig.write_html(str(path.with_suffix(".html")))
+    """Save a Plotly figure as PNG."""
+    fig.write_image(str(path.with_suffix(".png")))
 
 
 def r2(pred: np.ndarray, gt: np.ndarray) -> float:
@@ -187,6 +188,7 @@ def decoder_loss_curves(
     decoder_results: dict[int, DecoderResult],
     layer_indices: list[int],
     path: Path,
+    subtitle: str | None = None,
 ) -> None:
     n = len(layer_indices)
     n_cols = min(4, n)
@@ -217,7 +219,7 @@ def decoder_loss_curves(
         )
         fig.update_yaxes(type="log", row=row, col=col)
     fig.update_layout(
-        title="Decoder training loss curves (log y)",
+        title=_with_subtitle("Decoder training loss curves (log y)", subtitle),
         height=260 * n_rows,
         width=320 * n_cols,
     )
@@ -228,6 +230,7 @@ def encoder_mse_curves(
     probe_results: dict[int, ProbeResult],
     layer_indices: list[int],
     path: Path,
+    subtitle: str | None = None,
 ) -> None:
     n = len(layer_indices)
     n_cols = min(4, n)
@@ -249,9 +252,18 @@ def encoder_mse_curves(
             ),
             row=row, col=col,
         )
+        if pr.test_mse_curve:
+            eval_eps = list(range(len(pr.test_mse_curve)))
+            fig.add_trace(
+                go.Scatter(
+                    x=eval_eps, y=pr.test_mse_curve, name="Eval MSE",
+                    showlegend=show, line=dict(color="#ff7f0e"),
+                ),
+                row=row, col=col,
+            )
         fig.update_yaxes(type="log", row=row, col=col)
     fig.update_layout(
-        title="Encoder training MSE curves (log y)",
+        title=_with_subtitle("Encoder train/eval MSE curves (log y)", subtitle),
         height=260 * n_rows,
         width=320 * n_cols,
     )
@@ -266,6 +278,7 @@ def layer_line_plot(
     path: Path,
     train_vals: list[float] | None = None,
     log_y: bool = False,
+    subtitle: str | None = None,
 ) -> None:
     layers = [str(l) for l in layer_indices]
     traces: list[Any] = []
@@ -280,7 +293,7 @@ def layer_line_plot(
     if log_y:
         fig.update_yaxes(type="log")
     fig.update_layout(
-        title=title,
+        title=_with_subtitle(title, subtitle),
         xaxis_title="Layer",
         yaxis_title=y_title,
         height=420,

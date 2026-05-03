@@ -17,6 +17,19 @@ def _get_device() -> torch.device:
 device = _get_device()
 
 
+def _resolve_device(requested: torch.device | str | None = None) -> torch.device:
+    if requested is None:
+        return device
+    return torch.device(requested)
+
+
+def set_hmm_device(requested: torch.device | str | None = None) -> torch.device:
+    """Set the module-level default device used by newly created HMM objects."""
+    global device
+    device = _get_device() if requested is None else torch.device(requested)
+    return device
+
+
 def belief_to_hex(belief):
     """Convert belief state probabilities to hex color codes."""
     if hasattr(belief, "detach"):
@@ -172,6 +185,9 @@ class BeliefHMM:
         self.reverse_mapping : dict {vocab_idx -> internal_idx}
     """
 
+    def _device(self) -> torch.device:
+        return getattr(self, "device", device)
+
     def generate_dataset(self, num_sequences, seq_length, return_states=False):
         """Generate sequences from the HMM.
 
@@ -179,20 +195,21 @@ class BeliefHMM:
             tokens, tokens_y if return_states=False
             tokens, tokens_y, states if return_states=True
         """
+        dev = self._device()
         vocab_size, n_states, _ = self.T_3d_matrix.shape
-        prior = torch.ones(n_states, dtype=torch.float, device=device) / n_states
+        prior = torch.ones(n_states, dtype=torch.float, device=dev) / n_states
 
-        tokens = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
-        tokens_y = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
+        tokens = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=dev)
+        tokens_y = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=dev)
         if return_states:
-            states = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=device)
+            states = torch.zeros(num_sequences, seq_length, dtype=torch.int64, device=dev)
         state_idx = torch.multinomial(prior, num_sequences, replacement=True)
 
         for i in range(seq_length + 1):
             if return_states and i < seq_length:
                 states[:, i] = state_idx
 
-            test = self.T_3d_matrix[:, :, state_idx].T.unsqueeze(0).reshape(num_sequences, -1)
+            test = self.T_3d_matrix[:, :, state_idx].permute(2, 1, 0).reshape(num_sequences, -1)
             test_pairs = torch.multinomial(test, 1, replacement=True).squeeze()
             state_idx = test_pairs // vocab_size
             if i != seq_length:
@@ -206,13 +223,15 @@ class BeliefHMM:
 
     def compute_belief_state(self, tokens, initial_belief=None):
         """Compute belief states given a sequence of tokens."""
+        dev = self._device()
+        tokens = tokens.to(dev)
         if initial_belief is None:
-            belief = torch.ones(self.num_states, device=device) / self.num_states
+            belief = torch.ones(self.num_states, device=dev) / self.num_states
         else:
-            belief = torch.tensor(initial_belief, dtype=torch.float, device=device)
+            belief = torch.tensor(initial_belief, dtype=torch.float, device=dev)
 
         num_sequences, length = tokens.shape
-        beliefs = torch.zeros(num_sequences, length + 1, self.num_states, dtype=torch.float, device=device)
+        beliefs = torch.zeros(num_sequences, length + 1, self.num_states, dtype=torch.float, device=dev)
         beliefs[:, 0] = belief
 
         internal_tokens = torch.zeros_like(tokens)
@@ -229,116 +248,6 @@ class BeliefHMM:
         """Emission matrix (n_states, vocab_size): P(token | state)."""
         em = self.T_3d_matrix.sum(dim=1).T  # (n_states, vocab_size)  — sum over next_state (dim 1)
         return em / em.sum(dim=1, keepdim=True)
-
-
-class FernHMM(BeliefHMM):
-    """HMM for the Fern process (2 tokens, 3 states).
-
-    Matrix from Xavier's xavier/processes branch, converted from row convention
-    (belief @ T[tok]) to our column convention (T[tok] @ belief) via transpose(-1, -2).
-    """
-
-    def __init__(self, vocab_mapping=None):
-        self.tokens = ['A', 'B']
-        self.states = ['1', '2', '3']
-        self.num_states = len(self.states)
-        self.token_to_idx = {token: idx for idx, token in enumerate(self.tokens)}
-        self.idx_to_token = {idx: token for idx, token in enumerate(self.tokens)}
-
-        if vocab_mapping is None:
-            self.vocab_mapping = {0: 0, 1: 1}
-        else:
-            self.vocab_mapping = vocab_mapping
-        self.reverse_mapping = {v: k for k, v in self.vocab_mapping.items()}
-
-        self.T_3d_matrix = torch.zeros((2, 3, 3), device=device)
-
-    def create_hmm(self, x: float):
-        """Build the Fern transition tensor for parameter x.
-
-        Xavier's row-convention matrix is transposed to our column convention:
-        T_col[v, next_state, cur_state] = T_xavier[v, cur_state, next_state]
-        """
-        T_xavier = torch.tensor([
-            [[0.3942,       0.00512,        0.0381],
-             [0.0,          0.53,           0.0],
-             [0.0,          0.326 * x,      0.554]],
-            [[0.3358,       0.01088,        0.2159],
-             [0.0,          0.0,            0.47],
-             [0.12,         0.326 * (1-x),  0.0]],
-        ], dtype=torch.float32, device=device)
-        self.T_3d_matrix = T_xavier.transpose(-1, -2)
-        return self.T_3d_matrix
-
-
-class Mess3HMM(BeliefHMM):
-    """Hidden Markov Model for the Mess3 process with 3 states and 3 tokens."""
-
-    def __init__(self, vocab_mapping=None, seed=42):
-        self.seed = seed
-        if seed is not None:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(seed)
-        self.tokens = ['A', 'B', 'C']
-        self.states = ['1', '2', '3']
-        self.num_states = len(self.states)
-        self.token_to_idx = {token: idx for idx, token in enumerate(self.tokens)}
-        self.idx_to_token = {idx: token for idx, token in enumerate(self.tokens)}
-        self.states_to_idx = {state: idx for idx, state in enumerate(self.states)}
-        self.idx_to_states = {idx: state for idx, state in enumerate(self.states)}
-
-        self.transition_matrix = {
-            'A': torch.tensor([
-                [0.765, 0.00375, 0.00375],
-                [0.0425, 0.0675, 0.00375],
-                [0.0425, 0.00375, 0.0675]
-            ], device=device),
-            'B': torch.tensor([
-                [0.0675, 0.0425, 0.00375],
-                [0.00375, 0.765, 0.00375],
-                [0.00375, 0.0425, 0.0675]
-            ], device=device),
-            'C': torch.tensor([
-                [0.0675, 0.00375, 0.0425],
-                [0.00375, 0.0675, 0.0425],
-                [0.00375, 0.00375, 0.765]
-            ], device=device)
-        }
-
-        self.T_3d_matrix = torch.stack([
-            self.transition_matrix['A'],
-            self.transition_matrix['B'],
-            self.transition_matrix['C']
-        ])
-
-        if vocab_mapping is None:
-            self.vocab_mapping = {0: 0, 1: 1, 2: 2}
-        else:
-            self.vocab_mapping = vocab_mapping
-
-        self.reverse_mapping = {v: k for k, v in self.vocab_mapping.items()}
-
-    def create_hmm(self, x, alpha):
-        """Create HMM transition matrices with given parameters (from epsilon transformers)."""
-        T = torch.zeros((3, 3, 3), device=device)
-        beta = (1 - alpha) / 2
-        y = 1 - 2 * x
-
-        ay = alpha * y
-        bx = beta * x
-        by = beta * y
-        ax = alpha * x
-
-        T[0, :, :] = torch.tensor([[ay, bx, bx], [ax, by, bx], [ax, bx, by]], device=device)
-        T[1, :, :] = torch.tensor([[by, ax, bx], [bx, ay, bx], [bx, ax, by]], device=device)
-        T[2, :, :] = torch.tensor([[by, bx, ax], [bx, by, ax], [bx, bx, ay]], device=device)
-
-        #x0.05, alpha0.9 => beta = 0.05, y = 0.9, ay=0.81 bx=0.025 ax=0.045
-        # print(T)
-
-        self.T_3d_matrix = T
-        return T
 
     def sample_continuation(
         self,
@@ -377,14 +286,195 @@ class Mess3HMM(BeliefHMM):
         """Log P(sequence) under the HMM. seq: 1D tensor of token indices (length L)."""
         if seq.dim() == 2:
             seq = seq.squeeze(0)
-        seq = seq.to(device)
-        belief = torch.ones(self.num_states, device=device) / self.num_states
+        dev = self._device()
+        seq = seq.to(dev)
+        belief = torch.ones(self.num_states, device=dev) / self.num_states
         em = self.emission_matrix()
         log_p = 0.0
         for t in range(seq.size(0)):
             obs_probs = belief @ em  # (vocab_size,)
             log_p = log_p + torch.log(obs_probs[seq[t]] + 1e-10)
-            # Update belief given observation
             belief = (self.T_3d_matrix[seq[t]] @ belief.unsqueeze(-1)).squeeze(-1)
             belief = belief / belief.sum()
         return log_p
+
+
+class FernHMM(BeliefHMM):
+    """HMM for the Fern process (2 tokens, 3 states).
+
+    Matrix from Xavier's xavier/processes branch, converted from row convention
+    (belief @ T[tok]) to our column convention (T[tok] @ belief) via transpose(-1, -2).
+    """
+
+    def __init__(self, vocab_mapping=None, hmm_device: torch.device | str | None = None):
+        self.device = _resolve_device(hmm_device)
+        self.tokens = ['A', 'B']
+        self.states = ['1', '2', '3']
+        self.num_states = len(self.states)
+        self.token_to_idx = {token: idx for idx, token in enumerate(self.tokens)}
+        self.idx_to_token = {idx: token for idx, token in enumerate(self.tokens)}
+
+        if vocab_mapping is None:
+            self.vocab_mapping = {0: 0, 1: 1}
+        else:
+            self.vocab_mapping = vocab_mapping
+        self.reverse_mapping = {v: k for k, v in self.vocab_mapping.items()}
+
+        self.T_3d_matrix = torch.zeros((2, 3, 3), device=self.device)
+
+    def create_hmm(self, x: float):
+        """Build the Fern transition tensor for parameter x.
+
+        Xavier's row-convention matrix is transposed to our column convention:
+        T_col[v, next_state, cur_state] = T_xavier[v, cur_state, next_state]
+        """
+        T_xavier = torch.tensor([
+            [[0.3942,       0.00512,        0.0381],
+             [0.0,          0.53,           0.0],
+             [0.0,          0.326 * x,      0.554]],
+            [[0.3358,       0.01088,        0.2159],
+             [0.0,          0.0,            0.47],
+             [0.12,         0.326 * (1-x),  0.0]],
+        ], dtype=torch.float32, device=self.device)
+        self.T_3d_matrix = T_xavier.transpose(-1, -2)
+        return self.T_3d_matrix
+
+
+class _TwoTokenThreeStateHMM(BeliefHMM):
+    """Shared setup for binary-output, three-state HMMs."""
+
+    def __init__(self, vocab_mapping=None, hmm_device: torch.device | str | None = None):
+        self.device = _resolve_device(hmm_device)
+        self.tokens = ['A', 'B']
+        self.states = ['1', '2', '3']
+        self.num_states = len(self.states)
+        self.token_to_idx = {token: idx for idx, token in enumerate(self.tokens)}
+        self.idx_to_token = {idx: token for idx, token in enumerate(self.tokens)}
+        self.states_to_idx = {state: idx for idx, state in enumerate(self.states)}
+        self.idx_to_states = {idx: state for idx, state in enumerate(self.states)}
+
+        if vocab_mapping is None:
+            self.vocab_mapping = {0: 0, 1: 1}
+        else:
+            self.vocab_mapping = vocab_mapping
+        self.reverse_mapping = {v: k for k, v in self.vocab_mapping.items()}
+        self.T_3d_matrix = torch.zeros((2, 3, 3), device=self.device)
+
+
+class StrataHMM(_TwoTokenThreeStateHMM):
+    """HMM for Xavier's Strata process."""
+
+    def create_hmm(self, a: float, t0: float, t1: float):
+        """Build the Strata transition tensor for parameters ``a``, ``t0``, ``t1``."""
+        if not 0 <= a <= 1:
+            raise ValueError(f"a must be in [0, 1], got {a}")
+        if not 0 <= t0 <= 1:
+            raise ValueError(f"t0 must be in [0, 1], got {t0}")
+        if not 0 <= t1 <= 1:
+            raise ValueError(f"t1 must be in [0, 1], got {t1}")
+
+        b = (1 - a) / 2
+        T_xavier = torch.tensor([
+            [[t0 * a,       0.0,          0.0],
+             [0.0,          t1 * a,       0.0],
+             [0.0,          0.0,          0.0]],
+            [[(1 - t0) * a, b,            b],
+             [b,            (1 - t1) * a, b],
+             [b,            b,            a]],
+        ], dtype=torch.float32, device=self.device)
+        self.T_3d_matrix = T_xavier.transpose(-1, -2)
+        return self.T_3d_matrix
+
+
+class WingHMM(_TwoTokenThreeStateHMM):
+    """HMM for Xavier's Wing process."""
+
+    def create_hmm(self, x: float, y: float):
+        """Build the Wing transition tensor for parameters ``x`` and ``y``."""
+        if not 0 <= x <= 1:
+            raise ValueError(f"x must be in [0, 1], got {x}")
+        if not 0 <= y <= 1:
+            raise ValueError(f"y must be in [0, 1], got {y}")
+
+        b = (1 - x) / 2
+        T_xavier = torch.tensor([
+            [[0.0, b,           0.0],
+             [0.0, y * x,       0.5 * b],
+             [b,   0.0,         0.0]],
+            [[x,   0.0,         b],
+             [b,   (1 - y) * x, 0.5 * b],
+             [0.0, b,           x]],
+        ], dtype=torch.float32, device=self.device)
+        self.T_3d_matrix = T_xavier.transpose(-1, -2)
+        return self.T_3d_matrix
+
+
+class Mess3HMM(BeliefHMM):
+    """Hidden Markov Model for the Mess3 process with 3 states and 3 tokens."""
+
+    def __init__(self, vocab_mapping=None, seed=42, hmm_device: torch.device | str | None = None):
+        self.device = _resolve_device(hmm_device)
+        self.seed = seed
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+        self.tokens = ['A', 'B', 'C']
+        self.states = ['1', '2', '3']
+        self.num_states = len(self.states)
+        self.token_to_idx = {token: idx for idx, token in enumerate(self.tokens)}
+        self.idx_to_token = {idx: token for idx, token in enumerate(self.tokens)}
+        self.states_to_idx = {state: idx for idx, state in enumerate(self.states)}
+        self.idx_to_states = {idx: state for idx, state in enumerate(self.states)}
+
+        self.transition_matrix = {
+            'A': torch.tensor([
+                [0.765, 0.00375, 0.00375],
+                [0.0425, 0.0675, 0.00375],
+                [0.0425, 0.00375, 0.0675]
+            ], device=self.device),
+            'B': torch.tensor([
+                [0.0675, 0.0425, 0.00375],
+                [0.00375, 0.765, 0.00375],
+                [0.00375, 0.0425, 0.0675]
+            ], device=self.device),
+            'C': torch.tensor([
+                [0.0675, 0.00375, 0.0425],
+                [0.00375, 0.0675, 0.0425],
+                [0.00375, 0.00375, 0.765]
+            ], device=self.device)
+        }
+
+        self.T_3d_matrix = torch.stack([
+            self.transition_matrix['A'],
+            self.transition_matrix['B'],
+            self.transition_matrix['C']
+        ])
+
+        if vocab_mapping is None:
+            self.vocab_mapping = {0: 0, 1: 1, 2: 2}
+        else:
+            self.vocab_mapping = vocab_mapping
+
+        self.reverse_mapping = {v: k for k, v in self.vocab_mapping.items()}
+
+    def create_hmm(self, x, alpha):
+        """Create HMM transition matrices with given parameters (from epsilon transformers)."""
+        T = torch.zeros((3, 3, 3), device=self.device)
+        beta = (1 - alpha) / 2
+        y = 1 - 2 * x
+
+        ay = alpha * y
+        bx = beta * x
+        by = beta * y
+        ax = alpha * x
+
+        T[0, :, :] = torch.tensor([[ay, bx, bx], [ax, by, bx], [ax, bx, by]], device=self.device)
+        T[1, :, :] = torch.tensor([[by, ax, bx], [bx, ay, bx], [bx, ax, by]], device=self.device)
+        T[2, :, :] = torch.tensor([[by, bx, ax], [bx, by, ax], [bx, bx, ay]], device=self.device)
+
+        #x0.05, alpha0.9 => beta = 0.05, y = 0.9, ay=0.81 bx=0.025 ax=0.045
+        # print(T)
+
+        self.T_3d_matrix = T
+        return T

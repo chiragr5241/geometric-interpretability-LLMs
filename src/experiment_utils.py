@@ -10,9 +10,29 @@ import torch
 import torch.nn.functional as F
 
 
-def get_device() -> torch.device:
+def get_device(requested: str | torch.device | None = None) -> torch.device:
+    """Resolve an optional config-requested device with CUDA > MPS > CPU fallback."""
+    if requested is not None:
+        requested_device = torch.device(requested)
+        if requested_device.type == "cuda":
+            if torch.cuda.is_available():
+                index = 0 if requested_device.index is None else requested_device.index
+                if index >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"Requested {requested_device}, but only "
+                        f"{torch.cuda.device_count()} CUDA device(s) are available."
+                    )
+                torch.cuda.set_device(index)
+                return torch.device(f"cuda:{index}")
+        elif requested_device.type == "mps":
+            if torch.backends.mps.is_available():
+                return requested_device
+        elif requested_device.type == "cpu":
+            return requested_device
+
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        torch.cuda.set_device(0)
+        return torch.device("cuda:0")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -68,6 +88,7 @@ def load_model(
     device: torch.device,
     logger: logging.Logger,
     n_ctx: int | None = None,
+    model_n_devices: int | None = None,
 ):
     import transformers
     if not hasattr(transformers, "TRANSFORMERS_CACHE"):
@@ -76,7 +97,11 @@ def load_model(
     from transformer_lens import HookedTransformer
 
     dtype = torch.float32 if device.type == "cpu" else torch.float16
-    n_devices = min(torch.cuda.device_count(), 4) if device.type == "cuda" else 1
+    n_devices = model_n_devices
+    if n_devices is None:
+        n_devices = min(torch.cuda.device_count(), 4) if device.type == "cuda" else 1
+    if device.type != "cuda":
+        n_devices = 1
     logger.info(f"Loading '{model_name}' on {device} with dtype={dtype}, n_devices={n_devices} ...")
     t0 = time.time()
     model = HookedTransformer.from_pretrained(
@@ -85,6 +110,8 @@ def load_model(
         device=str(device),
         n_devices=n_devices,
     )
+    if n_devices == 1:
+        model.to(str(device))
     if n_ctx is not None:
         _extend_model_context(model, n_ctx)
     model.eval()

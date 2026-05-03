@@ -26,8 +26,8 @@ Alignment (no BOS):
 Metrics:
     KL-to-target  — KL(P_intervened ∥ P_opt(η_target)) per condition (primary metric).
     KL-to-factual — KL(P_intervened ∥ P_opt(η_factual)) (used for crossing plots).
-    KL-to-clean   — KL(P_intervened ∥ P_clean) in 4-category space (A, B, C, junk).
-    Ablation uses 4-category (A, B, C, junk) distributions to capture shifts in
+    KL-to-clean   — KL(P_intervened ∥ P_clean) in HMM-token + junk space.
+    Ablation uses HMM-token + junk distributions to capture shifts in
     probability mass between HMM tokens and the rest of the vocabulary.
 
 Architecture (batched cross-sequence):
@@ -73,7 +73,8 @@ from experiment_utils import (
     resolve_hmm_token_ids,
     setup_logging,
 )
-from hmm.hmm import Mess3HMM
+from hmm import BeliefHMM, build_process_hmm
+from plot_titles import format_hmm_process
 from probes import Probe, ProbeResult
 
 DRY_RUN_N_SEQ = 2
@@ -116,6 +117,8 @@ class SingleSeqInterventionsConfig(ExperimentConfig):
     post_convergence_start: int = 30
     train_eval_split: float = 0.7
     random_seed: int = 42
+    seq_exclude: list[int] = field(default_factory=list)
+    save_html: bool = False
 
 
 # ── Sequence data container ────────────────────────────────────────────────────
@@ -124,8 +127,8 @@ class SingleSeqInterventionsConfig(ExperimentConfig):
 class SequenceData:
     seq_idx: int
     llm_tokens: torch.Tensor                              # (1, L_trunc)
-    P_clean_3: np.ndarray                                 # (n_hmm,) normalised
-    P_clean_4: np.ndarray                                 # (n_hmm+1,) with junk category
+    P_clean_hmm: np.ndarray                               # (n_hmm,) normalised
+    P_clean_projected: np.ndarray                         # (n_hmm+1,) with junk category
     P_opt: np.ndarray                                     # (n_hmm,) Bayesian-optimal
     baseline_kl: float
     clean_acts_tail: dict[int, np.ndarray]                # layer -> (max_k, d_model)
@@ -143,10 +146,26 @@ def _kl(p: np.ndarray, q: np.ndarray) -> np.ndarray:
     return (p * np.log(np.clip(p, 1e-10, None) / np.clip(q, 1e-10, None))).sum(axis=-1)
 
 
-def _to_3cat(p: np.ndarray) -> np.ndarray:
-    """Drop junk column and renormalise to 3 HMM categories."""
-    p3 = p[..., :3].copy()
-    return (p3 / (p3.sum(axis=-1, keepdims=True) + 1e-10)).astype(np.float32)
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _save_fig(fig: go.Figure, path: Path, save_html: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if save_html:
+        fig.write_html(str(path.with_suffix(".html")))
+    try:
+        fig.write_image(str(path.with_suffix(".png")))
+    except Exception:
+        pass
+
+
+def _to_hmm_simplex(p: np.ndarray, n_hmm_tokens: int) -> np.ndarray:
+    """Drop junk mass and renormalise to the HMM-token simplex."""
+    p_hmm = p[..., :n_hmm_tokens].copy()
+    return (p_hmm / (p_hmm.sum(axis=-1, keepdims=True) + 1e-10)).astype(np.float32)
 
 
 def _eval_split_idx(L: int, P: int, train_eval_split: float) -> int:
@@ -297,12 +316,12 @@ def _load_checkpoint(
     }
 
 
-def _extract_4cat(
+def _extract_projected_probs(
     logits: torch.Tensor,
     measure_pos: int,
     mid_tok_ids: list[int],
 ) -> np.ndarray:
-    """Extract (B, 4) distribution: [P(A), P(B), P(C), P(junk)]."""
+    """Extract (B, n_hmm_tokens + 1) probabilities with a final junk category."""
     probs_all = F.softmax(logits[:, measure_pos, :].float(), dim=-1)
     probs_hmm = probs_all[:, mid_tok_ids].cpu().numpy()
     probs_junk = np.clip(1.0 - probs_hmm.sum(axis=-1, keepdims=True), 1e-10, None)
@@ -351,7 +370,7 @@ def _run_ablated(
     device: torch.device,
     model_dtype: torch.dtype,
 ) -> np.ndarray:
-    """Run belief-subspace ablation at ALL positions. Returns P_ablated (B, 4).
+    """Run belief-subspace ablation at ALL positions. Returns projected probabilities.
 
     tokens_batch: (B, L).
     bases: list of B orthonormal basis matrices Q, each (d, k).
@@ -371,7 +390,7 @@ def _run_ablated(
             return_type="logits",
         )
 
-    return _extract_4cat(logits, measure_pos, mid_tok_ids)
+    return _extract_projected_probs(logits, measure_pos, mid_tok_ids)
 
 
 def _run_combined(
@@ -387,7 +406,7 @@ def _run_combined(
     device: torch.device,
     model_dtype: torch.dtype,
 ) -> np.ndarray:
-    """Merged patching + steering in a single forward pass. Returns P_out (B_total, 4)."""
+    """Merged patching + steering in a single forward pass. Returns projected probabilities."""
     pos_tensor = torch.tensor(positions, dtype=torch.long)
     patch_t = patch_targets.to(device=device, dtype=model_dtype)
     steer_t = steer_deltas.to(device=device, dtype=model_dtype)
@@ -404,7 +423,7 @@ def _run_combined(
             return_type="logits",
         )
 
-    return _extract_4cat(logits, measure_pos, mid_tok_ids)
+    return _extract_projected_probs(logits, measure_pos, mid_tok_ids)
 
 
 # ── Batch assembly helpers ────────────────────────────────────────────────────
@@ -450,24 +469,25 @@ def _build_combined_batch(
 # ── Result scattering helpers ─────────────────────────────────────────────────
 
 def _scatter_ablation_results(
-    P_abl_4: np.ndarray,
+    P_abl_projected: np.ndarray,
     sub_batch: list[SequenceData],
     layer: int,
+    n_hmm_tokens: int,
     ablation_kl: dict[str, dict[int, list[tuple[int, int, float]]]],
     ablation_kl_to_clean: dict[str, dict[int, list[tuple[int, int, float]]]],
 ) -> None:
     b_offset = 0
     for sd in sub_batch:
         n_projs = len(sd.ablation_projs[layer])
-        P_slice_4 = P_abl_4[b_offset:b_offset + n_projs]
-        P_slice_3 = _to_3cat(P_slice_4)
+        P_slice_projected = P_abl_projected[b_offset:b_offset + n_projs]
+        P_slice_hmm = _to_hmm_simplex(P_slice_projected, n_hmm_tokens)
 
-        kl_abl = _kl(P_slice_3, sd.P_opt[None])
+        kl_abl = _kl(P_slice_hmm, sd.P_opt[None])
         ablation_kl["belief"][layer].append((sd.seq_idx, 0, float(kl_abl[0])))
         for draw_i, kl_v in enumerate(kl_abl[1:]):
             ablation_kl["random"][layer].append((sd.seq_idx, draw_i, float(kl_v)))
 
-        kl_abl_to_clean = _kl(P_slice_4, sd.P_clean_4[None])
+        kl_abl_to_clean = _kl(P_slice_projected, sd.P_clean_projected[None])
         ablation_kl_to_clean["belief"][layer].append((sd.seq_idx, 0, float(kl_abl_to_clean[0])))
         for draw_i, kl_v in enumerate(kl_abl_to_clean[1:]):
             ablation_kl_to_clean["random"][layer].append((sd.seq_idx, draw_i, float(kl_v)))
@@ -476,11 +496,12 @@ def _scatter_ablation_results(
 
 
 def _scatter_combined_results(
-    P_out_4: np.ndarray,
+    P_out_projected: np.ndarray,
     n_patch_total: int,
     sub_batch: list[SequenceData],
     layer: int,
     k: int,
+    n_hmm_tokens: int,
     patch_kl_to_target: dict,
     patch_kl_to_factual: dict,
     steer_kl_to_target: dict,
@@ -492,27 +513,27 @@ def _scatter_combined_results(
     n_past_consistent_draws: int,
     n_random_patch_draws: int,
 ) -> None:
-    P_patch_all_4 = P_out_4[:n_patch_total]
-    P_steer_all_4 = P_out_4[n_patch_total:]
-    P_patch_all_3 = _to_3cat(P_patch_all_4)
-    P_steer_all_3 = _to_3cat(P_steer_all_4)
+    P_patch_all_projected = P_out_projected[:n_patch_total]
+    P_steer_all_projected = P_out_projected[n_patch_total:]
+    P_patch_all_hmm = _to_hmm_simplex(P_patch_all_projected, n_hmm_tokens)
+    P_steer_all_hmm = _to_hmm_simplex(P_steer_all_projected, n_hmm_tokens)
 
     p_offset, s_offset = 0, 0
     for sd in sub_batch:
         n_p = sd.patch_targets[(layer, k)].shape[0]
         n_s = sd.steer_deltas[(layer, k)].shape[0]
-        P_patch_3 = P_patch_all_3[p_offset:p_offset + n_p]
-        P_steer_3 = P_steer_all_3[s_offset:s_offset + n_s]
-        P_patch_4 = P_patch_all_4[p_offset:p_offset + n_p]
-        P_steer_4 = P_steer_all_4[s_offset:s_offset + n_s]
+        P_patch_hmm = P_patch_all_hmm[p_offset:p_offset + n_p]
+        P_steer_hmm = P_steer_all_hmm[s_offset:s_offset + n_s]
+        P_patch_projected = P_patch_all_projected[p_offset:p_offset + n_p]
+        P_steer_projected = P_steer_all_projected[s_offset:s_offset + n_s]
 
         patch_P_opts = sd.patch_target_P_opts[(layer, k)]
         steer_P_opts = sd.steer_target_P_opts[(layer, k)]
 
-        kl_to_tgt = _kl(P_patch_3, patch_P_opts)
-        kl_to_fac = _kl(P_patch_3, sd.P_opt[None])
-        kl_to_cln = _kl(P_patch_4, sd.P_clean_4[None])
-        bl_to_tgt = _kl(sd.P_clean_3[None].repeat(n_p, axis=0), patch_P_opts)
+        kl_to_tgt = _kl(P_patch_hmm, patch_P_opts)
+        kl_to_fac = _kl(P_patch_hmm, sd.P_opt[None])
+        kl_to_cln = _kl(P_patch_projected, sd.P_clean_projected[None])
+        bl_to_tgt = _kl(sd.P_clean_hmm[None].repeat(n_p, axis=0), patch_P_opts)
 
         b_idx = 0
         for cond, n_draws in [("optimal", 1), ("round_trip", 1),
@@ -525,10 +546,10 @@ def _scatter_combined_results(
                 baseline_kl_to_target_patch[cond][k][layer].append((sd.seq_idx, draw_i, float(bl_to_tgt[b_idx])))
                 b_idx += 1
 
-        kl_s_tgt = _kl(P_steer_3, steer_P_opts)
-        kl_s_fac = _kl(P_steer_3, sd.P_opt[None])
-        kl_s_cln = _kl(P_steer_4, sd.P_clean_4[None])
-        bl_s_tgt = _kl(sd.P_clean_3[None].repeat(n_s, axis=0), steer_P_opts)
+        kl_s_tgt = _kl(P_steer_hmm, steer_P_opts)
+        kl_s_fac = _kl(P_steer_hmm, sd.P_opt[None])
+        kl_s_cln = _kl(P_steer_projected, sd.P_clean_projected[None])
+        bl_s_tgt = _kl(sd.P_clean_hmm[None].repeat(n_s, axis=0), steer_P_opts)
 
         s_idx = 0
         for cond, n_draws in [("optimal", 1),
@@ -567,7 +588,7 @@ def _round_trip_targets(
 def _past_consistent_targets(
     seq_beliefs: np.ndarray,
     positions: list[int],
-    hmm: Mess3HMM,
+    hmm: BeliefHMM,
     rng: np.random.Generator,
 ) -> np.ndarray:
     k = len(positions)
@@ -588,8 +609,10 @@ def _plot_kl_vs_layer(
     k: int,
     baseline_mean: float,
     title: str,
+    hmm_subtitle: str,
     colors: dict[str, str],
     path: Path,
+    save_html: bool = False,
 ) -> None:
     layers_str = [str(l) for l in layer_indices]
     fig = go.Figure()
@@ -632,21 +655,25 @@ def _plot_kl_vs_layer(
 
     fig.update_yaxes(type="log")
     fig.update_layout(
-        title=f"{title} (k={k})<br><sup>KL(P_intervened ∥ P_opt(η_target)) — log scale — mean ± stderr</sup>",
+        title=(
+            f"{title} (k={k})<br>"
+            f"<sup>{hmm_subtitle} | KL(P_intervened ∥ P_opt(η_target)) — log scale — mean ± stderr</sup>"
+        ),
         xaxis_title="Layer",
         yaxis_title="KL [nats]",
         height=500, width=820,
         margin=dict(t=80, b=60, l=70, r=40),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path, save_html=save_html)
 
 
 def _plot_heatmap(
     agg_by_layer: dict[int, dict],
     layer_indices: list[int],
     title: str,
+    hmm_subtitle: str,
     path: Path,
+    save_html: bool = False,
 ) -> None:
     n_seqs = agg_by_layer[layer_indices[0]]["n_seqs"]
     rows_by_layer = []
@@ -664,14 +691,13 @@ def _plot_heatmap(
         colorbar=dict(title="log₁₀(KL)"),
     ))
     fig.update_layout(
-        title=title,
+        title=f"{title}<br><sup>{hmm_subtitle}</sup>",
         xaxis_title="Layer",
         yaxis_title="Sequence",
         height=500, width=700,
         margin=dict(t=70, b=60, l=70, r=40),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path, save_html=save_html)
 
 
 def _plot_ablation_curve(
@@ -680,7 +706,9 @@ def _plot_ablation_curve(
     layer_indices: list[int],
     title: str,
     subtitle: str,
+    hmm_subtitle: str,
     path: Path,
+    save_html: bool = False,
 ) -> None:
     layers_str = [str(l) for l in layer_indices]
     fig = go.Figure()
@@ -702,14 +730,13 @@ def _plot_ablation_curve(
 
     fig.update_yaxes(type="log")
     fig.update_layout(
-        title=f"{title}<br><sup>{subtitle}</sup>",
+        title=f"{title}<br><sup>{hmm_subtitle} | {subtitle}</sup>",
         xaxis_title="Layer",
         yaxis_title="KL [nats]",
         height=460, width=780,
         margin=dict(t=80, b=60, l=70, r=40),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path, save_html=save_html)
 
 
 def _plot_roundtrip_comparison(
@@ -717,7 +744,9 @@ def _plot_roundtrip_comparison(
     layer_indices: list[int],
     baseline_mean: float,
     k: int,
+    hmm_subtitle: str,
     path: Path,
+    save_html: bool = False,
 ) -> None:
     layers_str = [str(l) for l in layer_indices]
     fig = go.Figure()
@@ -744,14 +773,14 @@ def _plot_roundtrip_comparison(
     fig.update_yaxes(type="log")
     fig.update_layout(
         title=f"H2A vs H2B: round-trip vs optimal patching (k={k})<br>"
-              "<sup>round-trip ≈ optimal → H2A (subspace matters); ≈ baseline → H2B (clean beliefs matter)</sup>",
+              f"<sup>{hmm_subtitle} | "
+              "round-trip ≈ optimal → H2A (subspace matters); ≈ baseline → H2B (clean beliefs matter)</sup>",
         xaxis_title="Layer",
         yaxis_title="KL [nats]",
         height=480, width=780,
         margin=dict(t=80, b=60, l=70, r=40),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path, save_html=save_html)
 
 
 def _plot_crossing(
@@ -763,7 +792,9 @@ def _plot_crossing(
     k: int,
     condition: str,
     title: str,
+    hmm_subtitle: str,
     path: Path,
+    save_html: bool = False,
 ) -> None:
     """Old-style crossing plot.
 
@@ -821,14 +852,13 @@ def _plot_crossing(
     fig.update_layout(
         title=(
             f"{title} — crossing ({condition.replace('_', '-')}, k={k})<br>"
-            "<sup>Blue = KL to factual (↑ = moved away) | Orange = KL to target (↓ = adopted)</sup>"
+            f"<sup>{hmm_subtitle} | Blue = KL to factual (↑ = moved away) | Orange = KL to target (↓ = adopted)</sup>"
         ),
         height=max(320, 220 * n_rows + 100),
         width=min(220 * n_cols + 220, 1400),
         margin=dict(t=90, b=60, l=60, r=40),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path, save_html=save_html)
 
 
 def _plot_causal_shift(
@@ -837,8 +867,10 @@ def _plot_causal_shift(
     layer_indices: list[int],
     k: int,
     title: str,
+    hmm_subtitle: str,
     colors: dict[str, str],
     path: Path,
+    save_html: bool = False,
 ) -> None:
     """ΔKL = KL_baseline_to_target − KL_intervened_to_target (positive = moved toward target)."""
     layers_str = [str(l) for l in layer_indices]
@@ -866,7 +898,7 @@ def _plot_causal_shift(
     fig.update_layout(
         title=(
             f"{title} — causal shift (k={k})<br>"
-            "<sup>ΔKL = KL_baseline − KL_intervened toward target: positive = causal</sup>"
+            f"<sup>{hmm_subtitle} | ΔKL = KL_baseline − KL_intervened toward target: positive = causal</sup>"
         ),
         xaxis_title="Layer",
         yaxis_title="ΔKL [nats] (↑ = toward target)",
@@ -874,8 +906,7 @@ def _plot_causal_shift(
         width=780,
         margin=dict(t=80, b=60, l=70, r=40),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(str(path.with_suffix(".png")))
+    _save_fig(fig, path, save_html=save_html)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -903,7 +934,7 @@ def main() -> None:
         config.experiment_name = f"{config.experiment_name}_dry_run"
 
     rng = np.random.default_rng(config.random_seed)
-    device = get_device()
+    device = get_device(config.device)
 
     resume_dir = Path(args.resume).resolve() if args.resume else None
     if resume_dir is not None:
@@ -917,6 +948,8 @@ def main() -> None:
         logger.info(f"=== RESUMING from {resume_dir} ===")
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
+    plot_data_dir = out_dir / "plot_data"
+    plot_data_dir.mkdir(parents=True, exist_ok=True)
 
     project_root = Path(__file__).resolve().parent.parent
     training_dir = Path(config.training_dir)
@@ -963,15 +996,25 @@ def main() -> None:
     logger.info(f"Measure pos     : {measure_pos}")
     logger.info(f"N sequences     : {N}")
 
-    model = load_model(config.model_name, device, logger, n_ctx=config.n_ctx_override)
+    model = load_model(
+        config.model_name,
+        device,
+        logger,
+        n_ctx=config.n_ctx_override,
+        model_n_devices=config.model_n_devices,
+    )
     model_dtype: torch.dtype = next(model.parameters()).dtype
     if model_dtype == torch.float16:
         _patch_attention_dtype(model)
         logger.info("Patched attention softmax to stay in fp16")
 
-    hmm = Mess3HMM()
-    p = config.hmm.process_params
-    hmm.create_hmm(p["x"], p["alpha"])
+    hmm = build_process_hmm(
+        config.hmm.process_name,
+        config.hmm.process_params,
+        hmm_device=device,
+    )
+    logger.info(f"HMM             : {config.hmm.process_name} {config.hmm.process_params}")
+    hmm_subtitle = format_hmm_process(config.hmm.process_name, config.hmm.process_params)
     emit = build_emission_matrix(hmm)
 
     idx_to_token = {v: k for k, v in config.vocab_mapping.items()}
@@ -1010,8 +1053,14 @@ def main() -> None:
     # ── Phase A: Clean forward passes ─────────────────────────────────────────
     logger.info("=== Phase A: Clean forward passes ===")
     all_seq_data: list[SequenceData] = []
+    seq_exclude_set = set(config.seq_exclude)
+    if seq_exclude_set:
+        logger.info(f"Excluding sequences: {sorted(seq_exclude_set)}")
 
     for seq_i in range(N):
+        if seq_i in seq_exclude_set:
+            logger.info(f"  Seq {seq_i}/{N-1} — skipped (excluded)")
+            continue
         logger.info(f"  Seq {seq_i}/{N-1} — clean pass")
         seq_tokens = all_tokens[seq_i]
         seq_beliefs = all_beliefs[seq_i]
@@ -1029,14 +1078,14 @@ def main() -> None:
 
         probs_all = F.softmax(logits[0, measure_pos, :].float(), dim=-1)
         probs_hmm = probs_all[mid_tok_ids].cpu().numpy()
-        P_clean_3 = (probs_hmm / (probs_hmm.sum() + 1e-10)).astype(np.float32)
+        P_clean_hmm = (probs_hmm / (probs_hmm.sum() + 1e-10)).astype(np.float32)
         probs_junk = max(float(1.0 - probs_hmm.sum()), 1e-10)
-        P_clean_4 = np.append(probs_hmm, probs_junk).astype(np.float32)
+        P_clean_projected = np.append(probs_hmm, probs_junk).astype(np.float32)
         del logits
 
         eta_baseline = seq_beliefs[measure_pos + 1].astype(np.float32)
         P_opt = (eta_baseline @ emit.T).astype(np.float32)
-        bkl = float(_kl(P_clean_3[None], P_opt[None])[0])
+        bkl = float(_kl(P_clean_hmm[None], P_opt[None])[0])
         baseline_kl_list.append(bkl)
         logger.info(f"    Baseline KL: {bkl:.4f}")
 
@@ -1054,8 +1103,8 @@ def main() -> None:
         all_seq_data.append(SequenceData(
             seq_idx=seq_i,
             llm_tokens=llm_tokens.cpu(),
-            P_clean_3=P_clean_3,
-            P_clean_4=P_clean_4,
+            P_clean_hmm=P_clean_hmm,
+            P_clean_projected=P_clean_projected,
             P_opt=P_opt,
             baseline_kl=bkl,
             clean_acts_tail=clean_acts_tail,
@@ -1262,7 +1311,7 @@ def main() -> None:
                 _run_abl_safe(batch[mid:])
                 return
             _scatter_ablation_results(
-                P_abl, batch, layer, ablation_kl, ablation_kl_to_clean,
+                P_abl, batch, layer, n_vocab, ablation_kl, ablation_kl_to_clean,
             )
 
         abl_chunks = _chunk(all_seq_data, abl_chunk_size)
@@ -1324,7 +1373,7 @@ def main() -> None:
                         return
 
                 _scatter_combined_results(
-                    P_out, np_b, batch, layer, _k,
+                    P_out, np_b, batch, layer, _k, n_vocab,
                     patch_kl_to_target, patch_kl_to_factual,
                     steer_kl_to_target, steer_kl_to_factual,
                     patch_kl_to_clean, steer_kl_to_clean,
@@ -1429,11 +1478,35 @@ def main() -> None:
             cond: {str(l): v for l, v in by_layer.items()}
             for cond, by_layer in agg_ablation.items()
         },
-        "ablation_to_clean_4cat": {
+        "ablation_to_clean_projected": {
             cond: {str(l): v for l, v in by_layer.items()}
             for cond, by_layer in agg_ablation_to_clean.items()
         },
     }
+    _write_json(
+        plot_data_dir / "raw_intervention_records.json",
+        {
+            "patch_kl_to_target": _serialize_ckl(patch_kl_to_target),
+            "patch_kl_to_factual": _serialize_ckl(patch_kl_to_factual),
+            "patch_kl_to_clean": _serialize_ckl(patch_kl_to_clean),
+            "baseline_kl_to_target_patch": _serialize_ckl(baseline_kl_to_target_patch),
+            "steer_kl_to_target": _serialize_ckl(steer_kl_to_target),
+            "steer_kl_to_factual": _serialize_ckl(steer_kl_to_factual),
+            "steer_kl_to_clean": _serialize_ckl(steer_kl_to_clean),
+            "baseline_kl_to_target_steer": _serialize_ckl(baseline_kl_to_target_steer),
+            "ablation_kl": _serialize_abl(ablation_kl),
+            "ablation_kl_to_clean": _serialize_abl(ablation_kl_to_clean),
+        },
+    )
+    _write_json(
+        plot_data_dir / "aggregated_plot_data.json",
+        {
+            "layer_indices": config.layer_indices,
+            "k_values": config.k_values,
+            "baseline_mean": agg_baseline["mean"],
+            "metrics": metrics,
+        },
+    )
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
     logger.info("Saved metrics.json")
@@ -1449,8 +1522,10 @@ def main() -> None:
             k=k,
             baseline_mean=baseline_mean,
             title="Activation patching: KL vs layer by condition",
+            hmm_subtitle=hmm_subtitle,
             colors=_PATCH_COLORS,
             path=fig_dir / f"patching_kl_vs_layer_k{k}",
+            save_html=config.save_html,
         )
         for cross_cond in ["past_consistent", "random"]:
             _plot_crossing(
@@ -1462,7 +1537,9 @@ def main() -> None:
                 k=k,
                 condition=cross_cond,
                 title="Activation patching",
+                hmm_subtitle=hmm_subtitle,
                 path=fig_dir / f"patching_crossing_{cross_cond}_k{k}",
+                save_html=config.save_html,
             )
         _plot_causal_shift(
             agg_to_target={cond: agg_patch_to_target[cond][k] for cond in PATCH_CONDITIONS},
@@ -1470,8 +1547,10 @@ def main() -> None:
             layer_indices=config.layer_indices,
             k=k,
             title="Activation patching",
+            hmm_subtitle=hmm_subtitle,
             colors=_PATCH_COLORS,
             path=fig_dir / f"patching_causal_shift_k{k}",
+            save_html=config.save_html,
         )
 
     for k in config.k_values:
@@ -1481,8 +1560,10 @@ def main() -> None:
             k=k,
             baseline_mean=baseline_mean,
             title="Activation steering: KL vs layer by condition",
+            hmm_subtitle=hmm_subtitle,
             colors=_STEER_COLORS,
             path=fig_dir / f"steering_kl_vs_layer_k{k}",
+            save_html=config.save_html,
         )
         for cross_cond in ["past_consistent", "random"]:
             _plot_crossing(
@@ -1494,7 +1575,9 @@ def main() -> None:
                 k=k,
                 condition=cross_cond,
                 title="Activation steering",
+                hmm_subtitle=hmm_subtitle,
                 path=fig_dir / f"steering_crossing_{cross_cond}_k{k}",
+                save_html=config.save_html,
             )
         _plot_causal_shift(
             agg_to_target={cond: agg_steer_to_target[cond][k] for cond in STEER_CONDITIONS},
@@ -1502,8 +1585,10 @@ def main() -> None:
             layer_indices=config.layer_indices,
             k=k,
             title="Activation steering",
+            hmm_subtitle=hmm_subtitle,
             colors=_STEER_COLORS,
             path=fig_dir / f"steering_causal_shift_k{k}",
+            save_html=config.save_html,
         )
 
     k_max = max(config.k_values)
@@ -1511,28 +1596,36 @@ def main() -> None:
         agg_patch_to_target["optimal"][k_max],
         config.layer_indices,
         title=f"Patching KL heatmap — optimal (k={k_max}, log₁₀ scale)",
+        hmm_subtitle=hmm_subtitle,
         path=fig_dir / f"heatmap_patching_optimal_k{k_max}",
+        save_html=config.save_html,
     )
     _plot_heatmap(
         agg_steer_to_target["optimal"][k_max],
         config.layer_indices,
         title=f"Steering KL heatmap — optimal (k={k_max}, log₁₀ scale)",
+        hmm_subtitle=hmm_subtitle,
         path=fig_dir / f"heatmap_steering_optimal_k{k_max}",
+        save_html=config.save_html,
     )
 
     _plot_ablation_curve(
         agg_ablation["belief"], agg_ablation["random"],
         config.layer_indices,
         title="Belief-subspace ablation: KL to optimal",
-        subtitle="KL(P_ablated ∥ P_opt) — 3-cat normalised — log scale",
+        subtitle="KL(P_ablated ∥ P_opt) — HMM-token simplex — log scale",
+        hmm_subtitle=hmm_subtitle,
         path=fig_dir / "ablation_causal_importance",
+        save_html=config.save_html,
     )
     _plot_ablation_curve(
         agg_ablation_to_clean["belief"], agg_ablation_to_clean["random"],
         config.layer_indices,
-        title="Belief-subspace ablation: output perturbation (4-category)",
-        subtitle="KL(P_ablated ∥ P_clean) — 4-cat (A, B, C, junk) — log scale",
-        path=fig_dir / "ablation_kl_to_output_4cat",
+        title="Belief-subspace ablation: output perturbation (HMM-token + junk)",
+        subtitle="KL(P_ablated ∥ P_clean) — HMM-token + junk projection — log scale",
+        hmm_subtitle=hmm_subtitle,
+        path=fig_dir / "ablation_kl_to_output_projected",
+        save_html=config.save_html,
     )
 
     _plot_roundtrip_comparison(
@@ -1540,7 +1633,9 @@ def main() -> None:
         config.layer_indices,
         baseline_mean=baseline_mean,
         k=k_max,
+        hmm_subtitle=hmm_subtitle,
         path=fig_dir / f"roundtrip_h2a_vs_h2b_k{k_max}",
+        save_html=config.save_html,
     )
 
     logger.info(f"All outputs written to {out_dir}")
