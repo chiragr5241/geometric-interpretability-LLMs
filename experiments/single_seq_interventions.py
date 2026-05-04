@@ -909,6 +909,423 @@ def _plot_causal_shift(
     _save_fig(fig, path, save_html=save_html)
 
 
+# ── (layer × k) effect surfaces ───────────────────────────────────────────────
+
+def _layer_k_matrix(
+    by_k_by_layer: dict[int, dict[int, dict]],
+    layer_indices: list[int],
+    k_values: list[int],
+    field: str = "mean",
+) -> np.ndarray:
+    """Build a [n_k, n_layer] matrix of `field` from a {k: {layer: agg}} dict."""
+    n_k = len(k_values)
+    n_l = len(layer_indices)
+    out = np.full((n_k, n_l), np.nan, dtype=float)
+    for i, k in enumerate(k_values):
+        if k not in by_k_by_layer:
+            continue
+        per_layer = by_k_by_layer[k]
+        for j, l in enumerate(layer_indices):
+            if l in per_layer and field in per_layer[l]:
+                out[i, j] = per_layer[l][field]
+    return out
+
+
+def _causal_shift_matrix(
+    agg_to_target: dict[int, dict[int, dict]],
+    agg_baseline_to_target: dict[int, dict[int, dict]],
+    layer_indices: list[int],
+    k_values: list[int],
+) -> np.ndarray:
+    """ΔKL[k, layer] = KL_baseline_to_target − KL_intervened_to_target."""
+    Z_int = _layer_k_matrix(agg_to_target, layer_indices, k_values)
+    Z_bl = _layer_k_matrix(agg_baseline_to_target, layer_indices, k_values)
+    return Z_bl - Z_int
+
+
+def _plot_layer_k_heatmap(
+    Z: np.ndarray,
+    layer_indices: list[int],
+    k_values: list[int],
+    title: str,
+    subtitle: str,
+    colorbar_title: str,
+    hmm_subtitle: str,
+    path: Path,
+    diverging: bool = True,
+    log_scale: bool = False,
+    save_html: bool = False,
+) -> None:
+    """Heatmap with k on y-axis (low at bottom) and layer on x-axis."""
+    Zp = Z.copy()
+    if log_scale:
+        Zp = np.log10(np.clip(Zp, 1e-10, None))
+    finite = Zp[np.isfinite(Zp)]
+    if finite.size == 0:
+        zmin, zmax = -1.0, 1.0
+    elif diverging:
+        amax = float(np.nanmax(np.abs(finite)))
+        zmin, zmax = -amax, amax
+    else:
+        zmin, zmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+    colorscale = "RdBu_r" if diverging else "Viridis"
+    range_str = f"range: [{zmin:.4g}, {zmax:.4g}]"
+    fig = go.Figure(go.Heatmap(
+        z=Zp,
+        x=[str(l) for l in layer_indices],
+        y=[str(k) for k in k_values],
+        colorscale=colorscale,
+        zmin=zmin,
+        zmax=zmax,
+        colorbar=dict(title=colorbar_title),
+    ))
+    full_subtitle = f"{subtitle} — {range_str}" if subtitle else range_str
+    if hmm_subtitle:
+        full_subtitle = f"{hmm_subtitle} | {full_subtitle}"
+    fig.update_layout(
+        title=f"{title}<br><sup>{full_subtitle}</sup>",
+        xaxis_title="Layer",
+        yaxis_title="k (positions intervened)",
+        height=520,
+        width=900,
+        margin=dict(t=90, b=60, l=70, r=40),
+    )
+    fig.update_yaxes(autorange=True)
+    _save_fig(fig, path, save_html=save_html)
+
+
+def _plot_layer_k_panel(
+    matrices: dict[str, np.ndarray],
+    layer_indices: list[int],
+    k_values: list[int],
+    title: str,
+    subtitle: str,
+    colorbar_title: str,
+    hmm_subtitle: str,
+    path: Path,
+    diverging: bool = True,
+    save_html: bool = False,
+) -> None:
+    """Side-by-side heatmap panel (one per condition) with shared color scale."""
+    conds = list(matrices.keys())
+    n = len(conds)
+    if n == 0:
+        return
+    all_vals = np.concatenate([m[np.isfinite(m)].ravel() for m in matrices.values()])
+    if all_vals.size == 0:
+        zmin, zmax = -1.0, 1.0
+    elif diverging:
+        amax = float(np.nanmax(np.abs(all_vals)))
+        zmin, zmax = -amax, amax
+    else:
+        zmin, zmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
+    colorscale = "RdBu_r" if diverging else "Viridis"
+    fig = make_subplots(
+        rows=1, cols=n,
+        subplot_titles=[c.replace("_", "-") for c in conds],
+        shared_yaxes=True,
+        horizontal_spacing=0.06,
+    )
+    for i, cond in enumerate(conds):
+        fig.add_trace(go.Heatmap(
+            z=matrices[cond],
+            x=[str(l) for l in layer_indices],
+            y=[str(k) for k in k_values],
+            colorscale=colorscale,
+            zmin=zmin, zmax=zmax,
+            showscale=(i == n - 1),
+            colorbar=dict(title=colorbar_title) if i == n - 1 else None,
+        ), row=1, col=i + 1)
+        fig.update_xaxes(title_text="Layer", row=1, col=i + 1)
+    fig.update_yaxes(title_text="k", row=1, col=1)
+    range_str = f"shared range: [{zmin:.4g}, {zmax:.4g}]"
+    full_subtitle = f"{subtitle} — {range_str}" if subtitle else range_str
+    if hmm_subtitle:
+        full_subtitle = f"{hmm_subtitle} | {full_subtitle}"
+    fig.update_layout(
+        title=f"{title}<br><sup>{full_subtitle}</sup>",
+        height=480,
+        width=max(420, 340 * n + 120),
+        margin=dict(t=90, b=60, l=70, r=40),
+    )
+    _save_fig(fig, path, save_html=save_html)
+
+
+def _plot_curves_over_layer_by_k(
+    Z: np.ndarray,
+    layer_indices: list[int],
+    k_values: list[int],
+    title: str,
+    subtitle: str,
+    yaxis_title: str,
+    hmm_subtitle: str,
+    path: Path,
+    log_y: bool = False,
+    add_zero_line: bool = False,
+    save_html: bool = False,
+) -> None:
+    """One curve per k, layer on x-axis, k mapped to Viridis."""
+    layers_str = [str(l) for l in layer_indices]
+    fig = go.Figure()
+    if add_zero_line:
+        fig.add_hline(y=0, line_color="black", line_width=1)
+    n_k = len(k_values)
+    for i, k in enumerate(k_values):
+        t = i / max(n_k - 1, 1)
+        r = int(68 + (253 - 68) * t)
+        g = int(1 + (231 - 1) * t)
+        b = int(84 + (37 - 84) * t)
+        color = f"rgb({r},{g},{b})"
+        fig.add_trace(go.Scatter(
+            x=layers_str,
+            y=list(Z[i, :]),
+            name=f"k={k}",
+            mode="lines",
+            line=dict(color=color, width=1.5),
+        ))
+    if log_y:
+        fig.update_yaxes(type="log")
+    full_subtitle = f"{hmm_subtitle} | {subtitle}" if hmm_subtitle else subtitle
+    fig.update_layout(
+        title=f"{title}<br><sup>{full_subtitle}</sup>",
+        xaxis_title="Layer",
+        yaxis_title=yaxis_title,
+        height=520, width=900,
+        margin=dict(t=90, b=60, l=70, r=40),
+    )
+    _save_fig(fig, path, save_html=save_html)
+
+
+def _fit_linear_trend(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+    """Return (slope, intercept, R²) for finite (x, y). Returns NaNs if insufficient points."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return float("nan"), float("nan"), float("nan")
+    xs = x[mask].astype(float)
+    ys = y[mask].astype(float)
+    slope, intercept = np.polyfit(xs, ys, 1)
+    yhat = slope * xs + intercept
+    ss_res = float(np.sum((ys - yhat) ** 2))
+    ss_tot = float(np.sum((ys - ys.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return float(slope), float(intercept), r2
+
+
+def _plot_curves_over_k_by_layer(
+    Z: np.ndarray,
+    layer_indices: list[int],
+    k_values: list[int],
+    title: str,
+    subtitle: str,
+    yaxis_title: str,
+    hmm_subtitle: str,
+    path: Path,
+    log_y: bool = False,
+    add_zero_line: bool = False,
+    save_html: bool = False,
+) -> None:
+    """One curve per layer, k on x-axis, layer mapped to Viridis. Adds linear trend per layer with R²."""
+    k_arr = np.asarray(k_values, dtype=float)
+    fig = go.Figure()
+    if add_zero_line:
+        fig.add_hline(y=0, line_color="black", line_width=1)
+    n_l = len(layer_indices)
+    for j, l in enumerate(layer_indices):
+        t = j / max(n_l - 1, 1)
+        r = int(68 + (253 - 68) * t)
+        g = int(1 + (231 - 1) * t)
+        b = int(84 + (37 - 84) * t)
+        color = f"rgb({r},{g},{b})"
+        y = Z[:, j].astype(float)
+        slope, intercept, r2 = _fit_linear_trend(k_arr, y)
+        label = (
+            f"L{l} (slope={slope:.3g}, R²={r2:.2f})"
+            if np.isfinite(r2) else f"L{l}"
+        )
+        fig.add_trace(go.Scatter(
+            x=[str(k) for k in k_values],
+            y=list(y),
+            name=label,
+            legendgroup=f"L{l}",
+            mode="lines",
+            line=dict(color=color, width=1.5),
+        ))
+        if np.isfinite(slope):
+            yhat = slope * k_arr + intercept
+            fig.add_trace(go.Scatter(
+                x=[str(k) for k in k_values],
+                y=list(yhat),
+                name=f"L{l} trend",
+                legendgroup=f"L{l}",
+                showlegend=False,
+                mode="lines",
+                line=dict(color=color, width=1, dash="dash"),
+                opacity=0.6,
+                hoverinfo="skip",
+            ))
+    if log_y:
+        fig.update_yaxes(type="log")
+    full_subtitle = f"{subtitle} — dashed = linear fit in k"
+    if hmm_subtitle:
+        full_subtitle = f"{hmm_subtitle} | {full_subtitle}"
+    fig.update_layout(
+        title=f"{title}<br><sup>{full_subtitle}</sup>",
+        xaxis_title="k (positions intervened)",
+        yaxis_title=yaxis_title,
+        height=520, width=1100,
+        margin=dict(t=90, b=60, l=70, r=40),
+    )
+    _save_fig(fig, path, save_html=save_html)
+
+
+def _emit_layer_k_effects(
+    *,
+    label: str,
+    conditions: list[str],
+    agg_to_target: dict[str, dict[int, dict[int, dict]]],
+    agg_baseline_to_target: dict[str, dict[int, dict[int, dict]]],
+    layer_indices: list[int],
+    k_values: list[int],
+    fig_dir: Path,
+    hmm_subtitle: str = "",
+    save_html: bool = False,
+) -> None:
+    """Produce all (layer × k) plots for a given intervention type (patching|steering)."""
+    causal_shift: dict[str, np.ndarray] = {}
+    abs_kl: dict[str, np.ndarray] = {}
+    for cond in conditions:
+        if cond not in agg_to_target:
+            continue
+        causal_shift[cond] = _causal_shift_matrix(
+            agg_to_target[cond], agg_baseline_to_target[cond],
+            layer_indices, k_values,
+        )
+        abs_kl[cond] = _layer_k_matrix(
+            agg_to_target[cond], layer_indices, k_values,
+        )
+
+    # 1) Per-condition causal-shift heatmaps + line views
+    for cond, Z in causal_shift.items():
+        base = fig_dir / f"{label}_causal_shift_{cond}"
+        _plot_layer_k_heatmap(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} causal shift — {cond.replace('_','-')}",
+            subtitle="ΔKL = KL_baseline − KL_intervened to target (↑ = toward target)",
+            colorbar_title="ΔKL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_heatmap"),
+            diverging=True,
+            save_html=save_html,
+        )
+        _plot_curves_over_layer_by_k(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} causal shift — {cond.replace('_','-')}",
+            subtitle="ΔKL toward target, one curve per k (Viridis: low k → high k)",
+            yaxis_title="ΔKL [nats] (↑ = toward target)",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_lines_by_k"),
+            add_zero_line=True,
+            save_html=save_html,
+        )
+        _plot_curves_over_k_by_layer(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} causal shift — {cond.replace('_','-')}",
+            subtitle="ΔKL toward target, one curve per layer (Viridis: shallow → deep)",
+            yaxis_title="ΔKL [nats] (↑ = toward target)",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_lines_by_layer"),
+            add_zero_line=True,
+            save_html=save_html,
+        )
+
+    # 1b) Combined panel across conditions (shared diverging scale)
+    if causal_shift:
+        _plot_layer_k_panel(
+            causal_shift, layer_indices, k_values,
+            title=f"{label.capitalize()} causal shift by condition",
+            subtitle="ΔKL toward target — shared diverging scale across panels",
+            colorbar_title="ΔKL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=fig_dir / f"{label}_causal_shift_panel",
+            diverging=True,
+            save_html=save_html,
+        )
+
+    # 2) Gap heatmaps (and line views) — optimal vs other conditions
+    if "optimal" in causal_shift:
+        Z_opt = causal_shift["optimal"]
+        for other in ["past_consistent", "random", "round_trip"]:
+            if other not in causal_shift:
+                continue
+            Z_gap = Z_opt - causal_shift[other]
+            base = fig_dir / f"{label}_gap_optimal_minus_{other}"
+            _plot_layer_k_heatmap(
+                Z_gap, layer_indices, k_values,
+                title=f"{label.capitalize()} gap — optimal − {other.replace('_','-')}",
+                subtitle="ΔKL_optimal − ΔKL_other (↑ = optimal pushes more)",
+                colorbar_title="ΔΔKL [nats]",
+                hmm_subtitle=hmm_subtitle,
+                path=base.with_name(base.name + "_heatmap"),
+                diverging=True,
+                save_html=save_html,
+            )
+            _plot_curves_over_layer_by_k(
+                Z_gap, layer_indices, k_values,
+                title=f"{label.capitalize()} gap — optimal − {other.replace('_','-')}",
+                subtitle="ΔΔKL by layer, one curve per k (Viridis: low → high)",
+                yaxis_title="ΔΔKL [nats]",
+                hmm_subtitle=hmm_subtitle,
+                path=base.with_name(base.name + "_lines_by_k"),
+                add_zero_line=True,
+                save_html=save_html,
+            )
+            _plot_curves_over_k_by_layer(
+                Z_gap, layer_indices, k_values,
+                title=f"{label.capitalize()} gap — optimal − {other.replace('_','-')}",
+                subtitle="ΔΔKL by k, one curve per layer (Viridis: shallow → deep)",
+                yaxis_title="ΔΔKL [nats]",
+                hmm_subtitle=hmm_subtitle,
+                path=base.with_name(base.name + "_lines_by_layer"),
+                add_zero_line=True,
+                save_html=save_html,
+            )
+
+    # 3) Absolute KL_to_target heatmaps + lines (sequential, log scale)
+    for cond, Z in abs_kl.items():
+        base = fig_dir / f"{label}_abs_kl_to_target_{cond}"
+        _plot_layer_k_heatmap(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} absolute KL to target — {cond.replace('_','-')}",
+            subtitle="KL(P_intervened ∥ P_opt(target)) — log₁₀ scale",
+            colorbar_title="log₁₀(KL)",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_heatmap"),
+            diverging=False,
+            log_scale=True,
+            save_html=save_html,
+        )
+        _plot_curves_over_layer_by_k(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} absolute KL to target — {cond.replace('_','-')}",
+            subtitle="KL by layer, one curve per k (log y)",
+            yaxis_title="KL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_lines_by_k"),
+            log_y=True,
+            save_html=save_html,
+        )
+        _plot_curves_over_k_by_layer(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} absolute KL to target — {cond.replace('_','-')}",
+            subtitle="KL by k, one curve per layer (log y)",
+            yaxis_title="KL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_lines_by_layer"),
+            log_y=True,
+            save_html=save_html,
+        )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1635,6 +2052,29 @@ def main() -> None:
         k=k_max,
         hmm_subtitle=hmm_subtitle,
         path=fig_dir / f"roundtrip_h2a_vs_h2b_k{k_max}",
+        save_html=config.save_html,
+    )
+
+    _emit_layer_k_effects(
+        label="patching",
+        conditions=PATCH_CONDITIONS,
+        agg_to_target=agg_patch_to_target,
+        agg_baseline_to_target=agg_bl_to_target_patch,
+        layer_indices=config.layer_indices,
+        k_values=config.k_values,
+        fig_dir=fig_dir,
+        hmm_subtitle=hmm_subtitle,
+        save_html=config.save_html,
+    )
+    _emit_layer_k_effects(
+        label="steering",
+        conditions=STEER_CONDITIONS,
+        agg_to_target=agg_steer_to_target,
+        agg_baseline_to_target=agg_bl_to_target_steer,
+        layer_indices=config.layer_indices,
+        k_values=config.k_values,
+        fig_dir=fig_dir,
+        hmm_subtitle=hmm_subtitle,
         save_html=config.save_html,
     )
 
