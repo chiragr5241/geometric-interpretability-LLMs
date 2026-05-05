@@ -10,9 +10,16 @@ import yaml
 
 @dataclass
 class SweepEntry:
-    """One process + parameter grid for sweeping."""
+    """One process + parameter grid for sweeping.
+
+    Supply EITHER ``param_grid`` (cartesian product over per-key value lists)
+    OR ``param_combos`` (explicit list of pre-built parameter dicts). The
+    explicit form is required when parameter combinations are not a clean
+    cartesian product (e.g. paired (a, x) values).
+    """
     process_name: str
-    param_grid: dict[str, list[float]]
+    param_grid: dict[str, list[float]] | None = None
+    param_combos: list[dict[str, float]] | None = None
     vocab_tokens: list[str] | None = None
     seq_length: int | None = None
     n_sequences: int | None = None
@@ -45,6 +52,17 @@ class TunedLensConfig:
     tuned_lens_epochs: int = 50
     tuned_lens_lr: float = 1e-3
     tuned_lens_batch_size: int = 512
+    # Optimizer for tuned-lens translators: "adam" (default) or "muon".
+    # The Tuned Lens paper (arXiv:2303.08112) recommends Muon as an alternative
+    # to Adam for the per-layer affine translators.
+    tuned_lens_optimizer: str = "adam"
+    # If True: model-target translator is trained on the FULL model output
+    # distribution (canonical tuned lens, arXiv:2303.08112).
+    # If False: model-target translator is trained on concept-token logits only.
+    model_target_full_vocab: bool = True
+    # Whether to also train an HMM-ground-truth target translator
+    # (KL against true HMM next-token distribution).
+    train_hmm_target: bool = True
 
     # Output
     output_user: str = "SPAR"
@@ -59,7 +77,18 @@ class TunedLensConfig:
 
 
 def expand_param_grid(entry: SweepEntry) -> list[dict[str, float]]:
-    """Cartesian product of param_grid values."""
+    """Expand a SweepEntry into the list of parameter dicts to run.
+
+    Uses ``param_combos`` verbatim if supplied; otherwise takes the cartesian
+    product of ``param_grid``.
+    """
+    if entry.param_combos:
+        return [dict(combo) for combo in entry.param_combos]
+    if not entry.param_grid:
+        raise ValueError(
+            f"SweepEntry for {entry.process_name!r} has neither param_grid "
+            f"nor param_combos."
+        )
     keys = sorted(entry.param_grid.keys())
     values = [entry.param_grid[k] for k in keys]
     return [dict(zip(keys, combo)) for combo in itertools.product(*values)]

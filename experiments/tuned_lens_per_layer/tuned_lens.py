@@ -12,6 +12,88 @@ from tqdm.auto import tqdm
 logger = logging.getLogger(__name__)
 
 
+@torch.no_grad()
+def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """Newton-Schulz iteration to (approximately) orthogonalize a 2D matrix.
+
+    Coefficients (a, b, c) from Keller Jordan's Muon implementation.
+    """
+    assert G.ndim == 2, "Newton-Schulz expects a 2D tensor"
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.to(torch.float32)
+    transposed = X.size(0) > X.size(1)
+    if transposed:
+        X = X.T
+    X = X / (X.norm() + 1e-7)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon — Momentum + orthogonalized 2D update via Newton-Schulz.
+
+    Reference: Keller Jordan, 2024. The tuned-lens paper notes Muon as a
+    recommended optimizer alternative to Adam. For 1D parameters (e.g. bias)
+    we fall back to plain SGD-momentum.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+    ) -> None:
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                u = g.add(buf, alpha=momentum) if nesterov else buf
+                if u.ndim == 2:
+                    u_o = _zeropower_via_newtonschulz5(u, steps=ns_steps)
+                    scale = max(1.0, u.size(-2) / u.size(-1)) ** 0.5
+                    p.add_(u_o, alpha=-lr * scale)
+                else:
+                    p.add_(u, alpha=-lr)
+        return loss
+
+
+def _make_optimizer(name: str, params, lr: float) -> torch.optim.Optimizer:
+    name = (name or "adam").lower()
+    if name == "adam":
+        return torch.optim.Adam(params, lr=lr)
+    if name == "muon":
+        # Muon's "natural" LR is larger than Adam's; we still honor user-supplied lr.
+        return Muon(params, lr=lr)
+    raise ValueError(f"Unknown optimizer: {name}")
+
+
 class TunedLensTranslator(nn.Module):
     """Per-layer affine translator h_l -> h_tilde, identity-initialized.
 
@@ -38,6 +120,7 @@ def train_tuned_lens(
     n_epochs: int = 50,
     lr: float = 1e-3,
     batch_size: int = 512,
+    optimizer_name: str = "adam",
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
     """Train one TunedLensTranslator per layer (faithful full-vocabulary version).
 
@@ -76,7 +159,7 @@ def train_tuned_lens(
         n = acts.shape[0]
 
         translator = TunedLensTranslator(d_model).to(device)
-        optimizer = torch.optim.Adam(translator.parameters(), lr=lr)
+        optimizer = _make_optimizer(optimizer_name, translator.parameters(), lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
         epoch_losses = []
@@ -127,6 +210,7 @@ def train_tuned_lens_concept(
     n_epochs: int = 50,
     lr: float = 1e-3,
     batch_size: int = 512,
+    optimizer_name: str = "adam",
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
     """Train one TunedLensTranslator per layer using concept-token logits only.
 
@@ -158,7 +242,7 @@ def train_tuned_lens_concept(
         n = acts.shape[0]
 
         translator = TunedLensTranslator(d_model).to(device)
-        optimizer = torch.optim.Adam(translator.parameters(), lr=lr)
+        optimizer = _make_optimizer(optimizer_name, translator.parameters(), lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
         epoch_losses = []

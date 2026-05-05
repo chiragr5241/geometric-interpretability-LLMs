@@ -1,0 +1,33 @@
+# 2-config smoke test of the upgraded tuned-lens pipeline.
+experiment_name: tuned_lens_hmm_zoo_smoke
+model_name: "meta-llama/Llama-3.2-3B"
+n_ctx_override: 4098
+
+seq_length: 200
+n_sequences: 6
+random_seed: 42
+
+layer_indices: [0, 7, 14, 21, 27]
+
+n_train_sequences: 4
+
+tuned_lens_epochs: 5
+tuned_lens_lr: 0.001
+tuned_lens_batch_size: 256
+tuned_lens_optimizer: muon
+model_target_full_vocab: true
+train_hmm_target: true
+
+results_dir: results/tuned_lens_hmm_zoo_smoke
+
+default_vocab_tokens:
+  2: ["F", "Q"]
+  3: ["F", "Q", "V"]
+
+sweeps:
+  - process_name: spiral
+    param_grid:
+      a: [0.05]
+  - process_name: mess3
+    param_combos:
+      - {a: 0.85, x: 0.02}

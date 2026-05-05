@@ -21,6 +21,8 @@ from .evaluation import LayerMetrics, compute_layer_metrics
 from .tuned_lens import (
     apply_logit_lens,
     apply_tuned_lens,
+    apply_tuned_lens_full_logits,
+    train_tuned_lens,
     train_tuned_lens_concept,
 )
 from .plotting import (
@@ -170,39 +172,68 @@ def run_pipeline(
     logger.info(f"Train points: {train_logits.shape[0]}, Test points: {test_logits.shape[0]}")
 
     # ── 5. Train tuned lenses on TRAINING data ─────────────────────────────
-    # Model-target tuned lens (concept-only)
-    train_concept_logits = train_logits[:, concept_ids]
-    logger.info("Training model-target tuned lens...")
-    translators, loss_curves = train_tuned_lens_concept(
-        activations_by_layer=train_activations,
-        model=model,
-        concept_ids=concept_ids,
-        layers=config.layer_indices,
-        target_concept_values=train_concept_logits,
-        target_is_probs=False,
-        n_epochs=config.tuned_lens_epochs,
-        lr=config.tuned_lens_lr,
-        batch_size=config.tuned_lens_batch_size,
+    # Model-target tuned lens.
+    # Canonical (paper) variant: train against the model's FULL output
+    # distribution. Concept-only variant: train against concept-token logits
+    # only. Selected by config.model_target_full_vocab.
+    optimizer_name = config.tuned_lens_optimizer
+    logger.info(
+        f"Training model-target tuned lens "
+        f"(full_vocab={config.model_target_full_vocab}, optimizer={optimizer_name})..."
     )
+    if config.model_target_full_vocab:
+        translators, loss_curves = train_tuned_lens(
+            activations_by_layer=train_activations,
+            model=model,
+            layers=config.layer_indices,
+            target_logits=train_logits,
+            n_epochs=config.tuned_lens_epochs,
+            lr=config.tuned_lens_lr,
+            batch_size=config.tuned_lens_batch_size,
+            optimizer_name=optimizer_name,
+        )
+    else:
+        train_concept_logits = train_logits[:, concept_ids]
+        translators, loss_curves = train_tuned_lens_concept(
+            activations_by_layer=train_activations,
+            model=model,
+            concept_ids=concept_ids,
+            layers=config.layer_indices,
+            target_concept_values=train_concept_logits,
+            target_is_probs=False,
+            n_epochs=config.tuned_lens_epochs,
+            lr=config.tuned_lens_lr,
+            batch_size=config.tuned_lens_batch_size,
+            optimizer_name=optimizer_name,
+        )
 
-    # HMM-target tuned lens (concept-only, trained on HMM observation probs)
-    train_obs_probs = obs_probs_all[:n_train, :seq_len_actual, :]
-    train_obs_probs_flat = train_obs_probs.reshape(-1, train_obs_probs.shape[-1])
-    logger.info("Training HMM-target tuned lens...")
-    translators_hmm, loss_curves_hmm = train_tuned_lens_concept(
-        activations_by_layer=train_activations,
-        model=model,
-        concept_ids=concept_ids,
-        layers=config.layer_indices,
-        target_concept_values=train_obs_probs_flat,
-        target_is_probs=True,
-        n_epochs=config.tuned_lens_epochs,
-        lr=config.tuned_lens_lr,
-        batch_size=config.tuned_lens_batch_size,
-    )
+    # HMM-target tuned lens (concept-only, trained on HMM observation probs).
+    # KL is taken against the HMM ground-truth next-token distribution.
+    translators_hmm: dict = {}
+    loss_curves_hmm: dict = {}
+    if config.train_hmm_target:
+        train_obs_probs = obs_probs_all[:n_train, :seq_len_actual, :]
+        train_obs_probs_flat = train_obs_probs.reshape(-1, train_obs_probs.shape[-1])
+        logger.info(
+            f"Training HMM-target tuned lens (KL vs HMM ground truth, "
+            f"optimizer={optimizer_name})..."
+        )
+        translators_hmm, loss_curves_hmm = train_tuned_lens_concept(
+            activations_by_layer=train_activations,
+            model=model,
+            concept_ids=concept_ids,
+            layers=config.layer_indices,
+            target_concept_values=train_obs_probs_flat,
+            target_is_probs=True,
+            n_epochs=config.tuned_lens_epochs,
+            lr=config.tuned_lens_lr,
+            batch_size=config.tuned_lens_batch_size,
+            optimizer_name=optimizer_name,
+        )
 
     plot_training_loss(loss_curves, figures_dir / "training_loss_model.png", label="model-target")
-    plot_training_loss(loss_curves_hmm, figures_dir / "training_loss_hmm.png", label="hmm-target")
+    if loss_curves_hmm:
+        plot_training_loss(loss_curves_hmm, figures_dir / "training_loss_hmm.png", label="hmm-target")
 
     # ── 6. Evaluate on TEST data ────────────────────────────────────────────
     logger.info("Evaluating on held-out test set...")
@@ -235,10 +266,15 @@ def run_pipeline(
             test_activations[layer], translators[layer], model, concept_ids,
         )
 
-        # HMM-target tuned lens (concept-only softmax)
-        tuned_hmm_probs = apply_tuned_lens(
-            test_activations[layer], translators_hmm[layer], model, concept_ids,
-        )
+        # HMM-target tuned lens (concept-only softmax). When disabled, fall
+        # back to the model-target probs so downstream metrics still compute
+        # (the *_tuned_hmm metrics will then mirror *_tuned).
+        if translators_hmm:
+            tuned_hmm_probs = apply_tuned_lens(
+                test_activations[layer], translators_hmm[layer], model, concept_ids,
+            )
+        else:
+            tuned_hmm_probs = tuned_probs
 
         m = compute_layer_metrics(
             layer=layer,
@@ -296,10 +332,11 @@ def run_pipeline(
     translators_dir.mkdir(exist_ok=True)
     for layer, translator in translators.items():
         torch.save(translator.state_dict(), translators_dir / f"layer_{layer}.pt")
-    translators_hmm_dir = output_dir / "translators_hmm"
-    translators_hmm_dir.mkdir(exist_ok=True)
-    for layer, translator in translators_hmm.items():
-        torch.save(translator.state_dict(), translators_hmm_dir / f"layer_{layer}.pt")
+    if translators_hmm:
+        translators_hmm_dir = output_dir / "translators_hmm"
+        translators_hmm_dir.mkdir(exist_ok=True)
+        for layer, translator in translators_hmm.items():
+            torch.save(translator.state_dict(), translators_hmm_dir / f"layer_{layer}.pt")
 
     # Save metrics as JSON
     metrics_summary = []
@@ -344,6 +381,9 @@ def run_pipeline(
             "tuned_lens_epochs": config.tuned_lens_epochs,
             "tuned_lens_lr": config.tuned_lens_lr,
             "tuned_lens_batch_size": config.tuned_lens_batch_size,
+            "tuned_lens_optimizer": config.tuned_lens_optimizer,
+            "model_target_full_vocab": config.model_target_full_vocab,
+            "train_hmm_target": config.train_hmm_target,
             "layer_indices": config.layer_indices,
             "random_seed": config.random_seed,
         }, f, indent=2)

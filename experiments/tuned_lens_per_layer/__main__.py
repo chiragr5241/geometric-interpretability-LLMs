@@ -122,6 +122,9 @@ def main() -> None:
                 tuned_lens_epochs=config.tuned_lens_epochs,
                 tuned_lens_lr=config.tuned_lens_lr,
                 tuned_lens_batch_size=config.tuned_lens_batch_size,
+                tuned_lens_optimizer=config.tuned_lens_optimizer,
+                model_target_full_vocab=config.model_target_full_vocab,
+                train_hmm_target=config.train_hmm_target,
                 results_dir=config.results_dir,
             )
 
