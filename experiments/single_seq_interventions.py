@@ -24,9 +24,9 @@ Alignment (no BOS):
     k-position interventions target positions [L−k, …, L−1]; KL measured at L−1.
 
 Metrics:
-    KL-to-target  — KL(P_intervened ∥ P_opt(η_target)) per condition (primary metric).
-    KL-to-factual — KL(P_intervened ∥ P_opt(η_factual)) (used for crossing plots).
-    KL-to-clean   — KL(P_intervened ∥ P_clean) in HMM-token + junk space.
+    KL-to-target  — KL(P_opt(η_target) ∥ P_intervened) per condition (primary metric).
+    KL-to-factual — KL(P_opt(η_factual) ∥ P_intervened) (used for crossing plots).
+    KL-to-clean   — KL(P_clean ∥ P_intervened) in HMM-token + junk space.
     Ablation uses HMM-token + junk distributions to capture shifts in
     probability mass between HMM tokens and the rest of the vocabulary.
 
@@ -79,11 +79,15 @@ from probes import Probe, ProbeResult
 
 DRY_RUN_N_SEQ = 2
 DRY_RUN_N_EVAL_POSITIONS = 3
-DRY_RUN_LAYERS = [0, 2, 10, 17, 27]
-DRY_RUN_K_VALUES = [1, 3]
+DRY_RUN_LAYERS = [0, 17]
+DRY_RUN_K_VALUES = [1]
 
-PATCH_CONDITIONS = ["optimal", "round_trip", "past_consistent", "random"]
-STEER_CONDITIONS = ["optimal", "past_consistent", "random"]
+PATCH_CONDITIONS = ["optimal", "round_trip", "past_consistent", "splice", "random"]
+STEER_CONDITIONS = ["optimal", "past_consistent", "splice", "random"]
+
+# Conditions whose targets are "principled" (i.e. real beliefs);
+# the run_with_controls path scores the random-direction control against each.
+PRINCIPLED_CONDITIONS = ["optimal", "past_consistent", "splice"]
 
 CHECKPOINT_FILENAME = "phase_c_checkpoint.json"
 
@@ -91,11 +95,13 @@ _PATCH_COLORS: dict[str, str] = {
     "optimal": "#1f77b4",
     "round_trip": "#ff7f0e",
     "past_consistent": "#2ca02c",
+    "splice": "#9467bd",
     "random": "#d62728",
 }
 _STEER_COLORS: dict[str, str] = {
     "optimal": "#1f77b4",
     "past_consistent": "#2ca02c",
+    "splice": "#9467bd",
     "random": "#d62728",
 }
 
@@ -111,6 +117,9 @@ class SingleSeqInterventionsConfig(ExperimentConfig):
     n_random_ablation_draws: int = 5
     n_past_consistent_draws: int = 3
     n_random_patch_draws: int = 3
+    n_splice_draws: int = 3
+    run_with_controls: bool = True
+    n_control_draws: int = 1
     max_intervention_batch: int | None = None
     max_variants_per_pass: int | None = None
     n_ctx_override: int | None = None
@@ -137,6 +146,13 @@ class SequenceData:
     steer_deltas: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
     patch_target_P_opts: dict[tuple[int, int], np.ndarray] = field(default_factory=dict)
     steer_target_P_opts: dict[tuple[int, int], np.ndarray] = field(default_factory=dict)
+    # Index of the first row in patch_target_P_opts / steer_target_P_opts for each
+    # principled condition, so the random-direction control can be scored against them.
+    patch_target_principled_offsets: dict[tuple[int, int], dict[str, list[int]]] = field(default_factory=dict)
+    steer_target_principled_offsets: dict[tuple[int, int], dict[str, list[int]]] = field(default_factory=dict)
+    # Random-direction "control" decoder outputs / steering deltas (independent of any cond).
+    patch_controls: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+    steer_controls: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -197,6 +213,32 @@ def _agg_records(records: list[tuple[int, int, float]]) -> dict:
         "mean": float(np.mean(seq_means)),
         "std": float(np.std(seq_means)),
         "stderr": float(np.std(seq_means) / max(np.sqrt(n), 1.0)),
+        "n_seqs": n,
+    }
+
+
+def _agg_paired_diff(
+    cond_records: list[tuple[int, int, float]],
+    ctl_records: list[tuple[int, int, float]],
+) -> dict:
+    """Per-seq mean(cond) − mean(ctl), then aggregate across sequences."""
+    cond_per_seq: dict[int, list[float]] = {}
+    for seq_idx, _, val in cond_records:
+        cond_per_seq.setdefault(seq_idx, []).append(val)
+    ctl_per_seq: dict[int, list[float]] = {}
+    for seq_idx, _, val in ctl_records:
+        ctl_per_seq.setdefault(seq_idx, []).append(val)
+    seq_diffs: list[float] = []
+    for seq_idx, vs in cond_per_seq.items():
+        if seq_idx not in ctl_per_seq:
+            continue
+        seq_diffs.append(float(np.mean(vs) - np.mean(ctl_per_seq[seq_idx])))
+    n = len(seq_diffs)
+    return {
+        "seq_means": seq_diffs,
+        "mean": float(np.mean(seq_diffs)) if n else float("nan"),
+        "std": float(np.std(seq_diffs)) if n else float("nan"),
+        "stderr": float(np.std(seq_diffs) / max(np.sqrt(n), 1.0)) if n else float("nan"),
         "n_seqs": n,
     }
 
@@ -270,6 +312,10 @@ def _save_checkpoint(
     baseline_kl_to_target_steer: dict,
     ablation_kl: dict,
     ablation_kl_to_clean: dict,
+    patch_control_kl_to_target: dict | None = None,
+    patch_control_kl_to_factual: dict | None = None,
+    steer_control_kl_to_target: dict | None = None,
+    steer_control_kl_to_factual: dict | None = None,
 ) -> None:
     """Atomically save Phase C progress after completing each layer."""
     chk = {
@@ -285,6 +331,11 @@ def _save_checkpoint(
         "ablation_kl": _serialize_abl(ablation_kl),
         "ablation_kl_to_clean": _serialize_abl(ablation_kl_to_clean),
     }
+    if patch_control_kl_to_target is not None:
+        chk["patch_control_kl_to_target"] = _serialize_ckl(patch_control_kl_to_target)
+        chk["patch_control_kl_to_factual"] = _serialize_ckl(patch_control_kl_to_factual)
+        chk["steer_control_kl_to_target"] = _serialize_ckl(steer_control_kl_to_target)
+        chk["steer_control_kl_to_factual"] = _serialize_ckl(steer_control_kl_to_factual)
     tmp = out_dir / f"{CHECKPOINT_FILENAME}.tmp"
     with open(tmp, "w") as f:
         json.dump(chk, f)
@@ -297,11 +348,12 @@ def _load_checkpoint(
     conds_steer: list[str],
     k_values: list[int],
     layer_indices: list[int],
+    conds_principled: list[str] | None = None,
 ) -> dict:
     """Load Phase C checkpoint and deserialize all result dicts."""
     with open(chk_path) as f:
         raw = json.load(f)
-    return {
+    out = {
         "completed_layers": raw["completed_layers"],
         "patch_kl_to_target": _deserialize_ckl(raw["patch_kl_to_target"], conds_patch, k_values, layer_indices),
         "patch_kl_to_factual": _deserialize_ckl(raw["patch_kl_to_factual"], conds_patch, k_values, layer_indices),
@@ -314,6 +366,20 @@ def _load_checkpoint(
         "ablation_kl": _deserialize_abl(raw["ablation_kl"], ["belief", "random"], layer_indices),
         "ablation_kl_to_clean": _deserialize_abl(raw["ablation_kl_to_clean"], ["belief", "random"], layer_indices),
     }
+    if conds_principled is not None and "patch_control_kl_to_target" in raw:
+        out["patch_control_kl_to_target"] = _deserialize_ckl(
+            raw["patch_control_kl_to_target"], conds_principled, k_values, layer_indices
+        )
+        out["patch_control_kl_to_factual"] = _deserialize_ckl(
+            raw["patch_control_kl_to_factual"], conds_principled, k_values, layer_indices
+        )
+        out["steer_control_kl_to_target"] = _deserialize_ckl(
+            raw["steer_control_kl_to_target"], conds_principled, k_values, layer_indices
+        )
+        out["steer_control_kl_to_factual"] = _deserialize_ckl(
+            raw["steer_control_kl_to_factual"], conds_principled, k_values, layer_indices
+        )
+    return out
 
 
 def _extract_projected_probs(
@@ -399,6 +465,7 @@ def _run_combined(
     layer: int,
     positions: list[int],
     n_patch: int,
+    n_steer: int,
     patch_targets: torch.Tensor,
     steer_deltas: torch.Tensor,
     measure_pos: int,
@@ -406,14 +473,36 @@ def _run_combined(
     device: torch.device,
     model_dtype: torch.dtype,
 ) -> np.ndarray:
-    """Merged patching + steering in a single forward pass. Returns projected probabilities."""
+    """Merged patching + steering (+ optional controls) in a single forward pass.
+
+    Layout of tokens_batch rows: [patch (n_patch) | steer (n_steer) | patch_control | steer_control].
+    patch_targets includes both patch and patch_control rows in order.
+    steer_deltas includes both steer and steer_control rows in order.
+    """
     pos_tensor = torch.tensor(positions, dtype=torch.long)
     patch_t = patch_targets.to(device=device, dtype=model_dtype)
     steer_t = steer_deltas.to(device=device, dtype=model_dtype)
+    n_patch_total = patch_t.shape[0]
 
     def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
-        value[:n_patch, pos_tensor, :] = patch_t
-        value[n_patch:, pos_tensor, :] = value[n_patch:, pos_tensor, :] + steer_t
+        # Rows [0, n_patch): patch (replace).
+        if n_patch > 0:
+            value[:n_patch, pos_tensor, :] = patch_t[:n_patch]
+        # Rows [n_patch, n_patch+n_steer): steer (add).
+        if n_steer > 0:
+            value[n_patch:n_patch + n_steer, pos_tensor, :] = (
+                value[n_patch:n_patch + n_steer, pos_tensor, :] + steer_t[:n_steer]
+            )
+        # Rows [n_patch+n_steer, n_patch+n_steer+n_ctl_p): patch_control (replace).
+        n_ctl_p = n_patch_total - n_patch
+        if n_ctl_p > 0:
+            value[n_patch + n_steer:n_patch + n_steer + n_ctl_p, pos_tensor, :] = patch_t[n_patch:]
+        # Remaining rows: steer_control (add).
+        n_ctl_s = steer_t.shape[0] - n_steer
+        if n_ctl_s > 0:
+            value[n_patch + n_steer + n_ctl_p:, pos_tensor, :] = (
+                value[n_patch + n_steer + n_ctl_p:, pos_tensor, :] + steer_t[n_steer:]
+            )
         return value
 
     with torch.no_grad():
@@ -449,11 +538,22 @@ def _build_combined_batch(
     seq_data_list: list[SequenceData],
     layer: int,
     k: int,
-) -> tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
+    run_with_controls: bool,
+) -> tuple[torch.Tensor, int, int, torch.Tensor, torch.Tensor]:
+    """Build combined batch ordered as: [patch | steer | patch_control | steer_control].
+
+    Returns (tokens, n_patch, n_steer, patch_tgts (incl ctl), steer_dlts (incl ctl)).
+    Control items are appended to the patch/steer hook tensors so the same hook
+    function injects them; downstream scatter splits at n_patch + n_steer + ctl_p.
+    """
     patch_tokens: list[torch.Tensor] = []
     steer_tokens: list[torch.Tensor] = []
     patch_tgts: list[torch.Tensor] = []
     steer_dlts: list[torch.Tensor] = []
+    ctl_patch_tokens: list[torch.Tensor] = []
+    ctl_steer_tokens: list[torch.Tensor] = []
+    ctl_patch_tgts: list[torch.Tensor] = []
+    ctl_steer_dlts: list[torch.Tensor] = []
     for sd in seq_data_list:
         n_p = sd.patch_targets[(layer, k)].shape[0]
         n_s = sd.steer_deltas[(layer, k)].shape[0]
@@ -461,9 +561,21 @@ def _build_combined_batch(
         steer_tokens.append(sd.llm_tokens.expand(n_s, -1))
         patch_tgts.append(sd.patch_targets[(layer, k)])
         steer_dlts.append(sd.steer_deltas[(layer, k)])
+        if run_with_controls:
+            ctl_p = sd.patch_controls[(layer, k)]
+            ctl_s = sd.steer_controls[(layer, k)]
+            ctl_patch_tokens.append(sd.llm_tokens.expand(ctl_p.shape[0], -1))
+            ctl_steer_tokens.append(sd.llm_tokens.expand(ctl_s.shape[0], -1))
+            ctl_patch_tgts.append(ctl_p)
+            ctl_steer_dlts.append(ctl_s)
     n_patch = sum(t.shape[0] for t in patch_tgts)
-    tokens = torch.cat(patch_tokens + steer_tokens, dim=0)
-    return tokens, n_patch, torch.cat(patch_tgts, dim=0), torch.cat(steer_dlts, dim=0)
+    n_steer = sum(t.shape[0] for t in steer_dlts)
+    tokens = torch.cat(
+        patch_tokens + steer_tokens + ctl_patch_tokens + ctl_steer_tokens, dim=0
+    )
+    patch_all = torch.cat(patch_tgts + ctl_patch_tgts, dim=0) if ctl_patch_tgts else torch.cat(patch_tgts, dim=0)
+    steer_all = torch.cat(steer_dlts + ctl_steer_dlts, dim=0) if ctl_steer_dlts else torch.cat(steer_dlts, dim=0)
+    return tokens, n_patch, n_steer, patch_all, steer_all
 
 
 # ── Result scattering helpers ─────────────────────────────────────────────────
@@ -482,12 +594,12 @@ def _scatter_ablation_results(
         P_slice_projected = P_abl_projected[b_offset:b_offset + n_projs]
         P_slice_hmm = _to_hmm_simplex(P_slice_projected, n_hmm_tokens)
 
-        kl_abl = _kl(P_slice_hmm, sd.P_opt[None])
+        kl_abl = _kl(sd.P_opt[None], P_slice_hmm)
         ablation_kl["belief"][layer].append((sd.seq_idx, 0, float(kl_abl[0])))
         for draw_i, kl_v in enumerate(kl_abl[1:]):
             ablation_kl["random"][layer].append((sd.seq_idx, draw_i, float(kl_v)))
 
-        kl_abl_to_clean = _kl(P_slice_projected, sd.P_clean_projected[None])
+        kl_abl_to_clean = _kl(sd.P_clean_projected[None], P_slice_projected)
         ablation_kl_to_clean["belief"][layer].append((sd.seq_idx, 0, float(kl_abl_to_clean[0])))
         for draw_i, kl_v in enumerate(kl_abl_to_clean[1:]):
             ablation_kl_to_clean["random"][layer].append((sd.seq_idx, draw_i, float(kl_v)))
@@ -498,6 +610,7 @@ def _scatter_ablation_results(
 def _scatter_combined_results(
     P_out_projected: np.ndarray,
     n_patch_total: int,
+    n_steer_total: int,
     sub_batch: list[SequenceData],
     layer: int,
     k: int,
@@ -511,15 +624,43 @@ def _scatter_combined_results(
     baseline_kl_to_target_patch: dict,
     baseline_kl_to_target_steer: dict,
     n_past_consistent_draws: int,
+    n_splice_draws: int,
     n_random_patch_draws: int,
+    run_with_controls: bool,
+    n_control_draws: int,
+    patch_control_kl_to_target: dict | None,
+    steer_control_kl_to_target: dict | None,
+    patch_control_kl_to_factual: dict | None,
+    steer_control_kl_to_factual: dict | None,
 ) -> None:
     P_patch_all_projected = P_out_projected[:n_patch_total]
-    P_steer_all_projected = P_out_projected[n_patch_total:]
+    P_steer_all_projected = P_out_projected[n_patch_total:n_patch_total + n_steer_total]
+    P_ctl_patch_all_projected = P_out_projected[n_patch_total + n_steer_total:
+                                                 n_patch_total + n_steer_total + (
+                                                     len(sub_batch) * n_control_draws if run_with_controls else 0)]
+    P_ctl_steer_all_projected = P_out_projected[n_patch_total + n_steer_total + (
+                                                     len(sub_batch) * n_control_draws if run_with_controls else 0):]
     P_patch_all_hmm = _to_hmm_simplex(P_patch_all_projected, n_hmm_tokens)
     P_steer_all_hmm = _to_hmm_simplex(P_steer_all_projected, n_hmm_tokens)
+    P_ctl_patch_all_hmm = _to_hmm_simplex(P_ctl_patch_all_projected, n_hmm_tokens) if run_with_controls else None
+    P_ctl_steer_all_hmm = _to_hmm_simplex(P_ctl_steer_all_projected, n_hmm_tokens) if run_with_controls else None
+
+    cond_draw_counts = [
+        ("optimal", 1),
+        ("round_trip", 1),
+        ("past_consistent", n_past_consistent_draws),
+        ("splice", n_splice_draws),
+        ("random", n_random_patch_draws),
+    ]
+    steer_cond_draw_counts = [
+        ("optimal", 1),
+        ("past_consistent", n_past_consistent_draws),
+        ("splice", n_splice_draws),
+        ("random", n_random_patch_draws),
+    ]
 
     p_offset, s_offset = 0, 0
-    for sd in sub_batch:
+    for sd_idx, sd in enumerate(sub_batch):
         n_p = sd.patch_targets[(layer, k)].shape[0]
         n_s = sd.steer_deltas[(layer, k)].shape[0]
         P_patch_hmm = P_patch_all_hmm[p_offset:p_offset + n_p]
@@ -530,15 +671,13 @@ def _scatter_combined_results(
         patch_P_opts = sd.patch_target_P_opts[(layer, k)]
         steer_P_opts = sd.steer_target_P_opts[(layer, k)]
 
-        kl_to_tgt = _kl(P_patch_hmm, patch_P_opts)
-        kl_to_fac = _kl(P_patch_hmm, sd.P_opt[None])
-        kl_to_cln = _kl(P_patch_projected, sd.P_clean_projected[None])
-        bl_to_tgt = _kl(sd.P_clean_hmm[None].repeat(n_p, axis=0), patch_P_opts)
+        kl_to_tgt = _kl(patch_P_opts, P_patch_hmm)
+        kl_to_fac = _kl(sd.P_opt[None], P_patch_hmm)
+        kl_to_cln = _kl(sd.P_clean_projected[None], P_patch_projected)
+        bl_to_tgt = _kl(patch_P_opts, sd.P_clean_hmm[None].repeat(n_p, axis=0))
 
         b_idx = 0
-        for cond, n_draws in [("optimal", 1), ("round_trip", 1),
-                               ("past_consistent", n_past_consistent_draws),
-                               ("random", n_random_patch_draws)]:
+        for cond, n_draws in cond_draw_counts:
             for draw_i in range(n_draws):
                 patch_kl_to_target[cond][k][layer].append((sd.seq_idx, draw_i, float(kl_to_tgt[b_idx])))
                 patch_kl_to_factual[cond][k][layer].append((sd.seq_idx, draw_i, float(kl_to_fac[b_idx])))
@@ -546,21 +685,57 @@ def _scatter_combined_results(
                 baseline_kl_to_target_patch[cond][k][layer].append((sd.seq_idx, draw_i, float(bl_to_tgt[b_idx])))
                 b_idx += 1
 
-        kl_s_tgt = _kl(P_steer_hmm, steer_P_opts)
-        kl_s_fac = _kl(P_steer_hmm, sd.P_opt[None])
-        kl_s_cln = _kl(P_steer_projected, sd.P_clean_projected[None])
-        bl_s_tgt = _kl(sd.P_clean_hmm[None].repeat(n_s, axis=0), steer_P_opts)
+        kl_s_tgt = _kl(steer_P_opts, P_steer_hmm)
+        kl_s_fac = _kl(sd.P_opt[None], P_steer_hmm)
+        kl_s_cln = _kl(sd.P_clean_projected[None], P_steer_projected)
+        bl_s_tgt = _kl(steer_P_opts, sd.P_clean_hmm[None].repeat(n_s, axis=0))
 
         s_idx = 0
-        for cond, n_draws in [("optimal", 1),
-                               ("past_consistent", n_past_consistent_draws),
-                               ("random", n_random_patch_draws)]:
+        for cond, n_draws in steer_cond_draw_counts:
             for draw_i in range(n_draws):
                 steer_kl_to_target[cond][k][layer].append((sd.seq_idx, draw_i, float(kl_s_tgt[s_idx])))
                 steer_kl_to_factual[cond][k][layer].append((sd.seq_idx, draw_i, float(kl_s_fac[s_idx])))
                 steer_kl_to_clean[cond][k][layer].append((sd.seq_idx, draw_i, float(kl_s_cln[s_idx])))
                 baseline_kl_to_target_steer[cond][k][layer].append((sd.seq_idx, draw_i, float(bl_s_tgt[s_idx])))
                 s_idx += 1
+
+        if run_with_controls:
+            ctl_p_start = sd_idx * n_control_draws
+            P_ctl_p = P_ctl_patch_all_hmm[ctl_p_start:ctl_p_start + n_control_draws]
+            P_ctl_s = P_ctl_steer_all_hmm[ctl_p_start:ctl_p_start + n_control_draws]
+
+            patch_target_offsets = sd.patch_target_principled_offsets[(layer, k)]
+            steer_target_offsets = sd.steer_target_principled_offsets[(layer, k)]
+
+            for cond in PRINCIPLED_CONDITIONS:
+                if cond not in patch_target_offsets:
+                    continue
+                offsets = patch_target_offsets[cond]
+                # Use only first principled draw of each cond as the reference target P_opt.
+                P_opt_ref = patch_P_opts[offsets[0]:offsets[0] + 1]
+                kl_ctl_p_tgt = _kl(P_opt_ref, P_ctl_p)
+                kl_ctl_p_fac = _kl(sd.P_opt[None], P_ctl_p)
+                for draw_i in range(n_control_draws):
+                    patch_control_kl_to_target[cond][k][layer].append(
+                        (sd.seq_idx, draw_i, float(kl_ctl_p_tgt[draw_i]))
+                    )
+                    patch_control_kl_to_factual[cond][k][layer].append(
+                        (sd.seq_idx, draw_i, float(kl_ctl_p_fac[draw_i]))
+                    )
+            for cond in PRINCIPLED_CONDITIONS:
+                if cond not in steer_target_offsets:
+                    continue
+                offsets = steer_target_offsets[cond]
+                P_opt_ref = steer_P_opts[offsets[0]:offsets[0] + 1]
+                kl_ctl_s_tgt = _kl(P_opt_ref, P_ctl_s)
+                kl_ctl_s_fac = _kl(sd.P_opt[None], P_ctl_s)
+                for draw_i in range(n_control_draws):
+                    steer_control_kl_to_target[cond][k][layer].append(
+                        (sd.seq_idx, draw_i, float(kl_ctl_s_tgt[draw_i]))
+                    )
+                    steer_control_kl_to_factual[cond][k][layer].append(
+                        (sd.seq_idx, draw_i, float(kl_ctl_s_fac[draw_i]))
+                    )
 
         p_offset += n_p
         s_offset += n_s
@@ -599,6 +774,33 @@ def _past_consistent_targets(
 
 def _random_targets(positions: list[int], rng: np.random.Generator, n_states: int = 3) -> np.ndarray:
     return rng.dirichlet(np.ones(n_states), size=len(positions)).astype(np.float32)
+
+
+def _splice_targets(
+    seq_idx: int,
+    all_beliefs: np.ndarray,
+    valid_donor_seqs: list[int],
+    post_convergence_start: int,
+    k: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample a splice-target: take k consecutive HMM-evolved beliefs from a different donor seq.
+
+    The donor's beliefs already evolve under the HMM, so the resulting target is internally
+    consistent (unlike `random` which is i.i.d. Dirichlet) but conflicts with the prefix
+    tokens the model has actually seen at the patched positions.
+    """
+    donors = [j for j in valid_donor_seqs if j != seq_idx]
+    if not donors:
+        donors = [j for j in valid_donor_seqs]  # degenerate: only one valid seq, allow self
+    donor = int(rng.choice(donors))
+    L_donor = all_beliefs.shape[1]
+    t_max = L_donor - k
+    t_min = post_convergence_start
+    if t_max < t_min:
+        t_min = max(0, t_max)
+    t0 = int(rng.integers(t_min, t_max + 1))
+    return all_beliefs[donor, t0:t0 + k].astype(np.float32)
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -657,10 +859,71 @@ def _plot_kl_vs_layer(
     fig.update_layout(
         title=(
             f"{title} (k={k})<br>"
-            f"<sup>{hmm_subtitle} | KL(P_intervened ∥ P_opt(η_target)) — log scale — mean ± stderr</sup>"
+            f"<sup>{hmm_subtitle} | KL(P_opt(η_target) ∥ P_intervened) — log scale — mean ± stderr</sup>"
         ),
         xaxis_title="Layer",
         yaxis_title="KL [nats]",
+        height=500, width=820,
+        margin=dict(t=80, b=60, l=70, r=40),
+    )
+    _save_fig(fig, path, save_html=save_html)
+
+
+def _plot_kl_minus_control_vs_layer(
+    agg_diff: dict[str, dict[int, dict]],
+    layer_indices: list[int],
+    k: int,
+    title: str,
+    hmm_subtitle: str,
+    colors: dict[str, str],
+    path: Path,
+    save_html: bool = False,
+) -> None:
+    """Per-condition KL_to_target minus control KL_to_target (paired by seq).
+
+    Negative values ⇒ principled intervention beats a random-direction control on
+    hitting that condition's own target distribution.
+    """
+    layers_str = [str(l) for l in layer_indices]
+    fig = go.Figure()
+    fig.add_hline(y=0, line_color="black", line_width=1)
+
+    for cond, color in colors.items():
+        if cond not in agg_diff:
+            continue
+        means = [agg_diff[cond][l]["mean"] for l in layer_indices]
+        stderrs = [agg_diff[cond][l]["stderr"] for l in layer_indices]
+        upper = [m + e for m, e in zip(means, stderrs)]
+        lower = [m - e for m, e in zip(means, stderrs)]
+        rgba = color.lstrip("#")
+        r, g, b = int(rgba[0:2], 16), int(rgba[2:4], 16), int(rgba[4:6], 16)
+        fill_color = f"rgba({r},{g},{b},0.12)"
+
+        fig.add_trace(go.Scatter(
+            x=layers_str + layers_str[::-1],
+            y=upper + lower[::-1],
+            fill="toself",
+            fillcolor=fill_color,
+            line=dict(width=0),
+            showlegend=False,
+            mode="lines",
+        ))
+        fig.add_trace(go.Scatter(
+            x=layers_str,
+            y=means,
+            name=cond.replace("_", "-"),
+            mode="lines+markers",
+            line=dict(color=color, width=2),
+        ))
+
+    fig.update_layout(
+        title=(
+            f"{title} (k={k})<br>"
+            f"<sup>{hmm_subtitle} | KL(P_opt(η_C) ‖ LLM_int_C) − KL(P_opt(η_C) ‖ LLM_int_control) "
+            "— negative = principled beats random control</sup>"
+        ),
+        xaxis_title="Layer",
+        yaxis_title="ΔKL [nats]",
         height=500, width=820,
         margin=dict(t=80, b=60, l=70, r=40),
     )
@@ -798,8 +1061,8 @@ def _plot_crossing(
 ) -> None:
     """Old-style crossing plot.
 
-    Blue: KL(P ∥ P_opt_factual) — should go UP after patching with wrong belief.
-    Orange: KL(P ∥ P_opt_target) — should go DOWN (model adopts injected belief).
+    Blue: KL(P_opt_factual ∥ P) — should go UP after patching with wrong belief.
+    Orange: KL(P_opt_target ∥ P) — should go DOWN (model adopts injected belief).
     Crossing of the two = causal adoption of injected belief.
     """
     n_layers = len(layer_indices)
@@ -1178,6 +1441,76 @@ def _plot_curves_over_k_by_layer(
     _save_fig(fig, path, save_html=save_html)
 
 
+def _emit_kl_minus_control_layer_k(
+    *,
+    label: str,
+    conditions: list[str],
+    diff_records_by_cond: dict[str, dict[int, dict[int, list[tuple[int, int, float]]]]],
+    layer_indices: list[int],
+    k_values: list[int],
+    fig_dir: Path,
+    hmm_subtitle: str = "",
+    save_html: bool = False,
+) -> None:
+    """(layer × k) heatmap & lines for KL_C_to_C − KL_ctl_to_C, per condition.
+
+    `diff_records_by_cond[cond][k][layer]` should be the per-seq aggregated diff dict
+    (output of _agg_paired_diff for each k, layer).
+    """
+    diff_mats: dict[str, np.ndarray] = {}
+    for cond in conditions:
+        if cond not in diff_records_by_cond:
+            continue
+        diff_mats[cond] = _layer_k_matrix(
+            diff_records_by_cond[cond], layer_indices, k_values, field="mean",
+        )
+
+    for cond, Z in diff_mats.items():
+        base = fig_dir / f"{label}_kl_minus_control_{cond}"
+        _plot_layer_k_heatmap(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} KL minus control — {cond.replace('_','-')}",
+            subtitle="ΔKL = KL_C_to_C − KL_ctl_to_C (negative = principled beats control)",
+            colorbar_title="ΔKL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_heatmap"),
+            diverging=True,
+            save_html=save_html,
+        )
+        _plot_curves_over_layer_by_k(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} KL minus control — {cond.replace('_','-')}",
+            subtitle="ΔKL by layer, one curve per k (Viridis: low → high)",
+            yaxis_title="ΔKL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_lines_by_k"),
+            add_zero_line=True,
+            save_html=save_html,
+        )
+        _plot_curves_over_k_by_layer(
+            Z, layer_indices, k_values,
+            title=f"{label.capitalize()} KL minus control — {cond.replace('_','-')}",
+            subtitle="ΔKL by k, one curve per layer (Viridis: shallow → deep)",
+            yaxis_title="ΔKL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=base.with_name(base.name + "_lines_by_layer"),
+            add_zero_line=True,
+            save_html=save_html,
+        )
+
+    if diff_mats:
+        _plot_layer_k_panel(
+            diff_mats, layer_indices, k_values,
+            title=f"{label.capitalize()} KL minus control by condition",
+            subtitle="ΔKL = KL_C_to_C − KL_ctl_to_C — shared diverging scale",
+            colorbar_title="ΔKL [nats]",
+            hmm_subtitle=hmm_subtitle,
+            path=fig_dir / f"{label}_kl_minus_control_panel",
+            diverging=True,
+            save_html=save_html,
+        )
+
+
 def _emit_layer_k_effects(
     *,
     label: str,
@@ -1296,7 +1629,7 @@ def _emit_layer_k_effects(
         _plot_layer_k_heatmap(
             Z, layer_indices, k_values,
             title=f"{label.capitalize()} absolute KL to target — {cond.replace('_','-')}",
-            subtitle="KL(P_intervened ∥ P_opt(target)) — log₁₀ scale",
+            subtitle="KL(P_opt(target) ∥ P_intervened) — log₁₀ scale",
             colorbar_title="log₁₀(KL)",
             hmm_subtitle=hmm_subtitle,
             path=base.with_name(base.name + "_heatmap"),
@@ -1351,6 +1684,7 @@ def main() -> None:
         config.experiment_name = f"{config.experiment_name}_dry_run"
 
     rng = np.random.default_rng(config.random_seed)
+    control_rng = np.random.default_rng(config.random_seed + 1)
     device = get_device(config.device)
 
     resume_dir = Path(args.resume).resolve() if args.resume else None
@@ -1455,6 +1789,14 @@ def main() -> None:
     steer_kl_to_clean = _make_cond_k_layer(STEER_CONDITIONS)
     baseline_kl_to_target_steer = _make_cond_k_layer(STEER_CONDITIONS)
 
+    # Control buckets: KL of (random-direction control intervention output)
+    # against P_opt(η_target_for_cond_C) — same control used per (seq, layer, k),
+    # scored against each principled condition's target.
+    patch_control_kl_to_target = _make_cond_k_layer(PRINCIPLED_CONDITIONS) if config.run_with_controls else None
+    patch_control_kl_to_factual = _make_cond_k_layer(PRINCIPLED_CONDITIONS) if config.run_with_controls else None
+    steer_control_kl_to_target = _make_cond_k_layer(PRINCIPLED_CONDITIONS) if config.run_with_controls else None
+    steer_control_kl_to_factual = _make_cond_k_layer(PRINCIPLED_CONDITIONS) if config.run_with_controls else None
+
     ablation_kl: dict[str, dict[int, list[tuple[int, int, float]]]] = {
         "belief": {l: [] for l in config.layer_indices},
         "random": {l: [] for l in config.layer_indices},
@@ -1502,7 +1844,7 @@ def main() -> None:
 
         eta_baseline = seq_beliefs[measure_pos + 1].astype(np.float32)
         P_opt = (eta_baseline @ emit.T).astype(np.float32)
-        bkl = float(_kl(P_clean_hmm[None], P_opt[None])[0])
+        bkl = float(_kl(P_opt[None], P_clean_hmm[None])[0])
         baseline_kl_list.append(bkl)
         logger.info(f"    Baseline KL: {bkl:.4f}")
 
@@ -1538,9 +1880,23 @@ def main() -> None:
     logger.info("=== Phase B: Pre-computing targets ===")
 
     n_abl_per_seq = 1 + config.n_random_ablation_draws
-    n_patch_per_seq = 1 + 1 + config.n_past_consistent_draws + config.n_random_patch_draws
-    n_steer_per_seq = 1 + config.n_past_consistent_draws + config.n_random_patch_draws
-    n_combined_per_seq = n_patch_per_seq + n_steer_per_seq
+    n_patch_per_seq = (
+        1  # optimal
+        + 1  # round_trip
+        + config.n_past_consistent_draws
+        + config.n_splice_draws
+        + config.n_random_patch_draws
+    )
+    n_steer_per_seq = (
+        1  # optimal
+        + config.n_past_consistent_draws
+        + config.n_splice_draws
+        + config.n_random_patch_draws
+    )
+    n_ctl = config.n_control_draws if config.run_with_controls else 0
+    n_combined_per_seq = n_patch_per_seq + n_steer_per_seq + 2 * n_ctl
+
+    valid_donor_seqs = [sd_d.seq_idx for sd_d in all_seq_data]
 
     for sd in all_seq_data:
         seq_i = sd.seq_idx
@@ -1571,10 +1927,24 @@ def main() -> None:
                     _past_consistent_targets(seq_beliefs, positions, hmm, rng)
                     for _ in range(config.n_past_consistent_draws)
                 ]
+                eta_splice_list = [
+                    _splice_targets(
+                        seq_i, all_beliefs, valid_donor_seqs,
+                        config.post_convergence_start, k, rng,
+                    )
+                    for _ in range(config.n_splice_draws)
+                ]
                 eta_random_list = [
                     _random_targets(positions, rng, n_states)
                     for _ in range(config.n_random_patch_draws)
                 ]
+                eta_control_list = (
+                    [
+                        _random_targets(positions, control_rng, n_states)
+                        for _ in range(config.n_control_draws)
+                    ]
+                    if config.run_with_controls else []
+                )
 
                 round_trip_acts, round_trip_beliefs = _round_trip_targets(
                     encoder, clean_acts_k, decoder,
@@ -1586,13 +1956,22 @@ def main() -> None:
                         decoder(torch.from_numpy(ep).float())
                         for ep in eta_past_list
                     ]
+                    dec_splice = [
+                        decoder(torch.from_numpy(es).float())
+                        for es in eta_splice_list
+                    ]
                     dec_random = [
                         decoder(torch.from_numpy(er).float())
                         for er in eta_random_list
                     ]
+                    dec_control = [
+                        decoder(torch.from_numpy(ec).float())
+                        for ec in eta_control_list
+                    ]
 
                 sd.patch_targets[(layer, k)] = torch.stack(
-                    [dec_optimal, torch.from_numpy(round_trip_acts)] + dec_past + dec_random,
+                    [dec_optimal, torch.from_numpy(round_trip_acts)]
+                    + dec_past + dec_splice + dec_random,
                     dim=0,
                 )
 
@@ -1601,11 +1980,22 @@ def main() -> None:
                     (eta_optimal[measure_belief_idx] @ emit.T).astype(np.float32),
                     (round_trip_beliefs[measure_belief_idx] @ emit.T).astype(np.float32),
                 ]
+                # Track row offsets in patch_P_opts per principled condition.
+                patch_offsets: dict[str, list[int]] = {"optimal": [0]}
+                next_off = 2  # 0=optimal, 1=round_trip
+                patch_offsets["past_consistent"] = list(range(next_off, next_off + len(eta_past_list)))
                 for ep in eta_past_list:
                     patch_P_opt_list.append((ep[measure_belief_idx] @ emit.T).astype(np.float32))
+                next_off += len(eta_past_list)
+                patch_offsets["splice"] = list(range(next_off, next_off + len(eta_splice_list)))
+                for es in eta_splice_list:
+                    patch_P_opt_list.append((es[measure_belief_idx] @ emit.T).astype(np.float32))
+                next_off += len(eta_splice_list)
+                # random offsets — not used by control scatter but kept for completeness
                 for er in eta_random_list:
                     patch_P_opt_list.append((er[measure_belief_idx] @ emit.T).astype(np.float32))
                 sd.patch_target_P_opts[(layer, k)] = np.stack(patch_P_opt_list, axis=0)
+                sd.patch_target_principled_offsets[(layer, k)] = patch_offsets
 
                 with torch.no_grad():
                     source_beliefs = encoder(torch.from_numpy(clean_acts_k).float())
@@ -1615,25 +2005,58 @@ def main() -> None:
                         (dp - dec_source).unsqueeze(0)
                         for dp in dec_past
                     ]
+                    steer_splice = [
+                        (ds - dec_source).unsqueeze(0)
+                        for ds in dec_splice
+                    ]
                     steer_random = [
                         (dr - dec_source).unsqueeze(0)
                         for dr in dec_random
                     ]
+                    steer_control = [
+                        (dc - dec_source).unsqueeze(0)
+                        for dc in dec_control
+                    ]
 
                 sd.steer_deltas[(layer, k)] = torch.cat(
-                    [steer_optimal] + steer_past + steer_random, dim=0
+                    [steer_optimal] + steer_past + steer_splice + steer_random, dim=0
                 )
 
                 steer_P_opt_list = [
                     (eta_optimal[measure_belief_idx] @ emit.T).astype(np.float32),
                 ]
+                steer_offsets: dict[str, list[int]] = {"optimal": [0]}
+                next_off_s = 1
+                steer_offsets["past_consistent"] = list(range(next_off_s, next_off_s + len(eta_past_list)))
                 for ep in eta_past_list:
                     steer_P_opt_list.append((ep[measure_belief_idx] @ emit.T).astype(np.float32))
+                next_off_s += len(eta_past_list)
+                steer_offsets["splice"] = list(range(next_off_s, next_off_s + len(eta_splice_list)))
+                for es in eta_splice_list:
+                    steer_P_opt_list.append((es[measure_belief_idx] @ emit.T).astype(np.float32))
+                next_off_s += len(eta_splice_list)
                 for er in eta_random_list:
                     steer_P_opt_list.append((er[measure_belief_idx] @ emit.T).astype(np.float32))
                 sd.steer_target_P_opts[(layer, k)] = np.stack(steer_P_opt_list, axis=0)
+                sd.steer_target_principled_offsets[(layer, k)] = steer_offsets
+
+                if config.run_with_controls and dec_control:
+                    sd.patch_controls[(layer, k)] = torch.stack(dec_control, dim=0)
+                    sd.steer_controls[(layer, k)] = torch.cat(steer_control, dim=0)
 
             del encoder, decoder
+
+    control_etas_sha = ""
+    if config.run_with_controls:
+        import hashlib
+        h = hashlib.sha256()
+        for sd in all_seq_data:
+            for layer in config.layer_indices:
+                for k in config.k_values:
+                    if (layer, k) in sd.patch_controls:
+                        h.update(sd.patch_controls[(layer, k)].cpu().numpy().tobytes())
+        control_etas_sha = h.hexdigest()
+        logger.info(f"Control draws SHA256: {control_etas_sha[:16]} (n_control_draws={config.n_control_draws})")
 
     # ── Load checkpoint (resume) ──────────────────────────────────────────────
     completed_layers: list[int] = []
@@ -1644,6 +2067,7 @@ def main() -> None:
             chk = _load_checkpoint(
                 chk_path, PATCH_CONDITIONS, STEER_CONDITIONS,
                 config.k_values, config.layer_indices,
+                PRINCIPLED_CONDITIONS if config.run_with_controls else None,
             )
             completed_layers = chk["completed_layers"]
             patch_kl_to_target = chk["patch_kl_to_target"]
@@ -1656,6 +2080,11 @@ def main() -> None:
             baseline_kl_to_target_steer = chk["baseline_kl_to_target_steer"]
             ablation_kl = chk["ablation_kl"]
             ablation_kl_to_clean = chk["ablation_kl_to_clean"]
+            if config.run_with_controls and "patch_control_kl_to_target" in chk:
+                patch_control_kl_to_target = chk["patch_control_kl_to_target"]
+                patch_control_kl_to_factual = chk["patch_control_kl_to_factual"]
+                steer_control_kl_to_target = chk["steer_control_kl_to_target"]
+                steer_control_kl_to_factual = chk["steer_control_kl_to_factual"]
             logger.info(f"  Restored {len(completed_layers)} completed layers: {completed_layers}")
         else:
             logger.warning(f"  No checkpoint found at {chk_path}; Phase C will run from scratch")
@@ -1746,37 +2175,63 @@ def main() -> None:
             positions = list(range(L_trunc - k, L_trunc))
 
             def _run_comb_safe(batch: list[SequenceData], _k: int = k, _pos: list[int] = positions) -> None:
-                tb, np_b, pt_b, sd_b = _build_combined_batch(batch, layer, _k)
+                tb, np_b, ns_b, pt_b, sd_b = _build_combined_batch(
+                    batch, layer, _k, config.run_with_controls,
+                )
+                n_ctl_p_tot = pt_b.shape[0] - np_b
+                n_ctl_s_tot = sd_b.shape[0] - ns_b
 
                 max_v = config.max_variants_per_pass
                 if max_v is not None and tb.shape[0] > max_v:
-                    # Variant-level chunking: split patch items then steer items into
-                    # sub-passes of ≤ max_variants_per_pass, limiting attention-pattern
-                    # peak memory to max_v × n_heads × seq_len² × dtype_bytes.
-                    patch_tb = tb[:np_b]
-                    steer_tb = tb[np_b:]
-                    n_steer = tb.shape[0] - np_b
+                    # Variant-level chunking: split each of the 4 segments (patch_main,
+                    # steer_main, patch_ctl, steer_ctl) into sub-passes of ≤ max_v rows.
                     pieces: list[np.ndarray] = []
+                    # Segment 0: patch_main (replace)
+                    pmt = tb[:np_b]
+                    pmtgt = pt_b[:np_b]
                     for start in range(0, np_b, max_v):
                         end = min(start + max_v, np_b)
                         pieces.append(_run_combined(
-                            model, patch_tb[start:end], layer, _pos,
-                            end - start, pt_b[start:end], sd_b[:0],
+                            model, pmt[start:end], layer, _pos,
+                            end - start, 0, pmtgt[start:end], sd_b[:0],
                             measure_pos, mid_tok_ids, device, model_dtype,
                         ))
-                    for start in range(0, n_steer, max_v):
-                        end = min(start + max_v, n_steer)
+                    # Segment 1: steer_main (add)
+                    smt = tb[np_b:np_b + ns_b]
+                    smdlt = sd_b[:ns_b]
+                    for start in range(0, ns_b, max_v):
+                        end = min(start + max_v, ns_b)
                         pieces.append(_run_combined(
-                            model, steer_tb[start:end], layer, _pos,
-                            0, pt_b[:0], sd_b[start:end],
+                            model, smt[start:end], layer, _pos,
+                            0, end - start, pt_b[:0], smdlt[start:end],
                             measure_pos, mid_tok_ids, device, model_dtype,
                         ))
-                    P_out = np.concatenate(pieces, axis=0)
+                    # Segment 2: patch_ctl (replace)
+                    pct = tb[np_b + ns_b:np_b + ns_b + n_ctl_p_tot]
+                    pctgt = pt_b[np_b:]
+                    for start in range(0, n_ctl_p_tot, max_v):
+                        end = min(start + max_v, n_ctl_p_tot)
+                        pieces.append(_run_combined(
+                            model, pct[start:end], layer, _pos,
+                            end - start, 0, pctgt[start:end], sd_b[:0],
+                            measure_pos, mid_tok_ids, device, model_dtype,
+                        ))
+                    # Segment 3: steer_ctl (add)
+                    sct = tb[np_b + ns_b + n_ctl_p_tot:]
+                    sctlt = sd_b[ns_b:]
+                    for start in range(0, n_ctl_s_tot, max_v):
+                        end = min(start + max_v, n_ctl_s_tot)
+                        pieces.append(_run_combined(
+                            model, sct[start:end], layer, _pos,
+                            0, end - start, pt_b[:0], sctlt[start:end],
+                            measure_pos, mid_tok_ids, device, model_dtype,
+                        ))
+                    P_out = np.concatenate(pieces, axis=0) if pieces else np.zeros((0, 0))
                 else:
                     try:
                         P_out = _run_combined(
                             model, tb, layer, _pos,
-                            np_b, pt_b, sd_b,
+                            np_b, ns_b, pt_b, sd_b,
                             measure_pos, mid_tok_ids, device, model_dtype,
                         )
                     except torch.cuda.OutOfMemoryError:
@@ -1790,12 +2245,16 @@ def main() -> None:
                         return
 
                 _scatter_combined_results(
-                    P_out, np_b, batch, layer, _k, n_vocab,
+                    P_out, np_b, ns_b, batch, layer, _k, n_vocab,
                     patch_kl_to_target, patch_kl_to_factual,
                     steer_kl_to_target, steer_kl_to_factual,
                     patch_kl_to_clean, steer_kl_to_clean,
                     baseline_kl_to_target_patch, baseline_kl_to_target_steer,
-                    config.n_past_consistent_draws, config.n_random_patch_draws,
+                    config.n_past_consistent_draws, config.n_splice_draws,
+                    config.n_random_patch_draws,
+                    config.run_with_controls, config.n_control_draws,
+                    patch_control_kl_to_target, steer_control_kl_to_target,
+                    patch_control_kl_to_factual, steer_control_kl_to_factual,
                 )
 
             combined_chunks = _chunk(all_seq_data, combined_chunk_size)
@@ -1817,6 +2276,10 @@ def main() -> None:
             steer_kl_to_target, steer_kl_to_factual, steer_kl_to_clean,
             baseline_kl_to_target_steer,
             ablation_kl, ablation_kl_to_clean,
+            patch_control_kl_to_target=patch_control_kl_to_target,
+            patch_control_kl_to_factual=patch_control_kl_to_factual,
+            steer_control_kl_to_target=steer_control_kl_to_target,
+            steer_control_kl_to_factual=steer_control_kl_to_factual,
         )
 
         elapsed = time.perf_counter() - layer_start
@@ -1875,6 +2338,17 @@ def main() -> None:
         "random": {l: _agg_records(ablation_kl_to_clean["random"][l]) for l in config.layer_indices},
     }
 
+    if config.run_with_controls:
+        agg_patch_ctl_to_target = _agg_cond_k_layer(patch_control_kl_to_target, PRINCIPLED_CONDITIONS)
+        agg_patch_ctl_to_factual = _agg_cond_k_layer(patch_control_kl_to_factual, PRINCIPLED_CONDITIONS)
+        agg_steer_ctl_to_target = _agg_cond_k_layer(steer_control_kl_to_target, PRINCIPLED_CONDITIONS)
+        agg_steer_ctl_to_factual = _agg_cond_k_layer(steer_control_kl_to_factual, PRINCIPLED_CONDITIONS)
+    else:
+        agg_patch_ctl_to_target = None
+        agg_patch_ctl_to_factual = None
+        agg_steer_ctl_to_target = None
+        agg_steer_ctl_to_factual = None
+
     def _to_json(d: dict, conds: list[str]) -> dict:
         return {
             cond: {str(k): {str(l): v for l, v in by_layer.items()} for k, by_layer in by_k.items()}
@@ -1900,20 +2374,85 @@ def main() -> None:
             for cond, by_layer in agg_ablation_to_clean.items()
         },
     }
+    if config.run_with_controls:
+        metrics["patching_control_to_target"] = _to_json(agg_patch_ctl_to_target, PRINCIPLED_CONDITIONS)
+        metrics["patching_control_to_factual"] = _to_json(agg_patch_ctl_to_factual, PRINCIPLED_CONDITIONS)
+        metrics["steering_control_to_target"] = _to_json(agg_steer_ctl_to_target, PRINCIPLED_CONDITIONS)
+        metrics["steering_control_to_factual"] = _to_json(agg_steer_ctl_to_factual, PRINCIPLED_CONDITIONS)
+
+        # Paired-diff aggregates: KL_C_to_X − KL_ctl_to_X per seq, then aggregated.
+        # These mirror the new control-delta plots and let downstream code skip
+        # re-implementing the per-seq pairing logic.
+        agg_patch_diff_to_target_metrics: dict[str, dict[int, dict[int, dict]]] = {}
+        agg_patch_diff_to_factual_metrics: dict[str, dict[int, dict[int, dict]]] = {}
+        agg_steer_diff_to_target_metrics: dict[str, dict[int, dict[int, dict]]] = {}
+        agg_steer_diff_to_factual_metrics: dict[str, dict[int, dict[int, dict]]] = {}
+        for cond in PRINCIPLED_CONDITIONS:
+            agg_patch_diff_to_target_metrics[cond] = {}
+            agg_patch_diff_to_factual_metrics[cond] = {}
+            agg_steer_diff_to_target_metrics[cond] = {}
+            agg_steer_diff_to_factual_metrics[cond] = {}
+            for k in config.k_values:
+                agg_patch_diff_to_target_metrics[cond][k] = {
+                    l: _agg_paired_diff(
+                        patch_kl_to_target[cond][k][l],
+                        patch_control_kl_to_target[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+                agg_patch_diff_to_factual_metrics[cond][k] = {
+                    l: _agg_paired_diff(
+                        patch_kl_to_factual[cond][k][l],
+                        patch_control_kl_to_factual[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+                agg_steer_diff_to_target_metrics[cond][k] = {
+                    l: _agg_paired_diff(
+                        steer_kl_to_target[cond][k][l],
+                        steer_control_kl_to_target[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+                agg_steer_diff_to_factual_metrics[cond][k] = {
+                    l: _agg_paired_diff(
+                        steer_kl_to_factual[cond][k][l],
+                        steer_control_kl_to_factual[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+        metrics["patching_minus_control_to_target"] = _to_json(
+            agg_patch_diff_to_target_metrics, PRINCIPLED_CONDITIONS
+        )
+        metrics["patching_minus_control_to_factual"] = _to_json(
+            agg_patch_diff_to_factual_metrics, PRINCIPLED_CONDITIONS
+        )
+        metrics["steering_minus_control_to_target"] = _to_json(
+            agg_steer_diff_to_target_metrics, PRINCIPLED_CONDITIONS
+        )
+        metrics["steering_minus_control_to_factual"] = _to_json(
+            agg_steer_diff_to_factual_metrics, PRINCIPLED_CONDITIONS
+        )
+    raw_records = {
+        "patch_kl_to_target": _serialize_ckl(patch_kl_to_target),
+        "patch_kl_to_factual": _serialize_ckl(patch_kl_to_factual),
+        "patch_kl_to_clean": _serialize_ckl(patch_kl_to_clean),
+        "baseline_kl_to_target_patch": _serialize_ckl(baseline_kl_to_target_patch),
+        "steer_kl_to_target": _serialize_ckl(steer_kl_to_target),
+        "steer_kl_to_factual": _serialize_ckl(steer_kl_to_factual),
+        "steer_kl_to_clean": _serialize_ckl(steer_kl_to_clean),
+        "baseline_kl_to_target_steer": _serialize_ckl(baseline_kl_to_target_steer),
+        "ablation_kl": _serialize_abl(ablation_kl),
+        "ablation_kl_to_clean": _serialize_abl(ablation_kl_to_clean),
+    }
+    if config.run_with_controls:
+        raw_records["patch_control_kl_to_target"] = _serialize_ckl(patch_control_kl_to_target)
+        raw_records["patch_control_kl_to_factual"] = _serialize_ckl(patch_control_kl_to_factual)
+        raw_records["steer_control_kl_to_target"] = _serialize_ckl(steer_control_kl_to_target)
+        raw_records["steer_control_kl_to_factual"] = _serialize_ckl(steer_control_kl_to_factual)
     _write_json(
         plot_data_dir / "raw_intervention_records.json",
-        {
-            "patch_kl_to_target": _serialize_ckl(patch_kl_to_target),
-            "patch_kl_to_factual": _serialize_ckl(patch_kl_to_factual),
-            "patch_kl_to_clean": _serialize_ckl(patch_kl_to_clean),
-            "baseline_kl_to_target_patch": _serialize_ckl(baseline_kl_to_target_patch),
-            "steer_kl_to_target": _serialize_ckl(steer_kl_to_target),
-            "steer_kl_to_factual": _serialize_ckl(steer_kl_to_factual),
-            "steer_kl_to_clean": _serialize_ckl(steer_kl_to_clean),
-            "baseline_kl_to_target_steer": _serialize_ckl(baseline_kl_to_target_steer),
-            "ablation_kl": _serialize_abl(ablation_kl),
-            "ablation_kl_to_clean": _serialize_abl(ablation_kl_to_clean),
-        },
+        raw_records,
     )
     _write_json(
         plot_data_dir / "aggregated_plot_data.json",
@@ -1928,9 +2467,84 @@ def main() -> None:
         json.dump(metrics, f, indent=2)
     logger.info("Saved metrics.json")
 
+    provenance = {
+        "random_seed": config.random_seed,
+        "control_rng_seed": config.random_seed + 1 if config.run_with_controls else None,
+        "n_random_ablation_draws": config.n_random_ablation_draws,
+        "n_past_consistent_draws": config.n_past_consistent_draws,
+        "n_splice_draws": config.n_splice_draws,
+        "n_random_patch_draws": config.n_random_patch_draws,
+        "run_with_controls": config.run_with_controls,
+        "n_control_draws": config.n_control_draws,
+        "control_etas_sha256": control_etas_sha,
+        "patch_conditions": PATCH_CONDITIONS,
+        "steer_conditions": STEER_CONDITIONS,
+        "principled_conditions": PRINCIPLED_CONDITIONS,
+        "seqs_used": [sd.seq_idx for sd in all_seq_data],
+        "seqs_excluded": list(config.seq_exclude),
+        "layer_indices": list(config.layer_indices),
+        "k_values": list(config.k_values),
+        "post_convergence_start": config.post_convergence_start,
+        "train_eval_split": config.train_eval_split,
+        "L_trunc": L_trunc,
+        "measure_pos": measure_pos,
+        "eval_act_start": eval_act_start,
+        "model_name": config.model_name,
+        "training_dir": str(training_dir),
+        "hmm": {"process_name": config.hmm.process_name, "process_params": dict(config.hmm.process_params)},
+    }
+    _write_json(out_dir / "run_provenance.json", provenance)
+    logger.info("Saved run_provenance.json")
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     logger.info("Generating plots ...")
     baseline_mean = agg_baseline["mean"]
+
+    # Per-(cond, k, layer) paired diff: principled cond minus its random-direction control.
+    if config.run_with_controls:
+        agg_patch_diff_to_target: dict[str, dict[int, dict[int, dict]]] = {}
+        agg_patch_diff_to_factual: dict[str, dict[int, dict[int, dict]]] = {}
+        agg_steer_diff_to_target: dict[str, dict[int, dict[int, dict]]] = {}
+        agg_steer_diff_to_factual: dict[str, dict[int, dict[int, dict]]] = {}
+        for cond in PRINCIPLED_CONDITIONS:
+            agg_patch_diff_to_target[cond] = {}
+            agg_patch_diff_to_factual[cond] = {}
+            agg_steer_diff_to_target[cond] = {}
+            agg_steer_diff_to_factual[cond] = {}
+            for k in config.k_values:
+                agg_patch_diff_to_target[cond][k] = {
+                    l: _agg_paired_diff(
+                        patch_kl_to_target[cond][k][l],
+                        patch_control_kl_to_target[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+                agg_patch_diff_to_factual[cond][k] = {
+                    l: _agg_paired_diff(
+                        patch_kl_to_factual[cond][k][l],
+                        patch_control_kl_to_factual[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+                agg_steer_diff_to_target[cond][k] = {
+                    l: _agg_paired_diff(
+                        steer_kl_to_target[cond][k][l],
+                        steer_control_kl_to_target[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+                agg_steer_diff_to_factual[cond][k] = {
+                    l: _agg_paired_diff(
+                        steer_kl_to_factual[cond][k][l],
+                        steer_control_kl_to_factual[cond][k][l],
+                    )
+                    for l in config.layer_indices
+                }
+    else:
+        agg_patch_diff_to_target = None
+        agg_patch_diff_to_factual = None
+        agg_steer_diff_to_target = None
+        agg_steer_diff_to_factual = None
 
     for k in config.k_values:
         _plot_kl_vs_layer(
@@ -1944,6 +2558,17 @@ def main() -> None:
             path=fig_dir / f"patching_kl_vs_layer_k{k}",
             save_html=config.save_html,
         )
+        if config.run_with_controls:
+            _plot_kl_minus_control_vs_layer(
+                {cond: agg_patch_diff_to_target[cond][k] for cond in PRINCIPLED_CONDITIONS},
+                config.layer_indices,
+                k=k,
+                title="Activation patching: KL_to_target − KL_control_to_target",
+                hmm_subtitle=hmm_subtitle,
+                colors={c: _PATCH_COLORS[c] for c in PRINCIPLED_CONDITIONS},
+                path=fig_dir / f"patching_kl_minus_control_vs_layer_k{k}",
+                save_html=config.save_html,
+            )
         for cross_cond in ["past_consistent", "random"]:
             _plot_crossing(
                 agg_to_factual=agg_patch_to_factual[cross_cond][k],
@@ -1982,6 +2607,17 @@ def main() -> None:
             path=fig_dir / f"steering_kl_vs_layer_k{k}",
             save_html=config.save_html,
         )
+        if config.run_with_controls:
+            _plot_kl_minus_control_vs_layer(
+                {cond: agg_steer_diff_to_target[cond][k] for cond in PRINCIPLED_CONDITIONS},
+                config.layer_indices,
+                k=k,
+                title="Activation steering: KL_to_target − KL_control_to_target",
+                hmm_subtitle=hmm_subtitle,
+                colors={c: _STEER_COLORS[c] for c in PRINCIPLED_CONDITIONS},
+                path=fig_dir / f"steering_kl_minus_control_vs_layer_k{k}",
+                save_html=config.save_html,
+            )
         for cross_cond in ["past_consistent", "random"]:
             _plot_crossing(
                 agg_to_factual=agg_steer_to_factual[cross_cond][k],
@@ -2030,7 +2666,7 @@ def main() -> None:
         agg_ablation["belief"], agg_ablation["random"],
         config.layer_indices,
         title="Belief-subspace ablation: KL to optimal",
-        subtitle="KL(P_ablated ∥ P_opt) — HMM-token simplex — log scale",
+        subtitle="KL(P_opt ∥ P_ablated) — HMM-token simplex — log scale",
         hmm_subtitle=hmm_subtitle,
         path=fig_dir / "ablation_causal_importance",
         save_html=config.save_html,
@@ -2039,7 +2675,7 @@ def main() -> None:
         agg_ablation_to_clean["belief"], agg_ablation_to_clean["random"],
         config.layer_indices,
         title="Belief-subspace ablation: output perturbation (HMM-token + junk)",
-        subtitle="KL(P_ablated ∥ P_clean) — HMM-token + junk projection — log scale",
+        subtitle="KL(P_clean ∥ P_ablated) — HMM-token + junk projection — log scale",
         hmm_subtitle=hmm_subtitle,
         path=fig_dir / "ablation_kl_to_output_projected",
         save_html=config.save_html,
@@ -2066,6 +2702,17 @@ def main() -> None:
         hmm_subtitle=hmm_subtitle,
         save_html=config.save_html,
     )
+    if config.run_with_controls:
+        _emit_kl_minus_control_layer_k(
+            label="patching",
+            conditions=PRINCIPLED_CONDITIONS,
+            diff_records_by_cond=agg_patch_diff_to_target,
+            layer_indices=config.layer_indices,
+            k_values=config.k_values,
+            fig_dir=fig_dir,
+            hmm_subtitle=hmm_subtitle,
+            save_html=config.save_html,
+        )
     _emit_layer_k_effects(
         label="steering",
         conditions=STEER_CONDITIONS,
@@ -2077,6 +2724,17 @@ def main() -> None:
         hmm_subtitle=hmm_subtitle,
         save_html=config.save_html,
     )
+    if config.run_with_controls:
+        _emit_kl_minus_control_layer_k(
+            label="steering",
+            conditions=PRINCIPLED_CONDITIONS,
+            diff_records_by_cond=agg_steer_diff_to_target,
+            layer_indices=config.layer_indices,
+            k_values=config.k_values,
+            fig_dir=fig_dir,
+            hmm_subtitle=hmm_subtitle,
+            save_html=config.save_html,
+        )
 
     logger.info(f"All outputs written to {out_dir}")
 

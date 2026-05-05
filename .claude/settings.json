@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi *)",
+      "Bash(pip list)",
+      "Bash(pip show *)",
+      "Bash(pip freeze)",
+      "Bash(pip3 list)",
+      "Bash(pip3 show *)",
+      "Bash(pip3 freeze)",
+      "Bash(uv pip list)",
+      "Bash(uv pip show *)",
+      "Bash(uv pip freeze)",
+      "Bash(uv tree)",
+      "Bash(uv tree *)"
+    ]
+  }
+}

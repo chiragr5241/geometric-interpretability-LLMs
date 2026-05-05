@@ -28,10 +28,13 @@ vocab_mapping:
   "C": 2
 
 # Intervention parameters
-k_values: [1, 3, 5, 10, 20]
+k_values: [1, 2, 3, 5, 7, 10, 15, 25, 30, 50]
 n_random_ablation_draws: 3
 n_past_consistent_draws: 3
+n_splice_draws: 3
 n_random_patch_draws: 3
+run_with_controls: true
+n_control_draws: 1
 # null = auto-detect from VRAM on CUDA, 96 on MPS/CPU; set an integer to override
 # Setting to n_abl_per_seq (= 1 + n_random_ablation_draws = 4) avoids OOM-and-retry on ablation.
 max_intervention_batch: 4

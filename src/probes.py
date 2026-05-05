@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import numpy as np
 import torch
@@ -178,6 +178,7 @@ class ProbeResult:
 def train_probes_batched(
     inputs: list[ProbeInput],
     split: float = ...,
+    method: Literal["ols", "gd"] = ...,
     lr: float = ...,
     epochs: int = ...,
     max_epochs: int | None = ...,
@@ -192,6 +193,7 @@ def train_probes_batched(
 def train_probes_batched(
     inputs: dict[K, ProbeInput],
     split: float = ...,
+    method: Literal["ols", "gd"] = ...,
     lr: float = ...,
     epochs: int = ...,
     max_epochs: int | None = ...,
@@ -205,6 +207,7 @@ def train_probes_batched(
 def train_probes_batched(
     inputs: list[ProbeInput] | dict[Any, ProbeInput],
     split: float = 0.8,
+    method: Literal["ols", "gd"] = "ols",
     lr: float = 1e-3,
     epochs: int = 1000,
     max_epochs: int | None = None,
@@ -216,21 +219,20 @@ def train_probes_batched(
     """Train multiple linear probes in a single batched operation.
 
     Each probe learns an independent affine map from residual-stream
-    activations to belief states.  All probes share the same ``d_model``
-    and ``n_states`` dimensions but may have **different sequence lengths**.
-    Internally the inputs are zero-padded to the longest sequence and
-    boolean masks ensure that each probe's loss is computed only over its
-    valid positions.
+    activations to belief states.
 
-    Because every probe has its own slice of the weight / bias tensors and
-    the total loss is the sum of per-probe mean-MSE terms, the gradients
-    (and therefore the Adam updates) for each probe are mathematically
-    identical to training it individually — the only difference is that
-    ``torch.bmm`` runs all forward passes as a single kernel call.
+    ``method="ols"`` (default): closed-form least-squares solve via
+    ``torch.linalg.lstsq``.  One solve per probe; no training curve is
+    produced (``train_mse_curve`` and ``test_mse_curve`` are empty).
+    GD-only parameters (``lr``, ``epochs``, ``max_epochs``, ``patience``,
+    ``min_relative_improvement``) are ignored.
+
+    ``method="gd"``: Adam gradient descent.  All probes share the same
+    ``d_model`` and ``n_states`` dimensions but may have different sequence
+    lengths; inputs are zero-padded and per-probe losses are masked.
 
     **Dict overload:** when *inputs* is a ``dict[K, ProbeInput]``, the
-    return value is a ``dict[K, ProbeResult]`` with matching keys, so
-    callers never need to track integer indices::
+    return value is a ``dict[K, ProbeResult]`` with matching keys::
 
         results = train_probes_batched({
             (layer, "full"): ProbeInput(...),
@@ -245,20 +247,20 @@ def train_probes_batched(
             same ``d_model`` and ``n_states``.
         split: Fraction of each sequence used for training; the remainder
             is held out for the per-probe test MSE.
-        lr: Learning rate for Adam.
-        epochs: Number of gradient-descent steps when ``max_epochs`` is not set.
+        method: ``"ols"`` for closed-form least squares (default) or
+            ``"gd"`` for Adam gradient descent.
+        lr: Learning rate for Adam (``method="gd"`` only).
+        epochs: Number of gradient-descent steps when ``max_epochs`` is not set
+            (``method="gd"`` only).
         max_epochs: Maximum number of gradient-descent steps when using
-            patience-based convergence.
+            patience-based convergence (``method="gd"`` only).
         patience: Number of epochs without sufficient improvement before a
-            probe is considered converged. If unset, training runs for exactly
-            ``epochs`` steps, preserving historical behavior.
+            probe is considered converged (``method="gd"`` only).
         min_relative_improvement: Fractional improvement over the patience
-            window required to keep training an unconverged probe.
+            window required to keep training (``method="gd"`` only).
         device: Torch device for training.  Defaults to CUDA > MPS > CPU.
         max_probes_per_batch: If set, inputs are split into chunks of at
-            most this size and trained sequentially, with results merged
-            before returning.  Useful for bounding the size of the padded
-            activation tensor ``(N, max_len, d_model)`` on-device.
+            most this size and trained sequentially, with results merged.
 
     Returns:
         :class:`ProbeResult` objects in the same order / under the same
@@ -276,45 +278,94 @@ def train_probes_batched(
     else:
         input_list = list(inputs)
 
+    _impl = _train_probes_ols_impl if method == "ols" else _train_probes_batched_impl
+
     if max_probes_per_batch is not None and len(input_list) > max_probes_per_batch:
         results_list: list[ProbeResult] = []
         for start in range(0, len(input_list), max_probes_per_batch):
             chunk = input_list[start : start + max_probes_per_batch]
-            results_list.extend(
-                _train_probes_batched_impl(
-                    chunk,
-                    split,
-                    lr,
-                    max_epochs,
-                    patience,
-                    min_relative_improvement,
-                    device,
+            if method == "ols":
+                results_list.extend(_train_probes_ols_impl(chunk, split, device))
+            else:
+                results_list.extend(
+                    _train_probes_batched_impl(
+                        chunk, split, lr, max_epochs, patience, min_relative_improvement, device,
+                    )
                 )
-            )
         if keys is not None:
             return dict(zip(keys, results_list))
         return results_list
 
-    if keys is not None:
+    if method == "ols":
+        results = _train_probes_ols_impl(input_list, split, device)
+    else:
         results = _train_probes_batched_impl(
-            input_list,
-            split,
-            lr,
-            max_epochs,
-            patience,
-            min_relative_improvement,
-            device,
+            input_list, split, lr, max_epochs, patience, min_relative_improvement, device,
         )
+    if keys is not None:
         return dict(zip(keys, results))
-    return _train_probes_batched_impl(
-        input_list,
-        split,
-        lr,
-        max_epochs,
-        patience,
-        min_relative_improvement,
-        device,
-    )
+    return results
+
+
+def _train_probes_ols_impl(
+    input_list: list[ProbeInput],
+    split: float,
+    device: torch.device,
+) -> list[ProbeResult]:
+    results: list[ProbeResult] = []
+    for inp in input_list:
+        sl = inp.activations.shape[0]
+        d_model = inp.activations.shape[1]
+        n_states = inp.gt_belief_states.shape[1]
+
+        split_idx = inp.split_idx if inp.split_idx is not None else (sl if split >= 1.0 else int(sl * split))
+        split_idx = max(0, min(split_idx, sl))
+
+        X_train = torch.tensor(inp.activations[:split_idx], dtype=torch.float32, device=device)
+        Y_train = torch.tensor(inp.gt_belief_states[:split_idx], dtype=torch.float32, device=device)
+        n_train = X_train.shape[0]
+
+        ones = torch.ones(n_train, 1, device=device)
+        X_aug = torch.cat([X_train, ones], dim=1)  # (n_train, d_model+1)
+
+        # pinv (default rcond) truncates near-zero singular values, giving implicit
+        # regularization. The exact-OLS alternative (lstsq with gels driver) overfits
+        # catastrophically when n_train ~ d_model — train R²=1, eval R²<0 in deep layers.
+        solution = torch.linalg.pinv(X_aug) @ Y_train  # (d_model+1, n_states)
+        W = solution[:d_model]   # (d_model, n_states)
+        bias = solution[d_model] # (n_states,)
+
+        with torch.no_grad():
+            X_all = torch.tensor(inp.activations, dtype=torch.float32, device=device)
+            Y_all = torch.tensor(inp.gt_belief_states, dtype=torch.float32, device=device)
+            preds_all = X_all @ W + bias  # (sl, n_states)
+            sq_err_all = ((preds_all - Y_all) ** 2).mean(dim=-1)  # (sl,)
+
+            train_mse = float(sq_err_all[:split_idx].mean().item()) if split_idx > 0 else float("nan")
+            if split_idx < sl:
+                test_mse = float(sq_err_all[split_idx:].mean().item())
+            else:
+                test_mse = train_mse
+
+        probe = Probe(d_model, n_states)
+        probe.W.data = W.cpu()
+        probe.bias.data = bias.cpu()
+        probe.eval()
+
+        results.append(ProbeResult(
+            probe=probe,
+            train_mse_curve=[],
+            test_mse_curve=[],
+            test_mse=test_mse,
+            test_split_idx=split_idx,
+            train_tokens=inp.tokens,
+            activations=inp.activations,
+            gt_next_token_preds=inp.gt_next_token_preds,
+            computed_next_token_preds=inp.computed_next_token_preds,
+            gt_belief_states=inp.gt_belief_states,
+            computed_belief_states=preds_all.cpu().numpy(),
+        ))
+    return results
 
 
 def _train_probes_batched_impl(
@@ -448,6 +499,7 @@ def train_probe(
     gt_next_token_preds: np.ndarray,
     computed_next_token_preds: np.ndarray,
     split: float = 0.8,
+    method: Literal["ols", "gd"] = "ols",
     lr: float = 1e-3,
     epochs: int = 1000,
     max_epochs: int | None = None,
@@ -461,6 +513,7 @@ def train_probe(
         [ProbeInput(activations, gt_belief_states, tokens,
                     gt_next_token_preds, computed_next_token_preds)],
         split=split,
+        method=method,
         lr=lr,
         epochs=epochs,
         max_epochs=max_epochs,

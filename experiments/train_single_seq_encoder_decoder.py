@@ -76,6 +76,7 @@ class TrainSingleSeqEncoderDecoderConfig(ExperimentConfig):
     seq_length: int = 1500
     post_convergence_start: int = 30
     train_eval_split: float = 0.7
+    random_split: bool = True
     balance: bool = True
     layer_indices: list[int] = field(default_factory=list)
     vocab_mapping: dict[str, int] = field(default_factory=dict)
@@ -103,30 +104,28 @@ def _compute_balanced_train_indices(
     beliefs: np.ndarray,
     emit_np: np.ndarray,
     P: int,
-    split_idx: int,
+    train_pool: np.ndarray,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray, list[int], int]:
-    """Bin train-split positions [0, split_idx) by HMM token probability p_t and
-    subsample to equal bin sizes.
+    """Bin ``train_pool`` positions by HMM token probability p_t and subsample
+    to equal bin sizes.
 
-    The eval split [split_idx, n_post_conv) is kept contiguous and untouched so
-    that training never sees eval positions. p_t for post-conv position k is:
-        belief[P-1+k] · emit_row[token[P-1+k]]
+    p_t for post-conv position k is: belief[P-1+k] · emit_row[token[P-1+k]].
 
     Returns:
-        train_idx     – balanced subset of [0, split_idx), sorted
-        p_t_train     – p_t values for all positions in [0, split_idx)
+        train_idx     – balanced subset of train_pool (sorted, indices into post-conv)
+        p_t_train     – p_t values for all positions in train_pool
         counts_before – bin counts before subsampling [surprise, ambiguous, expected]
         min_bin_cap   – per-bin size after subsampling (= min of counts_before)
     """
     p_t_train = np.array(
-        [float((beliefs[P - 1 + k] * emit_np[int(tokens[P - 1 + k])]).sum()) for k in range(split_idx)],
+        [float((beliefs[P - 1 + k] * emit_np[int(tokens[P - 1 + k])]).sum()) for k in train_pool],
         dtype=np.float32,
     )
 
     bin_indices: list[list[int]] = [[], [], []]
-    for k, p in enumerate(p_t_train):
-        bin_indices[_bin_label(float(p))].append(k)
+    for i, p in enumerate(p_t_train):
+        bin_indices[_bin_label(float(p))].append(int(train_pool[i]))
 
     counts_before = [len(b) for b in bin_indices]
     min_cap = min(counts_before)
@@ -208,12 +207,13 @@ def main() -> None:
         config.balance = False
         config.layer_indices = [l for l in DRY_RUN_LAYERS if l in config.layer_indices]
         config.experiment_name = f"{config.experiment_name}_dry_run"
-        config.encoder_params = {
-            **config.encoder_params,
-            "epochs": 60,
-            "max_epochs": 60,
-            "patience": 30,
-        }
+        if config.encoder_params.get("method", "ols") == "gd":
+            config.encoder_params = {
+                **config.encoder_params,
+                "epochs": 60,
+                "max_epochs": 60,
+                "patience": 30,
+            }
         config.decoder_params = {
             **config.decoder_params,
             "max_epochs": 300,
@@ -240,6 +240,7 @@ def main() -> None:
     logger.info(f"Device           : {device}")
     logger.info(f"Dry run          : {args.dry_run}")
     logger.info(f"Balance          : {config.balance}")
+    logger.info(f"Random split     : {config.random_split}")
     logger.info(f"N sequences      : {config.n_sequences}")
     logger.info(f"Seq length       : {L}")
     logger.info(f"Post-conv start  : {P}")
@@ -280,54 +281,71 @@ def main() -> None:
     N = all_tokens.shape[0]
 
     # ── Train / eval index computation ───────────────────────────────────────
-    # The eval split [split_idx, n_post_conv) is always a contiguous suffix —
-    # never seen during training and used as-is for eval and interventions.
-    # When balance=True: the train split [0, split_idx) is subsampled so all
-    # three p_t bins (surprise / ambiguous / expected) are equally represented.
-    # When balance=False: the full train split is used (original behaviour).
+    # random_split=True (default): per-sequence permuted split; train/eval positions
+    # are interleaved across the post-conv window. Avoids temporal-drift artifacts
+    # where contiguous-suffix eval comes from a different distribution than the
+    # earlier-position train set (mid-layer activations drift as the LLM does
+    # in-context HMM-learning, hurting linear-probe generalization).
+    # random_split=False: legacy contiguous split, train=[0, split_idx),
+    #   eval=[split_idx, n_post_conv).
+    # balance=True: bin train positions by p_t and equalize bin sizes.
     split_idx = _eval_split_idx(L, P, config.train_eval_split)
-    eval_idx_all = np.arange(split_idx, n_post_conv, dtype=np.int64)
 
     seq_train_idx: list[np.ndarray] = []
-    seq_eval_idx: list[np.ndarray] = [eval_idx_all] * N  # same contiguous suffix for every seq
+    seq_eval_idx: list[np.ndarray] = []
 
     logger.info(
-        f"Train/eval split : {split_idx} / {n_post_conv} post-conv positions"
-        f" (eval window size={n_post_conv - split_idx})"
+        f"Train/eval split : {split_idx} / {n_post_conv} post-conv positions "
+        f"(eval window size={n_post_conv - split_idx}, "
+        f"mode={'random' if config.random_split else 'contiguous'})"
     )
 
+    emit_np = build_emission_matrix(hmm) if config.balance else None
+    balance_rng = np.random.default_rng(config.random_seed) if config.balance else None
+    split_rng = np.random.default_rng(config.random_seed) if config.random_split else None
+    balance_stats: list[dict] = []
     if config.balance:
-        emit_np = build_emission_matrix(hmm)
-        balance_rng = np.random.default_rng(config.random_seed)
-        balance_stats: list[dict] = []
         logger.info("Balancing train split by p_t bin ...")
-        for seq_i in range(N):
+
+    for seq_i in range(N):
+        if config.random_split:
+            perm = split_rng.permutation(n_post_conv)
+            train_pool = np.sort(perm[:split_idx])
+            eval_pool = np.sort(perm[split_idx:])
+        else:
+            train_pool = np.arange(split_idx, dtype=np.int64)
+            eval_pool = np.arange(split_idx, n_post_conv, dtype=np.int64)
+
+        if config.balance:
             tr_idx, _p_t, counts_before, min_cap = _compute_balanced_train_indices(
                 all_tokens[seq_i], all_beliefs[seq_i], emit_np,
-                P, split_idx, balance_rng,
+                P, train_pool, balance_rng,
             )
             if min_cap == 0:
                 raise RuntimeError(
                     f"Seq {seq_i}: smallest p_t bin in the train split is empty. "
                     "Increase seq_length or train_eval_split."
                 )
-            seq_train_idx.append(tr_idx)
             balance_stats.append({
                 "seq_i": seq_i,
                 "counts_before_balance": counts_before,
                 "min_bin_cap": min_cap,
                 "n_train_balanced": int(len(tr_idx)),
-                "n_eval": int(len(eval_idx_all)),
+                "n_eval": int(len(eval_pool)),
             })
             logger.info(
                 f"  Seq {seq_i}: train bins (surprise/ambiguous/expected)={counts_before}, "
                 f"cap={min_cap} → {len(tr_idx)} balanced training positions"
             )
+        else:
+            tr_idx = train_pool
+
+        seq_train_idx.append(tr_idx)
+        seq_eval_idx.append(eval_pool)
+
+    if config.balance:
         with open(out_dir / "balance_stats.json", "w") as f:
             json.dump(balance_stats, f, indent=2)
-    else:
-        for seq_i in range(N):
-            seq_train_idx.append(np.arange(split_idx, dtype=np.int64))
 
     # ── Phase 2a: forward passes ─────────────────────────────────────────────
     act_dir = out_dir / "activations"
@@ -388,6 +406,27 @@ def main() -> None:
     enc_p = config.encoder_params
     dec_p = config.decoder_params
 
+    encoder_method = enc_p.get("method", "ols")
+    decoder_method = dec_p.get("method", "ols")
+    logger.info(f"  Encoder method   : {encoder_method}")
+    logger.info(f"  Decoder method   : {decoder_method}")
+    _GD_ONLY_ENC = {"lr", "epochs", "max_epochs", "patience", "min_relative_improvement"}
+    _GD_ONLY_DEC = {"lr", "max_epochs", "patience", "min_relative_improvement"}
+    if encoder_method != "gd":
+        stray = _GD_ONLY_ENC & enc_p.keys()
+        if stray:
+            logger.warning(
+                f"encoder_params contains GD-only keys that will be ignored "
+                f"(method={encoder_method!r}): {sorted(stray)}"
+            )
+    if decoder_method != "gd":
+        stray = _GD_ONLY_DEC & dec_p.keys()
+        if stray:
+            logger.warning(
+                f"decoder_params contains GD-only keys that will be ignored "
+                f"(method={decoder_method!r}): {sorted(stray)}"
+            )
+
     for seq_i in range(N):
         (out_dir / f"seq_{seq_i}").mkdir(parents=True, exist_ok=True)
 
@@ -408,37 +447,40 @@ def main() -> None:
         encoder_inputs: dict[tuple[int, int], ProbeInput] = {}
         decoder_inputs: dict[tuple[int, int], DecoderInput] = {}
 
-        for layer in pending_layers:
-            for seq_i in range(N):
-                acts_post_conv = np.load(act_dir / f"seq_{seq_i}_layer_{layer}.npy")
-                tr_idx = seq_train_idx[seq_i]
-                train_acts = acts_post_conv[tr_idx]
-                train_beliefs = all_beliefs[seq_i][P + tr_idx]
-                train_tokens = all_tokens[seq_i][(P - 1) + tr_idx]
-                ev_idx = seq_eval_idx[seq_i]
-                eval_acts = acts_post_conv[ev_idx]
-                eval_beliefs = all_beliefs[seq_i][P + ev_idx]
-                eval_tokens = all_tokens[seq_i][(P - 1) + ev_idx]
-                n_tr = len(tr_idx)
-                n_enc = n_tr + len(ev_idx)
+        def _load_pair(layer: int, seq_i: int) -> tuple[tuple[int, int], ProbeInput, DecoderInput]:
+            acts_post_conv = np.load(act_dir / f"seq_{seq_i}_layer_{layer}.npy")
+            tr_idx = seq_train_idx[seq_i]
+            train_acts = acts_post_conv[tr_idx]
+            train_beliefs = all_beliefs[seq_i][P + tr_idx]
+            train_tokens = all_tokens[seq_i][(P - 1) + tr_idx]
+            ev_idx = seq_eval_idx[seq_i]
+            eval_acts = acts_post_conv[ev_idx]
+            eval_beliefs = all_beliefs[seq_i][P + ev_idx]
+            eval_tokens = all_tokens[seq_i][(P - 1) + ev_idx]
+            n_tr = len(tr_idx)
+            n_enc = n_tr + len(ev_idx)
+            enc_inp = ProbeInput(
+                activations=np.concatenate([train_acts, eval_acts], axis=0),
+                gt_belief_states=np.concatenate([train_beliefs, eval_beliefs], axis=0),
+                tokens=np.concatenate([train_tokens, eval_tokens], axis=0),
+                gt_next_token_preds=np.zeros((n_enc, n_vocab), dtype=np.float32),
+                computed_next_token_preds=np.zeros((n_enc, n_vocab), dtype=np.float32),
+                split_idx=n_tr,
+            )
+            dec_inp = DecoderInput(activations=train_acts, belief_states=train_beliefs)
+            return (layer, seq_i), enc_inp, dec_inp
 
-                encoder_inputs[(layer, seq_i)] = ProbeInput(
-                    activations=np.concatenate([train_acts, eval_acts], axis=0),
-                    gt_belief_states=np.concatenate([train_beliefs, eval_beliefs], axis=0),
-                    tokens=np.concatenate([train_tokens, eval_tokens], axis=0),
-                    gt_next_token_preds=np.zeros((n_enc, n_vocab), dtype=np.float32),
-                    computed_next_token_preds=np.zeros((n_enc, n_vocab), dtype=np.float32),
-                    split_idx=n_tr,
-                )
-                decoder_inputs[(layer, seq_i)] = DecoderInput(
-                    activations=train_acts,
-                    belief_states=train_beliefs,
-                )
+        pairs = [(layer, seq_i) for layer in pending_layers for seq_i in range(N)]
+        with ThreadPoolExecutor(max_workers=min(16, len(pairs))) as pool:
+            for key, enc_inp, dec_inp in pool.map(lambda p: _load_pair(*p), pairs):
+                encoder_inputs[key] = enc_inp
+                decoder_inputs[key] = dec_inp
 
-        logger.info(f"  Training {n_pairs} encoders (max_per_batch={config.max_probes_per_batch}) ...")
+        logger.info(f"  Training {n_pairs} encoders (method={encoder_method}, max_per_batch={config.max_probes_per_batch}) ...")
         probe_results: dict[tuple[int, int], ProbeResult] = train_probes_batched(
             encoder_inputs,
             split=1.0,
+            method=encoder_method,
             lr=enc_p.get("lr", 1e-3),
             epochs=enc_p.get("epochs", 1000),
             max_epochs=enc_p.get("max_epochs"),
@@ -448,10 +490,11 @@ def main() -> None:
             max_probes_per_batch=config.max_probes_per_batch,
         )
 
-        logger.info(f"  Training {n_pairs} decoders (max_per_batch={config.max_decoders_per_batch}) ...")
+        logger.info(f"  Training {n_pairs} decoders (method={decoder_method}, max_per_batch={config.max_decoders_per_batch}) ...")
         decoder_results: dict[tuple[int, int], DecoderResult] = train_decoders_batched(
             decoder_inputs,
             split=1.0,
+            method=decoder_method,
             lr=dec_p.get("lr", 1e-3),
             max_epochs=dec_p.get("max_epochs", 50000),
             patience=dec_p.get("patience", 400),

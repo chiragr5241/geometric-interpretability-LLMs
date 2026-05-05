@@ -190,6 +190,8 @@ def decoder_loss_curves(
     path: Path,
     subtitle: str | None = None,
 ) -> None:
+    if not any(decoder_results[l].train_loss_curve for l in layer_indices if l in decoder_results):
+        return
     n = len(layer_indices)
     n_cols = min(4, n)
     n_rows = (n + n_cols - 1) // n_cols
@@ -232,6 +234,8 @@ def encoder_mse_curves(
     path: Path,
     subtitle: str | None = None,
 ) -> None:
+    if not any(probe_results[l].train_mse_curve for l in layer_indices if l in probe_results):
+        return
     n = len(layer_indices)
     n_cols = min(4, n)
     n_rows = (n + n_cols - 1) // n_cols

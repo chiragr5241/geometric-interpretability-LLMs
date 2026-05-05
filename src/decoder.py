@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import numpy as np
 import torch
@@ -103,6 +103,7 @@ class DecoderResult:
 def train_batched(
     inputs: list[DecoderInput],
     split: float = ...,
+    method: Literal["ols", "gd"] = ...,
     lr: float = ...,
     max_epochs: int = ...,
     patience: int = ...,
@@ -116,6 +117,7 @@ def train_batched(
 def train_batched(
     inputs: dict[K, DecoderInput],
     split: float = ...,
+    method: Literal["ols", "gd"] = ...,
     lr: float = ...,
     max_epochs: int = ...,
     patience: int = ...,
@@ -128,6 +130,7 @@ def train_batched(
 def train_batched(
     inputs: list[DecoderInput] | dict[Any, DecoderInput],
     split: float = 0.8,
+    method: Literal["ols", "gd"] = "ols",
     lr: float = 1e-3,
     max_epochs: int = 1000,
     patience: int = 200,
@@ -137,13 +140,13 @@ def train_batched(
 ) -> list[DecoderResult] | dict[Any, DecoderResult]:
     """Train multiple decoders in a single batched operation.
 
-    Each decoder learns an independent affine map from belief states to
-    residual-stream activations.  Training uses Adam with MSE (mean over
-    d_model dimensions) loss and an 80/20 token-position train/eval split.
+    ``method="ols"`` (default): closed-form least-squares solve via
+    ``torch.linalg.lstsq``.  One solve per decoder; no training curve is
+    produced (``train_loss_curve`` and ``eval_loss_curve`` are empty).
+    GD-only parameters (``lr``, ``max_epochs``, ``patience``,
+    ``min_relative_improvement``) are ignored.
 
-    Training stops per-decoder when eval loss has not improved by at least
-    ``min_relative_improvement`` relative to the running best for ``patience``
-    consecutive epochs, or when ``max_epochs`` is reached for all decoders.
+    ``method="gd"``: Adam gradient descent with patience-based early stopping.
 
     Dict overload: when *inputs* is a ``dict[K, DecoderInput]``, the return
     value is a ``dict[K, DecoderResult]`` with matching keys::
@@ -156,13 +159,12 @@ def train_batched(
             dict (returns dict with the same keys).  All entries must share
             the same ``d_model`` and ``n_states``.
         split: Fraction of positions used for training; the rest is eval.
-        lr: Adam learning rate.
-        max_epochs: Maximum number of gradient-descent steps.
-        patience: Number of epochs without sufficient improvement before a
-            decoder is considered converged.
-        min_relative_improvement: Minimum fractional improvement over the
-            running best eval loss required to reset the patience counter,
-            i.e. ``(best - new) / best >= min_relative_improvement``.
+        method: ``"ols"`` for closed-form least squares (default) or
+            ``"gd"`` for Adam gradient descent.
+        lr: Adam learning rate (``method="gd"`` only).
+        max_epochs: Maximum gradient-descent steps (``method="gd"`` only).
+        patience: Epochs without improvement before convergence (``method="gd"`` only).
+        min_relative_improvement: Fractional improvement threshold (``method="gd"`` only).
         device: Training device.  Defaults to CUDA > MPS > CPU.
         max_decoders_per_batch: If set, inputs are split into chunks of at
             most this size and trained sequentially, with results merged.
@@ -184,16 +186,80 @@ def train_batched(
         results_list: list[DecoderResult] = []
         for start in range(0, len(input_list), max_decoders_per_batch):
             chunk = input_list[start : start + max_decoders_per_batch]
-            results_list.extend(
-                _train_batched_impl(chunk, split, lr, max_epochs, patience, min_relative_improvement, device)
-            )
+            if method == "ols":
+                results_list.extend(_train_decoders_ols_impl(chunk, split, device))
+            else:
+                results_list.extend(
+                    _train_batched_impl(chunk, split, lr, max_epochs, patience, min_relative_improvement, device)
+                )
         if keys is not None:
             return dict(zip(keys, results_list))
         return results_list
 
-    results = _train_batched_impl(input_list, split, lr, max_epochs, patience, min_relative_improvement, device)
+    if method == "ols":
+        results = _train_decoders_ols_impl(input_list, split, device)
+    else:
+        results = _train_batched_impl(input_list, split, lr, max_epochs, patience, min_relative_improvement, device)
     if keys is not None:
         return dict(zip(keys, results))
+    return results
+
+
+def _train_decoders_ols_impl(
+    input_list: list[DecoderInput],
+    split: float,
+    device: torch.device,
+) -> list[DecoderResult]:
+    results: list[DecoderResult] = []
+    for inp in input_list:
+        sl = inp.activations.shape[0]
+        d_model = inp.activations.shape[1]
+        n_states = inp.belief_states.shape[1]
+
+        split_idx = sl if split >= 1.0 else int(sl * split)
+        split_idx = max(0, min(split_idx, sl))
+
+        X_train = torch.tensor(inp.belief_states[:split_idx], dtype=torch.float32, device=device)
+        Y_train = torch.tensor(inp.activations[:split_idx], dtype=torch.float32, device=device)
+        n_train = X_train.shape[0]
+
+        ones = torch.ones(n_train, 1, device=device)
+        X_aug = torch.cat([X_train, ones], dim=1)  # (n_train, n_states+1)
+
+        solution = torch.linalg.pinv(X_aug) @ Y_train  # (n_states+1, d_model)
+        W_T = solution[:n_states]   # (n_states, d_model)  — decoder stores W as (d_model, n_states)
+        bias = solution[n_states]   # (d_model,)
+
+        with torch.no_grad():
+            X_all = torch.tensor(inp.belief_states, dtype=torch.float32, device=device)
+            Y_all = torch.tensor(inp.activations, dtype=torch.float32, device=device)
+            preds_all = X_all @ W_T + bias  # (sl, d_model)
+            sq_err_all = ((preds_all - Y_all) ** 2).mean(dim=-1)  # (sl,)
+
+            train_loss = float(sq_err_all[:split_idx].mean().item()) if split_idx > 0 else float("nan")
+            if split_idx < sl:
+                eval_loss = float(sq_err_all[split_idx:].mean().item())
+            else:
+                eval_loss = train_loss
+
+        act_norm = float(np.linalg.norm(inp.activations, axis=-1).mean())
+        norm_sq = act_norm ** 2
+
+        decoder = Decoder(d_model, n_states)
+        decoder.W.data = W_T.T.cpu()  # (d_model, n_states)
+        decoder.bias.data = bias.cpu()
+        decoder.eval()
+
+        results.append(DecoderResult(
+            decoder=decoder,
+            train_loss_curve=[],
+            eval_loss_curve=[],
+            train_loss=train_loss,
+            eval_loss=eval_loss,
+            train_split_idx=split_idx,
+            normalized_train_loss=train_loss / (norm_sq + 1e-10),
+            normalized_eval_loss=eval_loss / (norm_sq + 1e-10),
+        ))
     return results
 
 

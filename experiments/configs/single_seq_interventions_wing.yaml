@@ -4,7 +4,7 @@ output_user: dani
 device: cuda:1
 model_n_devices: 1
 
-training_dir: "outputs/dani/20260503_030655_train_single_seq_encoder_decoder_wing"
+training_dir: "outputs/dani/20260504_193538_train_single_seq_encoder_decoder_wing"
 
 random_seed: 45
 
@@ -26,10 +26,13 @@ vocab_mapping:
   "A": 0
   "B": 1
 
-k_values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+k_values: [1, 2, 3, 5, 7, 10, 15, 25, 30, 50]
 n_random_ablation_draws: 3
 n_past_consistent_draws: 3
+n_splice_draws: 3
 n_random_patch_draws: 3
+run_with_controls: true
+n_control_draws: 1
 max_intervention_batch: 4
 max_variants_per_pass: 4
 
