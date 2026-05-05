@@ -140,9 +140,11 @@ def run_pipeline(
         arrs = seq_activations[layer]
         train_activations[layer] = concat_seqs(arrs, 0, n_train)
         test_activations[layer] = concat_seqs(arrs, n_train, config.n_sequences)
+    del seq_activations
 
     train_logits = concat_seqs(seq_logits, 0, n_train)
     test_logits = concat_seqs(seq_logits, n_train, config.n_sequences)
+    del seq_logits
 
     # HMM probs for test set
     test_obs_probs = obs_probs_all[n_train:, :seq_len_actual, :]
@@ -191,6 +193,7 @@ def run_pipeline(
             lr=config.tuned_lens_lr,
             batch_size=config.tuned_lens_batch_size,
             optimizer_name=optimizer_name,
+            use_bf16=config.use_bf16,
         )
     else:
         train_concept_logits = train_logits[:, concept_ids]
@@ -205,6 +208,7 @@ def run_pipeline(
             lr=config.tuned_lens_lr,
             batch_size=config.tuned_lens_batch_size,
             optimizer_name=optimizer_name,
+            use_bf16=config.use_bf16,
         )
 
     # HMM-target tuned lens (concept-only, trained on HMM observation probs).
@@ -229,6 +233,7 @@ def run_pipeline(
             lr=config.tuned_lens_lr,
             batch_size=config.tuned_lens_batch_size,
             optimizer_name=optimizer_name,
+            use_bf16=config.use_bf16,
         )
 
     plot_training_loss(loss_curves, figures_dir / "training_loss_model.png", label="model-target")

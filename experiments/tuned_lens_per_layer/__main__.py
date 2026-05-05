@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import sys
 from pathlib import Path
+
+import torch
 
 # Ensure src/ is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
@@ -129,7 +132,9 @@ def main() -> None:
             )
 
             config_dir = output_dir / "configs" / label
-            summary = run_pipeline(model, cfg, config_dir)
+            run_pipeline(model, cfg, config_dir)
+            gc.collect()
+            torch.cuda.empty_cache()
 
             logger.info(f"Config {label} complete.")
 
