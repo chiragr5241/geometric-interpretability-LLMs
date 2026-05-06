@@ -48,6 +48,12 @@ class TunedLensConfig:
     n_train_sequences: int = 8  # first 8 sequences for training
     # remaining sequences are held-out test
 
+    # Optional [start, end) window of token positions used for TRAINING the
+    # translators (and the belief probe). If None, all positions are used.
+    # Test/eval always uses all positions so per-position KL plots can show
+    # generalization outside the training window.
+    train_pos_window: list[int] | None = None
+
     # Tuned lens training
     tuned_lens_epochs: int = 50
     tuned_lens_lr: float = 1e-3
@@ -56,6 +62,9 @@ class TunedLensConfig:
     # The Tuned Lens paper (arXiv:2303.08112) recommends Muon as an alternative
     # to Adam for the per-layer affine translators.
     tuned_lens_optimizer: str = "adam"
+    # Use bfloat16 autocast for the translator + unembed GEMMs (A100/H100 only).
+    # Enables tensor cores (~16x faster matmuls); log_softmax/KL stay float32.
+    use_bf16: bool = False
     # If True: model-target translator is trained on the FULL model output
     # distribution (canonical tuned lens, arXiv:2303.08112).
     # If False: model-target translator is trained on concept-token logits only.

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=tuned_lens_zoo
 #SBATCH --account=bfqt-delta-gpu
-#SBATCH --partition=gpuA40x4
+#SBATCH --partition=gpuA100x4
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16

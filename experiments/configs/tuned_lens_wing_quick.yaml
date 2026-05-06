@@ -15,7 +15,8 @@ n_train_sequences: 20
 tuned_lens_epochs: 50
 tuned_lens_lr: 0.001
 tuned_lens_batch_size: 512
-tuned_lens_optimizer: muon
+tuned_lens_optimizer: adam
+use_bf16: false
 model_target_full_vocab: true
 train_hmm_target: true
 

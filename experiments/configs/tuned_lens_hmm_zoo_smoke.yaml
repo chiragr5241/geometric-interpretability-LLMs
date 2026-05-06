@@ -13,7 +13,7 @@ n_train_sequences: 4
 
 tuned_lens_epochs: 5
 tuned_lens_lr: 0.001
-tuned_lens_batch_size: 256
+tuned_lens_batch_size: 1024
 tuned_lens_optimizer: muon
 model_target_full_vocab: true
 train_hmm_target: true

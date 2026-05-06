@@ -130,19 +130,34 @@ def run_pipeline(
     n_test = config.n_sequences - n_train
     logger.info(f"Train/test split: {n_train} train, {n_test} test sequences")
 
-    def concat_seqs(seq_list: list[np.ndarray], start: int, end: int) -> np.ndarray:
-        return np.concatenate(seq_list[start:end], axis=0)
+    train_window = config.train_pos_window
+    if train_window is not None:
+        w_start, w_end = int(train_window[0]), int(train_window[1])
+        if w_end > seq_len_actual or w_start < 0 or w_start >= w_end:
+            raise ValueError(
+                f"train_pos_window {train_window} invalid for seq_length {seq_len_actual}"
+            )
+        logger.info(f"Restricting TRAINING positions to [{w_start}, {w_end})")
 
-    # Training data: flatten train sequences
+    def concat_seqs(
+        seq_list: list[np.ndarray], start: int, end: int, window: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        sliced = seq_list[start:end]
+        if window is not None:
+            ws, we = window
+            sliced = [s[ws:we] for s in sliced]
+        return np.concatenate(sliced, axis=0)
+
+    # Training data: flatten train sequences (windowed if configured)
     train_activations = {}
     test_activations = {}
     for layer in config.layer_indices:
         arrs = seq_activations[layer]
-        train_activations[layer] = concat_seqs(arrs, 0, n_train)
+        train_activations[layer] = concat_seqs(arrs, 0, n_train, window=train_window)
         test_activations[layer] = concat_seqs(arrs, n_train, config.n_sequences)
     del seq_activations
 
-    train_logits = concat_seqs(seq_logits, 0, n_train)
+    train_logits = concat_seqs(seq_logits, 0, n_train, window=train_window)
     test_logits = concat_seqs(seq_logits, n_train, config.n_sequences)
     del seq_logits
 
@@ -216,7 +231,10 @@ def run_pipeline(
     translators_hmm: dict = {}
     loss_curves_hmm: dict = {}
     if config.train_hmm_target:
-        train_obs_probs = obs_probs_all[:n_train, :seq_len_actual, :]
+        if train_window is not None:
+            train_obs_probs = obs_probs_all[:n_train, w_start:w_end, :]
+        else:
+            train_obs_probs = obs_probs_all[:n_train, :seq_len_actual, :]
         train_obs_probs_flat = train_obs_probs.reshape(-1, train_obs_probs.shape[-1])
         logger.info(
             f"Training HMM-target tuned lens (KL vs HMM ground truth, "
@@ -249,7 +267,10 @@ def run_pipeline(
     # Also train belief-state probes for the comparison plot
     from sklearn.linear_model import LinearRegression
     test_beliefs_flat = belief_states_all[n_train:, :seq_len_actual].reshape(-1, belief_states_all.shape[-1])
-    train_beliefs_flat = belief_states_all[:n_train, :seq_len_actual].reshape(-1, belief_states_all.shape[-1])
+    if train_window is not None:
+        train_beliefs_flat = belief_states_all[:n_train, w_start:w_end].reshape(-1, belief_states_all.shape[-1])
+    else:
+        train_beliefs_flat = belief_states_all[:n_train, :seq_len_actual].reshape(-1, belief_states_all.shape[-1])
 
     r2_per_layer: dict[int, float] = {}
     for layer in config.layer_indices:

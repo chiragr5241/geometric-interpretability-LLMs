@@ -26,7 +26,8 @@ n_train_sequences: 20
 tuned_lens_epochs: 50
 tuned_lens_lr: 0.001
 tuned_lens_batch_size: 512
-tuned_lens_optimizer: muon          # "adam" or "muon"
+tuned_lens_optimizer: adam          # "adam" or "muon"
+use_bf16: false
 model_target_full_vocab: true       # canonical full-vocab KL against model-final
 train_hmm_target: true              # also fit a translator with KL vs HMM ground truth
 

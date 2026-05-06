@@ -83,5 +83,6 @@ outputs/*
 
 # Logs
 *.log
+slurm_logs/
 
 

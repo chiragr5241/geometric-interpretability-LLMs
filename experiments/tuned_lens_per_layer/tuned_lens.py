@@ -121,6 +121,7 @@ def train_tuned_lens(
     lr: float = 1e-3,
     batch_size: int = 512,
     optimizer_name: str = "adam",
+    use_bf16: bool = False,
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
     """Train one TunedLensTranslator per layer (faithful full-vocabulary version).
 
@@ -149,13 +150,13 @@ def train_tuned_lens(
 
     target_log_probs = F.log_softmax(
         torch.tensor(target_logits, dtype=torch.float32), dim=-1
-    )
+    ).to(device)  # pre-load once: eliminates ~262 MB PCIe transfer per batch
 
     translators: dict[int, TunedLensTranslator] = {}
     loss_curves: dict[int, list[float]] = {}
 
     for layer in tqdm(layers, desc="Training tuned lens"):
-        acts = torch.tensor(activations_by_layer[layer], dtype=torch.float32)
+        acts = torch.tensor(activations_by_layer[layer], dtype=torch.float32).to(device)
         n = acts.shape[0]
 
         translator = TunedLensTranslator(d_model).to(device)
@@ -164,20 +165,22 @@ def train_tuned_lens(
 
         epoch_losses = []
         for epoch in range(n_epochs):
-            perm = torch.randperm(n)
+            perm = torch.randperm(n, device=device)
             epoch_loss = 0.0
             n_batches = 0
 
             for start in range(0, n, batch_size):
                 idx = perm[start : start + batch_size]
-                acts_batch = acts[idx].to(device)
-                target_batch = target_log_probs[idx].to(device)
+                acts_batch = acts[idx]
+                target_batch = target_log_probs[idx]
 
                 optimizer.zero_grad()
-                h = translator(acts_batch)
-                normed = model.ln_final(h)
-                full_logits = normed @ W_U + b_U
-                log_probs = F.log_softmax(full_logits, dim=-1)
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    h = translator(acts_batch)
+                    normed = model.ln_final(h)
+                    full_logits = normed @ W_U + b_U
+                # cast to float32 before log_softmax: bfloat16 lacks precision over 128K classes
+                log_probs = F.log_softmax(full_logits.float(), dim=-1)
 
                 loss = F.kl_div(log_probs, target_batch, reduction="batchmean", log_target=True)
                 loss.backward()
@@ -211,6 +214,7 @@ def train_tuned_lens_concept(
     lr: float = 1e-3,
     batch_size: int = 512,
     optimizer_name: str = "adam",
+    use_bf16: bool = False,
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
     """Train one TunedLensTranslator per layer using concept-token logits only.
 
@@ -232,13 +236,13 @@ def train_tuned_lens_concept(
     b_c = model.unembed.b_U[concept_ids].detach().to(device)
 
     target = torch.as_tensor(target_concept_values, dtype=torch.float32)
-    target_probs = target if target_is_probs else F.softmax(target, dim=-1)
+    target_probs = (target if target_is_probs else F.softmax(target, dim=-1)).to(device)
 
     translators: dict[int, TunedLensTranslator] = {}
     loss_curves: dict[int, list[float]] = {}
 
     for layer in tqdm(layers, desc="Training tuned lens (concept)"):
-        acts = torch.tensor(activations_by_layer[layer], dtype=torch.float32)
+        acts = torch.tensor(activations_by_layer[layer], dtype=torch.float32).to(device)
         n = acts.shape[0]
 
         translator = TunedLensTranslator(d_model).to(device)
@@ -247,22 +251,23 @@ def train_tuned_lens_concept(
 
         epoch_losses = []
         for epoch in range(n_epochs):
-            perm = torch.randperm(n)
+            perm = torch.randperm(n, device=device)
             epoch_loss = 0.0
             n_batches = 0
 
             for start in range(0, n, batch_size):
                 idx = perm[start : start + batch_size]
-                acts_batch = acts[idx].to(device)
-                target_batch = target_probs[idx].to(device)
+                acts_batch = acts[idx]
+                target_batch = target_probs[idx]
 
                 optimizer.zero_grad()
-                h = translator(acts_batch)
-                normed = model.ln_final(h)
-                concept_logit = normed @ W_c + b_c
-                log_probs = F.log_softmax(concept_logit, dim=-1)
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    h = translator(acts_batch)
+                    normed = model.ln_final(h)
+                    concept_logit = normed @ W_c + b_c
+                log_probs = F.log_softmax(concept_logit.float(), dim=-1)
 
-                loss = F.kl_div(log_probs, target_batch, reduction="batchmean")
+                loss = F.kl_div(log_probs, target_batch.float(), reduction="batchmean")
                 loss.backward()
                 optimizer.step()
 
