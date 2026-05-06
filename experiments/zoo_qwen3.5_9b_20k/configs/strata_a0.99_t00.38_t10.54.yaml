@@ -1,0 +1,21 @@
+experiment_name: strata_a0.99_t00.38_t10.54
+process_name: strata
+process_params: {a: 0.99, t0: 0.38, t1: 0.54}
+vocab_tokens: ["F", "Q"]
+model_name: "Qwen/Qwen3.5-9B"
+n_ctx_override: 20500
+seq_length: 20000
+n_sequences: 10
+random_seed: 42
+layer_indices: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+n_train_sequences: 6
+train_pos_window: [15000, 20000]
+tuned_lens_epochs: 50
+tuned_lens_lr: 0.001
+tuned_lens_batch_size: 512
+tuned_lens_optimizer: adam
+use_bf16: false
+forward_chunk_size: 2048
+train_tuned_full: true
+train_tuned_concept: true
+train_tuned_hmm: true

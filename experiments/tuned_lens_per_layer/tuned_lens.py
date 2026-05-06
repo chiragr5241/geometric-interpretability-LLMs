@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import numpy as np
 import torch
@@ -10,6 +11,13 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_secs(s: float) -> str:
+    if s < 60:
+        return f"{s:.1f}s"
+    m, s = divmod(s, 60)
+    return f"{int(m)}m{s:04.1f}s"
 
 
 @torch.no_grad()
@@ -116,7 +124,7 @@ def train_tuned_lens(
     activations_by_layer: dict[int, np.ndarray],
     model,
     layers: list[int],
-    target_logits: np.ndarray,
+    target_final_resid: np.ndarray,
     n_epochs: int = 50,
     lr: float = 1e-3,
     batch_size: int = 512,
@@ -129,18 +137,20 @@ def train_tuned_lens(
         softmax(unembed(ln_final(T_l(h_l))))
     matches the model's full output distribution via KL(p_model || p_lens).
 
+    Memory-optimized: instead of pre-storing the full ``(N, vocab_size)``
+    target log-probabilities tensor (≈24 GB for Qwen-9B at 24K positions),
+    we cache the final-layer residual ``(N, d_model)`` (≈0.4 GB) and recompute
+    the target log_softmax per batch. The unembed matmul is cheap (~3 ms on
+    A40 for batch=512, vocab=248K) and removes the dominant memory footprint.
+
     Parameters
     ----------
     activations_by_layer : dict mapping layer index -> (N, d_model) array
     model : HookedTransformer
     layers : list of layer indices to train
-    target_logits : (N, vocab_size) full model logits from the final layer
+    target_final_resid : (N, d_model) cached final-layer residual whose
+        ``ln_final + unembed + softmax`` defines the target distribution
     n_epochs, lr, batch_size : training hyperparameters
-
-    Returns
-    -------
-    translators : dict mapping layer -> trained TunedLensTranslator
-    loss_curves : dict mapping layer -> list of per-epoch mean KL loss
     """
     device = model.unembed.W_U.device
     d_model = model.cfg.d_model
@@ -148,16 +158,20 @@ def train_tuned_lens(
     W_U = model.unembed.W_U.detach()
     b_U = model.unembed.b_U.detach()
 
-    target_log_probs = F.log_softmax(
-        torch.tensor(target_logits, dtype=torch.float32), dim=-1
-    ).to(device)  # pre-load once: eliminates ~262 MB PCIe transfer per batch
+    # Cache final residual on GPU once (small: N * d_model * 4 bytes).
+    target_resid_gpu = torch.from_numpy(target_final_resid).to(
+        device=device, dtype=torch.float32
+    )
+    n = target_resid_gpu.shape[0]
 
     translators: dict[int, TunedLensTranslator] = {}
     loss_curves: dict[int, list[float]] = {}
 
     for layer in tqdm(layers, desc="Training tuned lens"):
-        acts = torch.tensor(activations_by_layer[layer], dtype=torch.float32).to(device)
-        n = acts.shape[0]
+        layer_t0 = time.time()
+        acts = torch.from_numpy(activations_by_layer[layer]).to(
+            device=device, dtype=torch.float32
+        )
 
         translator = TunedLensTranslator(d_model).to(device)
         optimizer = _make_optimizer(optimizer_name, translator.parameters(), lr)
@@ -172,17 +186,28 @@ def train_tuned_lens(
             for start in range(0, n, batch_size):
                 idx = perm[start : start + batch_size]
                 acts_batch = acts[idx]
-                target_batch = target_log_probs[idx]
+
+                # Compute target log-probs for this batch from cached residuals.
+                with torch.no_grad():
+                    target_resid_batch = target_resid_gpu[idx]
+                    normed_t = model.ln_final(target_resid_batch)
+                    target_logits = normed_t @ W_U + b_U
+                    target_log_probs_batch = F.log_softmax(
+                        target_logits.float(), dim=-1
+                    )
 
                 optimizer.zero_grad()
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     h = translator(acts_batch)
                     normed = model.ln_final(h)
                     full_logits = normed @ W_U + b_U
-                # cast to float32 before log_softmax: bfloat16 lacks precision over 128K classes
+                # cast to float32 before log_softmax: bfloat16 lacks precision over large vocabs
                 log_probs = F.log_softmax(full_logits.float(), dim=-1)
 
-                loss = F.kl_div(log_probs, target_batch, reduction="batchmean", log_target=True)
+                loss = F.kl_div(
+                    log_probs, target_log_probs_batch,
+                    reduction="batchmean", log_target=True,
+                )
                 loss.backward()
                 optimizer.step()
 
@@ -196,10 +221,18 @@ def train_tuned_lens(
         for p in translators[layer].parameters():
             p.requires_grad = False
         loss_curves[layer] = epoch_losses
+        del acts
         torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-        logger.info(f"  Layer {layer:2d}: final KL = {epoch_losses[-1]:.4f}")
+        logger.info(
+            f"  Layer {layer:2d}: final KL = {epoch_losses[-1]:.4f}  "
+            f"(took {_fmt_secs(time.time() - layer_t0)})"
+        )
 
+    del target_resid_gpu
+    torch.cuda.empty_cache()
     return translators, loss_curves
 
 
@@ -242,7 +275,10 @@ def train_tuned_lens_concept(
     loss_curves: dict[int, list[float]] = {}
 
     for layer in tqdm(layers, desc="Training tuned lens (concept)"):
-        acts = torch.tensor(activations_by_layer[layer], dtype=torch.float32).to(device)
+        layer_t0 = time.time()
+        acts = torch.from_numpy(activations_by_layer[layer]).to(
+            device=device, dtype=torch.float32,
+        )
         n = acts.shape[0]
 
         translator = TunedLensTranslator(d_model).to(device)
@@ -281,11 +317,55 @@ def train_tuned_lens_concept(
         for p in translators[layer].parameters():
             p.requires_grad = False
         loss_curves[layer] = epoch_losses
+        del acts
         torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-        logger.info(f"  Layer {layer:2d}: final KL = {epoch_losses[-1]:.4f}")
+        logger.info(
+            f"  Layer {layer:2d}: final KL = {epoch_losses[-1]:.4f}  "
+            f"(took {_fmt_secs(time.time() - layer_t0)})"
+        )
 
     return translators, loss_curves
+
+
+def _concept_softmax_fp32(
+    h: torch.Tensor,
+    model,
+    W_c_fp32: torch.Tensor,
+    b_c_fp32: torch.Tensor,
+) -> torch.Tensor:
+    """Apply ln_final + concept-only unembed + softmax, all in fp32.
+
+    Casts the layer-norm output explicitly to fp32 before the matmul so we
+    never go through the fp16 path here — that path was the source of
+    spurious +inf in early-layer KL(HMM || logit) seen in old runs.
+    """
+    normed = model.ln_final(h).to(torch.float32)
+    concept_logits = normed @ W_c_fp32 + b_c_fp32
+    return F.softmax(concept_logits, dim=-1)
+
+
+def _check_finite(probs: np.ndarray, where: str, layer: int | None = None) -> np.ndarray:
+    """Defense in depth: replace any non-finite probs with a uniform row.
+
+    Logs a warning with offending row counts so silent corruption never
+    propagates into the metrics.
+    """
+    if np.isfinite(probs).all():
+        return probs
+    bad_rows = ~np.isfinite(probs).all(axis=-1)
+    n_bad = int(bad_rows.sum())
+    n_concepts = probs.shape[-1]
+    layer_str = f"layer={layer}" if layer is not None else "?"
+    logger.warning(
+        f"{where} ({layer_str}): {n_bad}/{len(probs)} rows had non-finite probs; "
+        f"replacing with uniform 1/{n_concepts}"
+    )
+    probs = probs.copy()
+    probs[bad_rows] = 1.0 / n_concepts
+    return probs
 
 
 def apply_logit_lens(
@@ -293,34 +373,27 @@ def apply_logit_lens(
     model,
     concept_ids: list[int],
     batch_size: int = 1024,
+    layer: int | None = None,
 ) -> np.ndarray:
     """Apply the raw logit lens (no training): ln_final + unembed -> concept probs.
 
-    Parameters
-    ----------
-    activations : (N, d_model)
-    model : HookedTransformer
-    concept_ids : LLM token IDs for HMM emission symbols
-
-    Returns
-    -------
-    probs : (N, n_concepts) softmax probabilities over concept tokens
+    Concept-only softmax (renormalized over HMM emission tokens). Computed
+    end-to-end in fp32 to avoid the fp16 overflow path that produced spurious
+    +inf KL values in old runs.
     """
     device = model.unembed.W_U.device
-    W_concept = model.unembed.W_U[:, concept_ids].detach()
-    b_concept = model.unembed.b_U[concept_ids].detach()
+    W_c = model.unembed.W_U[:, concept_ids].detach().to(torch.float32)
+    b_c = model.unembed.b_U[concept_ids].detach().to(torch.float32)
 
-    acts_t = torch.tensor(activations, dtype=torch.float32)
+    acts_t = torch.from_numpy(np.ascontiguousarray(activations)).to(torch.float32)
     probs_list = []
 
     with torch.no_grad():
         for start in range(0, acts_t.shape[0], batch_size):
             batch = acts_t[start : start + batch_size].to(device)
-            normed = model.ln_final(batch)
-            concept_logits = normed @ W_concept + b_concept
-            probs_list.append(F.softmax(concept_logits, dim=-1).cpu().numpy())
+            probs_list.append(_concept_softmax_fp32(batch, model, W_c, b_c).cpu().numpy())
 
-    return np.concatenate(probs_list, axis=0)
+    return _check_finite(np.concatenate(probs_list, axis=0), "apply_logit_lens", layer)
 
 
 def apply_tuned_lens(
@@ -329,38 +402,25 @@ def apply_tuned_lens(
     model,
     concept_ids: list[int],
     batch_size: int = 1024,
+    layer: int | None = None,
 ) -> np.ndarray:
-    """Apply a trained tuned lens translator -> concept probs.
-
-    Parameters
-    ----------
-    activations : (N, d_model)
-    translator : trained TunedLensTranslator
-    model : HookedTransformer
-    concept_ids : LLM token IDs for HMM emission symbols
-
-    Returns
-    -------
-    probs : (N, n_concepts)
-    """
+    """Apply a trained tuned lens translator -> concept probs (fp32 throughout)."""
     device = model.unembed.W_U.device
-    W_concept = model.unembed.W_U[:, concept_ids].detach()
-    b_concept = model.unembed.b_U[concept_ids].detach()
+    W_c = model.unembed.W_U[:, concept_ids].detach().to(torch.float32)
+    b_c = model.unembed.b_U[concept_ids].detach().to(torch.float32)
     translator_dev = translator.to(device)
 
-    acts_t = torch.tensor(activations, dtype=torch.float32)
+    acts_t = torch.from_numpy(np.ascontiguousarray(activations)).to(torch.float32)
     probs_list = []
 
     with torch.no_grad():
         for start in range(0, acts_t.shape[0], batch_size):
             batch = acts_t[start : start + batch_size].to(device)
             h = translator_dev(batch)
-            normed = model.ln_final(h)
-            concept_logits = normed @ W_concept + b_concept
-            probs_list.append(F.softmax(concept_logits, dim=-1).cpu().numpy())
+            probs_list.append(_concept_softmax_fp32(h, model, W_c, b_c).cpu().numpy())
 
     translator.cpu()
-    return np.concatenate(probs_list, axis=0)
+    return _check_finite(np.concatenate(probs_list, axis=0), "apply_tuned_lens", layer)
 
 
 def apply_tuned_lens_full_logits(
@@ -380,7 +440,7 @@ def apply_tuned_lens_full_logits(
     b_U = model.unembed.b_U.detach()
     translator_dev = translator.to(device)
 
-    acts_t = torch.tensor(activations, dtype=torch.float32)
+    acts_t = torch.from_numpy(np.ascontiguousarray(activations)).to(torch.float32)
     logits_list = []
 
     with torch.no_grad():

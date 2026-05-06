@@ -1,0 +1,20 @@
+experiment_name: spiral_a0.09
+process_name: spiral
+process_params: {a: 0.09}
+vocab_tokens: ["F", "Q"]
+model_name: "Qwen/Qwen3.5-4B"
+n_ctx_override: 5300
+seq_length: 5000
+n_sequences: 20
+random_seed: 42
+layer_indices: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+n_train_sequences: 12
+train_pos_window: [3000, 5000]
+tuned_lens_epochs: 50
+tuned_lens_lr: 0.001
+tuned_lens_batch_size: 512
+tuned_lens_optimizer: adam
+use_bf16: false
+forward_chunk_size: 2048
+model_target_full_vocab: true
+train_hmm_target: true

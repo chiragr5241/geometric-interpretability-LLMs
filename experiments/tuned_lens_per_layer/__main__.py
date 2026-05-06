@@ -5,6 +5,7 @@ import argparse
 import gc
 import logging
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -77,8 +78,9 @@ def main() -> None:
 
     if not config.sweeps:
         # Single config mode (backwards compatible)
+        t0 = time.time()
         summary = run_pipeline(model, config, output_dir)
-        logger.info("Experiment complete.")
+        logger.info(f"Experiment complete. Total: {time.time() - t0:.1f}s")
         logger.info(f"Results saved to: {output_dir}")
     else:
         # Sweep mode: iterate over all process + param combinations
@@ -103,10 +105,13 @@ def main() -> None:
         for i, (pname, params, vocab) in enumerate(all_configs):
             logger.info(f"  [{i+1}/{total}] {pname}: {params} vocab={vocab}")
 
+        sweep_t0 = time.time()
+        per_config_times: list[float] = []
         for i, (process_name, params, vocab) in enumerate(all_configs):
             label = make_config_label(process_name, params)
+            cfg_t0 = time.time()
             logger.info(f"\n{'='*60}")
-            logger.info(f"Config [{i+1}/{total}]: {label}")
+            logger.info(f"Config [{i+1}/{total}]: {label}  (started at {time.strftime('%H:%M:%S')})")
             logger.info(f"{'='*60}")
 
             # Create a per-config copy of the config
@@ -126,8 +131,14 @@ def main() -> None:
                 tuned_lens_lr=config.tuned_lens_lr,
                 tuned_lens_batch_size=config.tuned_lens_batch_size,
                 tuned_lens_optimizer=config.tuned_lens_optimizer,
-                model_target_full_vocab=config.model_target_full_vocab,
+                use_bf16=config.use_bf16,
+                forward_chunk_size=config.forward_chunk_size,
+                train_pos_window=config.train_pos_window,
+                train_tuned_full=config.train_tuned_full,
+                train_tuned_concept=config.train_tuned_concept,
+                train_tuned_hmm=config.train_tuned_hmm,
                 train_hmm_target=config.train_hmm_target,
+                model_target_full_vocab=config.model_target_full_vocab,
                 results_dir=config.results_dir,
             )
 
@@ -136,9 +147,16 @@ def main() -> None:
             gc.collect()
             torch.cuda.empty_cache()
 
-            logger.info(f"Config {label} complete.")
+            cfg_dt = time.time() - cfg_t0
+            per_config_times.append(cfg_dt)
+            avg = sum(per_config_times) / len(per_config_times)
+            remaining = avg * (total - i - 1)
+            logger.info(
+                f"Config {label} complete in {cfg_dt:.1f}s "
+                f"(avg {avg:.1f}s/cfg, ETA {remaining/60:.1f}m for remaining {total - i - 1})"
+            )
 
-        logger.info(f"\nAll {total} configurations complete.")
+        logger.info(f"\nAll {total} configurations complete in {(time.time() - sweep_t0)/60:.1f} min.")
         logger.info(f"Results saved to: {output_dir}")
 
 

@@ -65,13 +65,27 @@ class TunedLensConfig:
     # Use bfloat16 autocast for the translator + unembed GEMMs (A100/H100 only).
     # Enables tensor cores (~16x faster matmuls); log_softmax/KL stay float32.
     use_bf16: bool = False
-    # If True: model-target translator is trained on the FULL model output
-    # distribution (canonical tuned lens, arXiv:2303.08112).
-    # If False: model-target translator is trained on concept-token logits only.
-    model_target_full_vocab: bool = True
-    # Whether to also train an HMM-ground-truth target translator
-    # (KL against true HMM next-token distribution).
-    train_hmm_target: bool = True
+    # Chunk size for the KV-cached forward pass. Smaller chunks reduce peak
+    # forward-pass activation memory at the cost of more KV-cache append calls.
+    # 2048 is a good default for A40 (48 GB) with 8-9B models; raise to 4096
+    # on A100 for slightly better throughput.
+    forward_chunk_size: int = 2048
+    # Tuned-lens variants to train (each adds one set of per-layer translators
+    # and one row in the by-layer plots). Logit lens is always evaluated.
+    #
+    #   tuned_full     model-target, full-vocabulary KL (canonical, arXiv:2303.08112)
+    #   tuned_concept  model-target, concept-only-softmax KL
+    #   tuned_hmm      HMM-target, concept-only-softmax KL
+    train_tuned_full: bool = True
+    train_tuned_concept: bool = True
+    train_tuned_hmm: bool = True
+    # Backwards-compatible alias for older YAMLs that still set this flag.
+    # When True, ``train_hmm_target`` overrides ``train_tuned_hmm``.
+    train_hmm_target: bool | None = None
+    # Deprecated; kept so old YAMLs load. The value is ignored — both
+    # full-vocab and concept-only model-target lenses are trained when their
+    # respective flags are True.
+    model_target_full_vocab: bool | None = None
 
     # Output
     output_user: str = "SPAR"
