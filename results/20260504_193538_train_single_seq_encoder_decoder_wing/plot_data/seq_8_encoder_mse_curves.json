@@ -1,0 +1,117 @@
+{
+  "seq_i": 8,
+  "layers": {
+    "0": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "1": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "2": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "3": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "4": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "5": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "6": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "7": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "8": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "9": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "10": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "11": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "12": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "13": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "14": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "15": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "16": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "17": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "18": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "19": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "20": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "21": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "22": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "23": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "24": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "25": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "26": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    },
+    "27": {
+      "train_mse_curve": [],
+      "eval_mse_curve": []
+    }
+  }
+}

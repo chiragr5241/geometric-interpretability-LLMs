@@ -5,19 +5,28 @@ Four figures: (patching | steering) × (all_conds | xavier3)
 Layout: 2 rows (Strata, Wing) × 3 columns (k = 1, 5, 10).
 Y-axis: absolute KL to target after intervention (log scale, nats).
 Gray dashed horizontal line: unmodified model baseline (baseline_mean).
-Orange dashed line: averaged random-direction control across principled conditions.
+Orange line: averaged random-direction control across principled conditions.
 
 Usage (from repo root):
-    .venv/bin/python experiments/plot_xavier_figure.py
+    .venv/bin/python experiments/plot_interventions_vs_control.py
 """
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import seaborn as sns
+
+matplotlib.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['DejaVu Sans'],
+    'font.weight': 'light',
+})
+sns.set_context('notebook')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -35,7 +44,6 @@ PRINCIPLED = ["optimal", "past_consistent", "splice"]
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
-# All-conditions variant (orange reserved for control line)
 ALL_COLORS: dict[str, str] = {
     "optimal":         "#1f77b4",
     "round_trip":      "#8c564b",
@@ -51,7 +59,6 @@ ALL_LABELS: dict[str, str] = {
     "random":          "random (belief)",
 }
 
-# Xavier variant: 3 lines only
 XAVIER_COLORS: dict[str, str] = {
     "past_consistent": "#000000",
     "splice":          "#1f77b4",
@@ -61,8 +68,8 @@ XAVIER_LABELS: dict[str, str] = {
     "splice":          "past-inconsistent",
 }
 
-CONTROL_COLOR  = "#ff7f0e"   # orange — averaged random-direction control
-BASELINE_COLOR = "gray"      # unmodified model KL
+CONTROL_COLOR  = "#ff7f0e"
+BASELINE_COLOR = "gray"
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
@@ -76,26 +83,23 @@ def layer_stats(
     cond: str,
     k: int,
     layers: list[int],
-) -> tuple[list[float], list[float]]:
-    """Return (means, stderrs) over layers for a given condition/k."""
+) -> tuple[np.ndarray, np.ndarray]:
     k_str = str(k)
     means, stderrs = [], []
     for l in layers:
         e = metric[cond][k_str].get(str(l), {})
         means.append(e.get("mean", float("nan")))
         stderrs.append(e.get("stderr", float("nan")))
-    return means, stderrs
+    return np.array(means), np.array(stderrs)
 
 
 def control_avg(
     ctrl: dict,
     k: int,
     layers: list[int],
-) -> tuple[list[float], list[float]]:
-    """Average control means and stderrs over all PRINCIPLED conditions."""
+) -> tuple[np.ndarray, np.ndarray]:
     k_str = str(k)
-    m_rows: list[list[float]] = []
-    s_rows: list[list[float]] = []
+    m_rows, s_rows = [], []
     for cond in PRINCIPLED:
         if cond not in ctrl:
             continue
@@ -107,27 +111,18 @@ def control_avg(
         m_rows.append(ms)
         s_rows.append(ss)
     if not m_rows:
-        nan = [float("nan")] * len(layers)
+        nan = np.full(len(layers), float("nan"))
         return nan, nan
-    return (
-        list(np.nanmean(m_rows, axis=0)),
-        list(np.nanmean(s_rows, axis=0)),
-    )
-
-
-def _rgba(hex_color: str, alpha: float) -> str:
-    h = hex_color.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return f"rgba({r},{g},{b},{alpha})"
+    return np.nanmean(m_rows, axis=0), np.nanmean(s_rows, axis=0)
 
 
 # ── Figure builder ────────────────────────────────────────────────────────────
 
 def make_figure(
     datasets: dict[str, dict],
-    intervention: str,   # "patching" | "steering"
-    variant: str,        # "all" | "xavier"
-) -> go.Figure:
+    intervention: str,
+    variant: str,
+) -> plt.Figure:
     model_names = list(datasets.keys())
     n_rows = len(model_names)
     n_cols = len(K_COLS)
@@ -148,158 +143,90 @@ def make_figure(
         colors = ALL_COLORS
         labels = ALL_LABELS
 
-    # Column headers in row 1 only; row 2 gets empty strings
-    subplot_titles = [f"k = {k}" for k in K_COLS] + [""] * n_cols
-
-    fig = make_subplots(
-        rows=n_rows,
-        cols=n_cols,
-        subplot_titles=subplot_titles,
-        shared_xaxes=False,
-        shared_yaxes=False,
-        vertical_spacing=0.15,
-        horizontal_spacing=0.07,
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(4.5 * n_cols + 1.5, 3.5 * n_rows + 1.5),
+        squeeze=False,
     )
+    fig.patch.set_facecolor('white')
 
-    shown_in_legend: set[str] = set()
+    legend_elements: OrderedDict = OrderedDict()
 
     for ri, model_name in enumerate(model_names):
         data   = datasets[model_name]
         m      = data["metrics"]
         bm     = float(data["baseline_mean"])
         layers = [int(l) for l in data["layer_indices"]]
-        xs     = [str(l) for l in layers]
 
         for ci, k in enumerate(K_COLS):
-            row, col = ri + 1, ci + 1
+            ax = axes[ri, ci]
 
-            # ── Gray dashed baseline ──────────────────────────────────────────
+            if ri == 0:
+                ax.set_title(f"k = {k}", fontsize=23, pad=18)
+
+            # Baseline
             bl_label = "unmodified model"
-            show_bl = bl_label not in shown_in_legend
-            if show_bl:
-                shown_in_legend.add(bl_label)
-            fig.add_trace(go.Scatter(
-                x=xs,
-                y=[bm] * len(xs),
-                mode="lines",
-                line=dict(color=BASELINE_COLOR, dash="dash", width=1.5),
-                name=bl_label,
-                legendgroup=bl_label,
-                showlegend=show_bl,
-            ), row=row, col=col)
+            h = ax.axhline(bm, color=BASELINE_COLOR, ls="--", lw=2)
+            if bl_label not in legend_elements:
+                legend_elements[bl_label] = h
 
-            # ── Condition lines ───────────────────────────────────────────────
+            # Condition lines
             for cond in conds:
                 if cond not in m.get(target_key, {}):
                     continue
                 means, stderrs = layer_stats(m[target_key], cond, k, layers)
                 color = colors[cond]
                 label = labels[cond]
-                show  = label not in shown_in_legend
-                if show:
-                    shown_in_legend.add(label)
+                upper = means + stderrs
+                lower = np.maximum(means - stderrs, 1e-7)
+                ax.fill_between(layers, upper, lower, color=color, alpha=0.15, linewidth=0)
+                (h,) = ax.plot(layers, means, color=color, lw=5)
+                if label not in legend_elements:
+                    legend_elements[label] = h
 
-                upper = [mn + se for mn, se in zip(means, stderrs)]
-                lower = [max(mn - se, 1e-7) for mn, se in zip(means, stderrs)]
-
-                fig.add_trace(go.Scatter(
-                    x=xs + xs[::-1],
-                    y=upper + lower[::-1],
-                    fill="toself",
-                    fillcolor=_rgba(color, 0.12),
-                    line=dict(width=0),
-                    showlegend=False,
-                    hoverinfo="skip",
-                    legendgroup=label,
-                ), row=row, col=col)
-
-                fig.add_trace(go.Scatter(
-                    x=xs,
-                    y=means,
-                    mode="lines",
-                    line=dict(color=color, width=2),
-                    name=label,
-                    legendgroup=label,
-                    showlegend=show,
-                ), row=row, col=col)
-
-            # ── Averaged control (solid orange) ───────────────────────────────
+            # Control
             if ctrl_key in m:
                 ctrl_means, ctrl_stderrs = control_avg(m[ctrl_key], k, layers)
-                ctrl_upper = [mn + se for mn, se in zip(ctrl_means, ctrl_stderrs)]
-                ctrl_lower = [max(mn - se, 1e-7) for mn, se in zip(ctrl_means, ctrl_stderrs)]
+                ctrl_upper = ctrl_means + ctrl_stderrs
+                ctrl_lower = np.maximum(ctrl_means - ctrl_stderrs, 1e-7)
                 ctrl_label = "random control"
-                show_ctrl  = ctrl_label not in shown_in_legend
-                if show_ctrl:
-                    shown_in_legend.add(ctrl_label)
+                ax.fill_between(layers, ctrl_upper, ctrl_lower,
+                                color=CONTROL_COLOR, alpha=0.15, linewidth=0)
+                (h,) = ax.plot(layers, ctrl_means, color=CONTROL_COLOR, lw=5)
+                if ctrl_label not in legend_elements:
+                    legend_elements[ctrl_label] = h
 
-                fig.add_trace(go.Scatter(
-                    x=xs + xs[::-1],
-                    y=ctrl_upper + ctrl_lower[::-1],
-                    fill="toself",
-                    fillcolor=_rgba(CONTROL_COLOR, 0.12),
-                    line=dict(width=0),
-                    showlegend=False,
-                    hoverinfo="skip",
-                    legendgroup=ctrl_label,
-                ), row=row, col=col)
+            ax.set_yscale("log")
+            ax.set_xlabel("Layer", fontsize=22, labelpad=14)
+            ax.tick_params(axis="both", labelsize=22, length=3)
+            ax.grid(True, alpha=0.2, linewidth=0.5)
 
-                fig.add_trace(go.Scatter(
-                    x=xs,
-                    y=ctrl_means,
-                    mode="lines",
-                    line=dict(color=CONTROL_COLOR, width=2),
-                    name=ctrl_label,
-                    legendgroup=ctrl_label,
-                    showlegend=show_ctrl,
-                ), row=row, col=col)
+        axes[ri, 0].set_ylabel(f"{model_name}\nKL [nats]", fontsize=22)
 
-        # ── Row label: model name as y-axis title of leftmost subplot ─────────
-        fig.update_yaxes(
-            type="log",
-            title_text=f"<b>{model_name}</b><br>KL [nats]",
-            row=ri + 1, col=1,
-        )
-        for ci in range(2, n_cols + 1):
-            fig.update_yaxes(type="log", title_text="", row=ri + 1, col=ci)
+    handles = list(legend_elements.values())
+    lbls    = list(legend_elements.keys())
+    fig.legend(handles, lbls,
+               loc="lower center", ncol=len(handles),
+               fontsize=22, frameon=False,
+               bbox_to_anchor=(0.5, -0.12))
 
-    # X-axis labels
-    for ri in range(1, n_rows + 1):
-        for ci in range(1, n_cols + 1):
-            fig.update_xaxes(title_text="Layer", row=ri, col=ci)
-
-    v_label = (
-        "all conditions"
-        if variant == "all"
-        else "past-consistent / past-inconsistent / control"
-    )
-    fig.update_layout(
-        height=380 * n_rows,
-        width=320 * n_cols + 180,
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.1,
-            xanchor="center",
-            x=0.5,
-            font=dict(size=11),
-        ),
-        margin=dict(t=80, b=130, l=90, r=40),
-    )
+    plt.tight_layout(w_pad=0)
     return fig
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
-def save_fig(fig: go.Figure, stem: Path) -> None:
+def save_fig(fig: plt.Figure, stem: Path) -> None:
     stem.parent.mkdir(parents=True, exist_ok=True)
     for ext in ("pdf", "png"):
         p = stem.with_suffix(f".{ext}")
         try:
-            fig.write_image(str(p), scale=2 if ext == "png" else 1)
+            dpi = 200 if ext == "png" else None
+            fig.savefig(str(p), bbox_inches="tight", dpi=dpi)
             print(f"  wrote {p.name}")
         except Exception as exc:
             print(f"  FAILED {p.name}: {exc}")
+    plt.close(fig)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -311,7 +238,10 @@ def main() -> None:
         for variant in ("all", "xavier"):
             print(f"Building {intervention}/{variant} ...")
             fig = make_figure(datasets, intervention, variant)
-            save_fig(fig, OUT_DIR / f"interventions_{intervention}_{variant}")
+            stem = (f"interventions_{intervention}"
+                    if variant == "xavier"
+                    else f"interventions_{intervention}_{variant}")
+            save_fig(fig, OUT_DIR / stem)
 
 
 if __name__ == "__main__":

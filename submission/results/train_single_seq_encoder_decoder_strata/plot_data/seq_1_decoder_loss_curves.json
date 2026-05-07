@@ -1,0 +1,117 @@
+{
+  "seq_i": 1,
+  "layers": {
+    "0": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "1": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "2": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "3": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "4": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "5": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "6": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "7": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "8": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "9": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "10": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "11": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "12": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "13": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "14": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "15": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "16": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "17": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "18": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "19": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "20": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "21": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "22": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "23": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "24": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "25": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "26": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    },
+    "27": {
+      "train_loss_curve": [],
+      "eval_loss_curve": []
+    }
+  }
+}
