@@ -1,0 +1,31 @@
+# Requirements for experiments/notebooks/tuned_lens_qwen35_9b.ipynb
+#
+# --- STEP 1: PyTorch with CUDA (pick the wheel matching your CUDA version) ---
+# CUDA 12.1:  pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.4:  pip install torch --index-url https://download.pytorch.org/whl/cu124
+# CUDA 11.8:  pip install torch --index-url https://download.pytorch.org/whl/cu118
+#
+# --- STEP 2: JAX with CUDA (must match your CUDA / cuDNN) ---
+# CUDA 12:    pip install "jax[cuda12]"
+# CUDA 11:    pip install "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# CPU-only:   pip install jax
+#
+# --- STEP 3: simplexity (private GitHub repo) ---
+# pip install "git+https://github.com/Astera-org/simplexity.git@xavier/processes"
+#
+# --- STEP 4: everything else ---
+# pip install -r requirements_tuned_lens_qwen35_9b.txt
+
+# HuggingFace
+transformers>=4.51
+accelerate>=1.0.0
+
+# Numerics / plotting
+numpy>=2.0
+matplotlib>=3.9.0
+tqdm>=4.66.0
+
+# Jupyter
+jupyter>=1.1.1
+ipykernel>=7.2.0
+ipywidgets>=8.1.8
