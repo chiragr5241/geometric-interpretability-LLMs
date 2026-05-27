@@ -23,7 +23,7 @@ dependencies = [
     "torch>=2.6.0",
     "tqdm>=4.66.0",
     "transformer-lens>=2.17.0",
-    "transformers>=4.51,<4.58",
+    "transformers>=4.51",
 ]
 
 [tool.uv.sources]

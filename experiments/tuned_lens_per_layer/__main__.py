@@ -77,9 +77,9 @@ def main() -> None:
     )
 
     if not config.sweeps:
-        # Single config mode (backwards compatible)
+        # Single config mode: release backbone after training to free GPU memory.
         t0 = time.time()
-        summary = run_pipeline(model, config, output_dir)
+        summary = run_pipeline(model, config, output_dir, release_backbone=True)
         logger.info(f"Experiment complete. Total: {time.time() - t0:.1f}s")
         logger.info(f"Results saved to: {output_dir}")
     else:
@@ -143,7 +143,8 @@ def main() -> None:
             )
 
             config_dir = output_dir / "configs" / label
-            run_pipeline(model, cfg, config_dir)
+            # Keep backbone on GPU between configs (forward pass of next config needs it).
+            run_pipeline(model, cfg, config_dir, release_backbone=False)
             gc.collect()
             torch.cuda.empty_cache()
 

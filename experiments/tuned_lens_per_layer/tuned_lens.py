@@ -1,8 +1,11 @@
 """Tuned lens translator model and training."""
 from __future__ import annotations
 
+import copy
 import logging
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -118,6 +121,65 @@ class TunedLensTranslator(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
+
+
+# ──────────────────── eval-time weight extraction ────────────────────────────
+
+
+@dataclass
+class EvalWeights:
+    """Concept-column weights extracted from the backbone for evaluation.
+
+    Holds only the parts needed by apply_logit_lens / apply_tuned_lens:
+    the concept-token columns of W_U, their bias, and a copy of ln_final.
+    Tensors live on the same device as the model at extraction time.
+
+    Call extract_eval_weights() while the backbone is still on GPU, then
+    optionally move the backbone to CPU (freeing ~18 GB) before evaluation.
+    """
+
+    W_c: torch.Tensor        # [d_model, n_concepts] float32
+    b_c: torch.Tensor        # [n_concepts] float32
+    ln_final: nn.Module      # LayerNorm (no grad)
+    device: torch.device
+
+
+def extract_eval_weights(model, concept_ids: list[int]) -> EvalWeights:
+    """Extract the minimal weights for evaluation from a HookedTransformer.
+
+    Call this while the model is still on GPU. The result stores only the
+    concept-column slices of W_U (~KB) rather than the full matrix (~GB),
+    so the backbone can be moved to CPU or deleted after this call.
+    """
+    device = model.unembed.W_U.device
+    W_c = model.unembed.W_U[:, concept_ids].detach().to(torch.float32)
+    b_c = model.unembed.b_U[concept_ids].detach().to(torch.float32)
+    ln_final = copy.deepcopy(model.ln_final)
+    for p in ln_final.parameters():
+        p.requires_grad_(False)
+    return EvalWeights(W_c=W_c, b_c=b_c, ln_final=ln_final, device=device)
+
+
+def save_translators(translators: dict[int, TunedLensTranslator], save_dir: Path) -> None:
+    """Save translator state_dicts to ``save_dir/layer_<L>.pt``."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    for layer, translator in translators.items():
+        torch.save(translator.state_dict(), save_dir / f"layer_{layer}.pt")
+
+
+def load_translator(save_dir: Path, layer: int) -> TunedLensTranslator:
+    """Load a translator from ``save_dir/layer_<layer>.pt``.
+
+    Infers d_model from the saved weight shape — no separate d_model arg needed.
+    """
+    state = torch.load(save_dir / f"layer_{layer}.pt", weights_only=True, map_location="cpu")
+    d_model = state["linear.weight"].shape[0]
+    t = TunedLensTranslator(d_model)
+    t.load_state_dict(state)
+    t.eval()
+    for p in t.parameters():
+        p.requires_grad_(False)
+    return t
 
 
 def train_tuned_lens(
@@ -332,17 +394,16 @@ def train_tuned_lens_concept(
 
 def _concept_softmax_fp32(
     h: torch.Tensor,
-    model,
+    ln_final: nn.Module,
     W_c_fp32: torch.Tensor,
     b_c_fp32: torch.Tensor,
 ) -> torch.Tensor:
     """Apply ln_final + concept-only unembed + softmax, all in fp32.
 
-    Casts the layer-norm output explicitly to fp32 before the matmul so we
-    never go through the fp16 path here — that path was the source of
-    spurious +inf in early-layer KL(HMM || logit) seen in old runs.
+    Explicit fp32 cast prevents the fp16 overflow path that produced
+    spurious +inf KL values in early-layer logit-lens in old runs.
     """
-    normed = model.ln_final(h).to(torch.float32)
+    normed = ln_final(h).to(torch.float32)
     concept_logits = normed @ W_c_fp32 + b_c_fp32
     return F.softmax(concept_logits, dim=-1)
 
@@ -370,20 +431,19 @@ def _check_finite(probs: np.ndarray, where: str, layer: int | None = None) -> np
 
 def apply_logit_lens(
     activations: np.ndarray,
-    model,
-    concept_ids: list[int],
+    eval_weights: EvalWeights,
     batch_size: int = 1024,
     layer: int | None = None,
 ) -> np.ndarray:
-    """Apply the raw logit lens (no training): ln_final + unembed -> concept probs.
+    """Apply the raw logit lens (no translator): ln_final + concept-only unembed -> probs.
 
-    Concept-only softmax (renormalized over HMM emission tokens). Computed
-    end-to-end in fp32 to avoid the fp16 overflow path that produced spurious
-    +inf KL values in old runs.
+    End-to-end fp32 to prevent the fp16 overflow path that produced spurious
+    +inf KL at early layers in old runs.
     """
-    device = model.unembed.W_U.device
-    W_c = model.unembed.W_U[:, concept_ids].detach().to(torch.float32)
-    b_c = model.unembed.b_U[concept_ids].detach().to(torch.float32)
+    device = eval_weights.device
+    W_c = eval_weights.W_c.to(device)
+    b_c = eval_weights.b_c.to(device)
+    ln_final = eval_weights.ln_final.to(device)
 
     acts_t = torch.from_numpy(np.ascontiguousarray(activations)).to(torch.float32)
     probs_list = []
@@ -391,7 +451,7 @@ def apply_logit_lens(
     with torch.no_grad():
         for start in range(0, acts_t.shape[0], batch_size):
             batch = acts_t[start : start + batch_size].to(device)
-            probs_list.append(_concept_softmax_fp32(batch, model, W_c, b_c).cpu().numpy())
+            probs_list.append(_concept_softmax_fp32(batch, ln_final, W_c, b_c).cpu().numpy())
 
     return _check_finite(np.concatenate(probs_list, axis=0), "apply_logit_lens", layer)
 
@@ -399,15 +459,15 @@ def apply_logit_lens(
 def apply_tuned_lens(
     activations: np.ndarray,
     translator: TunedLensTranslator,
-    model,
-    concept_ids: list[int],
+    eval_weights: EvalWeights,
     batch_size: int = 1024,
     layer: int | None = None,
 ) -> np.ndarray:
-    """Apply a trained tuned lens translator -> concept probs (fp32 throughout)."""
-    device = model.unembed.W_U.device
-    W_c = model.unembed.W_U[:, concept_ids].detach().to(torch.float32)
-    b_c = model.unembed.b_U[concept_ids].detach().to(torch.float32)
+    """Apply a trained translator then concept-only unembed -> probs (fp32 throughout)."""
+    device = eval_weights.device
+    W_c = eval_weights.W_c.to(device)
+    b_c = eval_weights.b_c.to(device)
+    ln_final = eval_weights.ln_final.to(device)
     translator_dev = translator.to(device)
 
     acts_t = torch.from_numpy(np.ascontiguousarray(activations)).to(torch.float32)
@@ -417,7 +477,7 @@ def apply_tuned_lens(
         for start in range(0, acts_t.shape[0], batch_size):
             batch = acts_t[start : start + batch_size].to(device)
             h = translator_dev(batch)
-            probs_list.append(_concept_softmax_fp32(h, model, W_c, b_c).cpu().numpy())
+            probs_list.append(_concept_softmax_fp32(h, ln_final, W_c, b_c).cpu().numpy())
 
     translator.cpu()
     return _check_finite(np.concatenate(probs_list, axis=0), "apply_tuned_lens", layer)

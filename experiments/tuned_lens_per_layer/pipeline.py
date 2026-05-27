@@ -18,6 +18,7 @@ long sequences and large models on A40 (48 GB):
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import time
@@ -33,13 +34,17 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
 from data_generation import generate_hmm_sequences
-from experiment_utils import get_concept_token_ids
+from experiment_utils import WrappedHFModel, get_concept_token_ids
 
 from .config import TunedLensConfig
 from .evaluation import LayerMetrics, compute_layer_metrics
 from .tuned_lens import (
+    EvalWeights,
     apply_logit_lens,
     apply_tuned_lens,
+    extract_eval_weights,
+    load_translator,
+    save_translators,
     train_tuned_lens,
     train_tuned_lens_concept,
 )
@@ -85,8 +90,34 @@ def _forward_pass(
     layer_indices: list[int],
     n_sequences: int,
     chunk_size: int = 2048,
+    concept_ids: list[int] | None = None,
 ) -> tuple[dict[int, list[np.ndarray]], list[int]]:
-    """KV-cached chunked forward storing activations only at concept positions."""
+    """KV-cached chunked forward storing activations only at concept positions.
+
+    Dispatches to the HF path for WrappedHFModel instances; uses the
+    TransformerLens hook API otherwise.
+    """
+    if isinstance(model, WrappedHFModel):
+        if concept_ids is None:
+            raise ValueError("concept_ids is required for the HuggingFace forward path")
+        return _forward_pass_hf(
+            model, walk_concepts, vocab_tokens, layer_indices,
+            n_sequences, chunk_size, concept_ids,
+        )
+    return _forward_pass_tl(
+        model, walk_concepts, vocab_tokens, layer_indices, n_sequences, chunk_size,
+    )
+
+
+def _forward_pass_tl(
+    model,
+    walk_concepts: list[list[str]],
+    vocab_tokens: list[str],
+    layer_indices: list[int],
+    n_sequences: int,
+    chunk_size: int,
+) -> tuple[dict[int, list[np.ndarray]], list[int]]:
+    """TransformerLens KV-cached forward pass."""
     from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
     letter_set = set(vocab_tokens)
@@ -96,7 +127,7 @@ def _forward_pass(
     hook_names = {l: f"blocks.{l}.hook_resid_post" for l in layer_indices}
     seq_times: list[float] = []
 
-    for seq_idx in tqdm(range(n_sequences), desc="Forward pass (KV-cached)"):
+    for seq_idx in tqdm(range(n_sequences), desc="Forward pass (TL KV-cached)"):
         seq_t0 = time.time()
         seq_concepts = walk_concepts[seq_idx]
         prompt = seq_concepts[0] + " " + " ".join(seq_concepts[1:])
@@ -115,7 +146,6 @@ def _forward_pass(
         kv_cache = HookedTransformerKeyValueCache.init_cache(
             model.cfg, device, batch_size=1
         )
-
         chunk_layer_acts: dict[int, list[torch.Tensor]] = {l: [] for l in layer_indices}
 
         for chunk_start in range(0, seq_len, chunk_size):
@@ -179,25 +209,150 @@ def _forward_pass(
     return seq_activations, n_concepts_per_seq
 
 
+def _forward_pass_hf(
+    model: WrappedHFModel,
+    walk_concepts: list[list[str]],
+    vocab_tokens: list[str],
+    layer_indices: list[int],
+    n_sequences: int,
+    chunk_size: int,
+    concept_ids: list[int],
+) -> tuple[dict[int, list[np.ndarray]], list[int]]:
+    """HuggingFace-native forward pass for models not supported by TransformerLens.
+
+    Uses the same pattern as experiments/notebooks/r2_qwen35_9b.ipynb:
+      - register_forward_hook on hf_model.model.layers[l]
+      - out[0] gives the post-layer hidden states
+      - Native past_key_values KV caching across chunks
+
+    Prompt format: " A B C ..." (leading space so all tokens are space-prefixed
+    and their IDs match the space-prefixed concept_ids from get_concept_token_ids).
+    """
+    hf_model = model._hf_model
+    tokenizer = model._tokenizer
+    device = model._device
+
+    # Build a set of token IDs to match. Include both space-prefixed (mid-sequence)
+    # and non-space-prefixed (possible first token) variants to be safe.
+    _nospace_ids = {
+        tokenizer.encode(c, add_special_tokens=False)[-1] for c in vocab_tokens
+    }
+    concept_id_set = set(concept_ids) | _nospace_ids
+
+    seq_activations: dict[int, list[np.ndarray]] = {l: [] for l in layer_indices}
+    n_concepts_per_seq: list[int] = []
+    seq_times: list[float] = []
+
+    for seq_idx in tqdm(range(n_sequences), desc="Forward pass (HF KV-cached)"):
+        seq_t0 = time.time()
+        seq_concepts = walk_concepts[seq_idx]
+
+        # Leading space ensures all concept tokens are space-prefixed in the tokenizer.
+        prompt = " " + " ".join(seq_concepts)
+        input_ids_list = tokenizer.encode(prompt, add_special_tokens=False)
+        input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=device)
+
+        ids_np = np.array(input_ids_list, dtype=np.int64)
+        positions = np.where(np.isin(ids_np, list(concept_id_set)))[0].astype(np.int64)
+        n_use = min(len(positions), len(seq_concepts))
+        positions = positions[:n_use]
+        n_concepts_per_seq.append(int(n_use))
+
+        seq_len = input_ids.shape[1]
+        past_kv = None
+        chunk_layer_acts: dict[int, list[torch.Tensor]] = {l: [] for l in layer_indices}
+
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+            chunk_tokens = input_ids[:, chunk_start:chunk_end]
+            chunk_pos_global = np.arange(chunk_start, chunk_end)
+            local_idx = np.where(np.isin(chunk_pos_global, positions))[0]
+            need_capture = local_idx.size > 0
+
+            captured: dict[int, torch.Tensor] = {}
+            hooks: list = []
+
+            if need_capture:
+                local_idx_t = torch.from_numpy(local_idx).to(device=device, dtype=torch.long)
+
+                def make_hook(li: int, idx_t: torch.Tensor):
+                    def hook_fn(module, inp, out):
+                        h = out[0] if isinstance(out, tuple) else out
+                        captured[li] = h[0].index_select(0, idx_t).detach()
+                    return hook_fn
+
+                for l in layer_indices:
+                    hooks.append(
+                        hf_model.model.layers[l].register_forward_hook(
+                            make_hook(l, local_idx_t)
+                        )
+                    )
+
+            with torch.no_grad():
+                out = hf_model.model(
+                    chunk_tokens,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                )
+
+            for h in hooks:
+                h.remove()
+
+            if need_capture:
+                for l in layer_indices:
+                    if l in captured:
+                        chunk_layer_acts[l].append(captured[l])
+            del captured
+
+            past_kv = out.past_key_values
+            del out
+            torch.cuda.empty_cache()
+
+        del past_kv
+        torch.cuda.empty_cache()
+
+        d_model = model.cfg.d_model
+        for l in layer_indices:
+            if chunk_layer_acts[l]:
+                merged = torch.cat(chunk_layer_acts[l], dim=0)
+                seq_activations[l].append(merged.to(torch.float32).cpu().numpy())
+            else:
+                seq_activations[l].append(np.zeros((0, d_model), dtype=np.float32))
+            chunk_layer_acts[l].clear()
+        torch.cuda.empty_cache()
+
+        seq_dt = time.time() - seq_t0
+        seq_times.append(seq_dt)
+        if seq_idx == 0 or (seq_idx + 1) % max(1, n_sequences // 10) == 0:
+            avg = sum(seq_times) / len(seq_times)
+            remaining = avg * (n_sequences - seq_idx - 1)
+            logger.info(
+                f"  seq {seq_idx + 1}/{n_sequences}: {_fmt_secs(seq_dt)} "
+                f"(avg {_fmt_secs(avg)}, ETA {_fmt_secs(remaining)})"
+            )
+
+    return seq_activations, n_concepts_per_seq
+
+
 # ────────────────────────────── helpers ──────────────────────────────────────
 
 
 def _final_concept_probs(
     final_resid: np.ndarray,
-    model,
-    concept_ids: list[int],
+    eval_weights: EvalWeights,
     batch_size: int = 1024,
 ) -> np.ndarray:
     """Apply ln_final + concept-only unembed + softmax (fp32) to cached residuals."""
-    device = model.unembed.W_U.device
-    W_c = model.unembed.W_U[:, concept_ids].detach().to(torch.float32)
-    b_c = model.unembed.b_U[concept_ids].detach().to(torch.float32)
+    device = eval_weights.device
+    W_c = eval_weights.W_c.to(device)
+    b_c = eval_weights.b_c.to(device)
+    ln_final = eval_weights.ln_final.to(device)
     h_t = torch.from_numpy(final_resid).to(torch.float32)
     out = []
     with torch.no_grad():
         for s in range(0, h_t.shape[0], batch_size):
             h = h_t[s:s + batch_size].to(device)
-            normed = model.ln_final(h).to(torch.float32)
+            normed = ln_final(h).to(torch.float32)
             logits_c = normed @ W_c + b_c
             out.append(F.softmax(logits_c, dim=-1).cpu().numpy())
     return np.concatenate(out, axis=0)
@@ -205,20 +360,20 @@ def _final_concept_probs(
 
 def _final_concept_logits(
     final_resid: np.ndarray,
-    model,
-    concept_ids: list[int],
+    eval_weights: EvalWeights,
     batch_size: int = 1024,
 ) -> np.ndarray:
     """Concept-only logits (no softmax) from cached final residuals."""
-    device = model.unembed.W_U.device
-    W_c = model.unembed.W_U[:, concept_ids].detach().to(torch.float32)
-    b_c = model.unembed.b_U[concept_ids].detach().to(torch.float32)
+    device = eval_weights.device
+    W_c = eval_weights.W_c.to(device)
+    b_c = eval_weights.b_c.to(device)
+    ln_final = eval_weights.ln_final.to(device)
     h_t = torch.from_numpy(final_resid).to(torch.float32)
     out = []
     with torch.no_grad():
         for s in range(0, h_t.shape[0], batch_size):
             h = h_t[s:s + batch_size].to(device)
-            normed = model.ln_final(h).to(torch.float32)
+            normed = ln_final(h).to(torch.float32)
             out.append((normed @ W_c + b_c).cpu().numpy())
     return np.concatenate(out, axis=0)
 
@@ -229,15 +384,25 @@ def _r2_belief_probe_gpu(
     train_beliefs: np.ndarray,
     test_beliefs: np.ndarray,
     layer_indices: list[int],
-) -> dict[int, float]:
-    """Belief-state OLS probe via torch.linalg.pinv on GPU."""
+    n_test_sequences: int,
+) -> tuple[dict[int, float], dict[int, np.ndarray]]:
+    """Belief-state OLS probe via torch.linalg.pinv on GPU.
+
+    Returns (r2_per_layer, r2_per_seq_per_layer) where r2_per_seq_per_layer[L]
+    is a (n_test_sequences,) array of per-sequence R² values used for CI bands.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Y_tr = torch.from_numpy(train_beliefs).to(device=device, dtype=torch.float32)
     Y_te = torch.from_numpy(test_beliefs).to(device=device, dtype=torch.float32)
     Y_te_centered = Y_te - Y_te.mean(dim=0, keepdim=True)
     ss_tot = (Y_te_centered ** 2).sum().item()
 
+    n_flat, belief_dim = Y_te.shape
+    seq_len = n_flat // n_test_sequences
+    Y_te_seq = Y_te.reshape(n_test_sequences, seq_len, belief_dim)
+
     r2: dict[int, float] = {}
+    r2_per_seq: dict[int, np.ndarray] = {}
     for layer in layer_indices:
         X_tr = torch.from_numpy(train_activations[layer]).to(device=device, dtype=torch.float32)
         X_te = torch.from_numpy(test_activations[layer]).to(device=device, dtype=torch.float32)
@@ -249,12 +414,21 @@ def _r2_belief_probe_gpu(
         pred = X_te_b @ W
         ss_res = ((pred - Y_te) ** 2).sum().item()
         r2[layer] = float(1.0 - ss_res / (ss_tot + 1e-10))
-        del X_tr, X_te, X_tr_b, X_te_b, W, pred
+
+        # Per-sequence R²: reshape residuals to (n_seq, seq_len, belief_dim)
+        pred_seq = pred.reshape(n_test_sequences, seq_len, belief_dim)
+        Y_te_seq_mean = Y_te_seq.mean(dim=1, keepdim=True)
+        ss_res_seq = ((pred_seq - Y_te_seq) ** 2).sum(dim=(1, 2))
+        ss_tot_seq = ((Y_te_seq - Y_te_seq_mean) ** 2).sum(dim=(1, 2))
+        r2_seq = (1.0 - ss_res_seq / (ss_tot_seq + 1e-10)).cpu().numpy()
+        r2_per_seq[layer] = r2_seq
+
+        del X_tr, X_te, X_tr_b, X_te_b, W, pred, pred_seq, ss_res_seq, ss_tot_seq, r2_seq
         torch.cuda.empty_cache()
 
-    del Y_tr, Y_te, Y_te_centered
+    del Y_tr, Y_te, Y_te_centered, Y_te_seq
     torch.cuda.empty_cache()
-    return r2
+    return r2, r2_per_seq
 
 
 # ─────────────────────────────── pipeline ───────────────────────────────────
@@ -264,8 +438,24 @@ def run_pipeline(
     model,
     config: TunedLensConfig,
     output_dir: Path,
+    release_backbone: bool = True,
 ) -> dict:
-    """Run the full tuned lens per-layer experiment."""
+    """Run the full tuned lens per-layer experiment.
+
+    Parameters
+    ----------
+    model
+        HookedTransformer on GPU (must still be on GPU at call time).
+    config
+        Experiment configuration.
+    output_dir
+        Where to write all artifacts.
+    release_backbone
+        If True (default), move the model to CPU after training completes
+        and before evaluation begins, freeing ~18 GB of GPU memory.
+        Set to False when running multiple configs in a sweep so the model
+        stays on GPU for the next config's forward pass.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = output_dir / "figures"
     figures_dir.mkdir(exist_ok=True)
@@ -301,10 +491,19 @@ def run_pipeline(
     walk_concepts = [[config.vocab_tokens[int(t)] for t in seq] for seq in tokens]
     logger.info(f"Generated {config.n_sequences} sequences of length {config.seq_length}")
 
-    # ── 2. Token IDs ───────────────────────────────────────────────────────
+    # ── 2. Token IDs + eval weights ────────────────────────────────────────
     concept_to_id = get_concept_token_ids(model, config.vocab_tokens)
     concept_ids = [concept_to_id[c] for c in config.vocab_tokens]
     logger.info(f"Concept token IDs: {dict(zip(config.vocab_tokens, concept_ids))}")
+
+    # Extract ln_final + concept-column weights while model is still on GPU.
+    # These tiny tensors (~KB) replace the backbone (18 GB) for all evaluation
+    # steps, so the backbone can be freed after training.
+    eval_weights = extract_eval_weights(model, concept_ids)
+    logger.info(
+        f"Eval weights extracted: W_c{list(eval_weights.W_c.shape)}, "
+        f"device={eval_weights.device}"
+    )
 
     # ── 3. Forward pass ────────────────────────────────────────────────────
     final_layer_idx = config.layer_indices[-1]
@@ -323,6 +522,7 @@ def run_pipeline(
             model, walk_concepts, config.vocab_tokens,
             config.layer_indices, config.n_sequences,
             chunk_size=config.forward_chunk_size,
+            concept_ids=concept_ids,
         )
 
     seq_len_actual = n_concepts_list[0]
@@ -380,9 +580,13 @@ def run_pipeline(
     logger.info(f"Train positions: {n_train_pos}, Test positions: {n_test_pos}")
 
     # ── 5. Train tuned lenses ──────────────────────────────────────────────
+    # Each variant is saved to disk immediately after training and removed
+    # from CPU RAM (~64 MB/layer × 28 layers per variant = ~1.8 GB freed per
+    # variant). Translators are reloaded from disk one layer at a time during
+    # evaluation, keeping peak CPU RAM near ~64 MB regardless of layer count.
     optimizer_name = config.tuned_lens_optimizer
-    translators_by_lens: dict[str, dict] = {}
     loss_curves_by_lens: dict[str, dict] = {}
+    trained_lens_names: list[str] = []
 
     if train_tuned_full:
         with _timed(f"train tuned_full ({len(config.layer_indices)} layers × {config.tuned_lens_epochs} epochs)"):
@@ -397,13 +601,15 @@ def run_pipeline(
                 optimizer_name=optimizer_name,
                 use_bf16=config.use_bf16,
             )
-            translators_by_lens["tuned_full"] = tr
-            loss_curves_by_lens["tuned_full"] = lc
+        save_translators(tr, output_dir / "translators_tuned_full")
+        logger.info(f"  Saved tuned_full translators ({len(tr)} layers)")
+        loss_curves_by_lens["tuned_full"] = lc
+        trained_lens_names.append("tuned_full")
+        del tr
+        torch.cuda.empty_cache()
 
     if train_tuned_concept:
-        train_concept_logits = _final_concept_logits(
-            train_final_resid, model, concept_ids
-        )
+        train_concept_logits = _final_concept_logits(train_final_resid, eval_weights)
         with _timed(f"train tuned_concept ({len(config.layer_indices)} layers × {config.tuned_lens_epochs} epochs)"):
             tr, lc = train_tuned_lens_concept(
                 activations_by_layer=train_activations,
@@ -418,8 +624,12 @@ def run_pipeline(
                 optimizer_name=optimizer_name,
                 use_bf16=config.use_bf16,
             )
-            translators_by_lens["tuned_concept"] = tr
-            loss_curves_by_lens["tuned_concept"] = lc
+        save_translators(tr, output_dir / "translators_tuned_concept")
+        logger.info(f"  Saved tuned_concept translators ({len(tr)} layers)")
+        loss_curves_by_lens["tuned_concept"] = lc
+        trained_lens_names.append("tuned_concept")
+        del tr
+        torch.cuda.empty_cache()
 
     if train_tuned_hmm:
         if train_window is not None:
@@ -441,18 +651,34 @@ def run_pipeline(
                 optimizer_name=optimizer_name,
                 use_bf16=config.use_bf16,
             )
-            translators_by_lens["tuned_hmm"] = tr
-            loss_curves_by_lens["tuned_hmm"] = lc
+        save_translators(tr, output_dir / "translators_tuned_hmm")
+        logger.info(f"  Saved tuned_hmm translators ({len(tr)} layers)")
+        loss_curves_by_lens["tuned_hmm"] = lc
+        trained_lens_names.append("tuned_hmm")
+        del tr
+        torch.cuda.empty_cache()
 
     for lens_name, lc in loss_curves_by_lens.items():
         plotting.plot_training_loss(
             lc, figures_dir / f"training_loss_{lens_name}.png", label=lens_name,
         )
 
+    # ── 5b. Release backbone ───────────────────────────────────────────────
+    # All translators are saved. Evaluation only needs eval_weights (ln_final +
+    # concept-column W_U) which were extracted earlier. Move the backbone to
+    # CPU to free GPU memory before the evaluation loop.
+    if release_backbone:
+        with _timed("release backbone to CPU"):
+            model.cpu()
+            gc.collect()
+            torch.cuda.empty_cache()
+        logger.info("Backbone moved to CPU — GPU free for evaluation.")
+
     # ── 6. Evaluate ────────────────────────────────────────────────────────
     logger.info("Evaluating on held-out test set...")
 
-    final_concept_probs = _final_concept_probs(test_final_resid, model, concept_ids)
+    # final_concept_probs uses eval_weights (backbone may now be on CPU)
+    final_concept_probs = _final_concept_probs(test_final_resid, eval_weights)
 
     test_beliefs_flat = belief_states_all[n_train:, :seq_len_actual].reshape(
         -1, belief_states_all.shape[-1]
@@ -467,24 +693,27 @@ def run_pipeline(
         )
 
     with _timed(f"belief-state R² probe (GPU pinv, {len(config.layer_indices)} layers)"):
-        r2_per_layer = _r2_belief_probe_gpu(
+        r2_per_layer, r2_per_seq_per_layer = _r2_belief_probe_gpu(
             train_activations, test_activations,
             train_beliefs_flat, test_beliefs_flat,
             config.layer_indices,
+            n_test_sequences=n_test,
         )
 
     all_metrics: list[LayerMetrics] = []
     eval_t0 = time.time()
     for layer in tqdm(config.layer_indices, desc="Evaluating layers"):
         lens_probs: dict[str, np.ndarray] = {}
-        lens_probs["logit"] = apply_logit_lens(
-            test_activations[layer], model, concept_ids, layer=layer,
-        )
-        for lens_name, translators in translators_by_lens.items():
+        lens_probs["logit"] = apply_logit_lens(test_activations[layer], eval_weights, layer=layer)
+
+        # Load each trained translator from disk, apply, then release immediately.
+        for lens_name in trained_lens_names:
+            t = load_translator(output_dir / f"translators_{lens_name}", layer)
             lens_probs[lens_name] = apply_tuned_lens(
-                test_activations[layer], translators[layer], model, concept_ids,
-                layer=layer,
+                test_activations[layer], t, eval_weights, layer=layer,
             )
+            del t
+        torch.cuda.empty_cache()
 
         m = compute_layer_metrics(
             layer=layer,
@@ -535,14 +764,9 @@ def run_pipeline(
     logger.info(f"[done ] plots  ({_fmt_secs(time.time() - plots_t0)})")
 
     # ── 8. Artifacts ───────────────────────────────────────────────────────
+    # Translators were already saved to disk in section 5 (save_translators).
     logger.info("Saving artifacts...")
     save_t0 = time.time()
-
-    for lens_name, translators in translators_by_lens.items():
-        d = output_dir / f"translators_{lens_name}"
-        d.mkdir(exist_ok=True)
-        for layer, translator in translators.items():
-            torch.save(translator.state_dict(), d / f"layer_{layer}.pt")
 
     metrics_summary = []
     for m in all_metrics:
@@ -564,6 +788,8 @@ def run_pipeline(
         for lens_name, vals in m.lenses.items():
             npz_dict[f"kl_final_vs_{lens_name}_layer{m.layer}"] = vals["kl_final_by_pos"]
             npz_dict[f"kl_hmm_vs_{lens_name}_layer{m.layer}"] = vals["kl_hmm_by_pos"]
+    for layer, r2_seq in r2_per_seq_per_layer.items():
+        npz_dict[f"r2_probe_per_seq_layer{layer}"] = r2_seq
     np.savez(output_dir / "per_position_metrics.npz", **npz_dict)
 
     with open(output_dir / "config.json", "w") as f:
