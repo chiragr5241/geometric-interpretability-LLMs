@@ -11,7 +11,7 @@ Patching (replace act with decoder(target_belief)):
     past_consistent — target = belief from a k-token HMM continuation sharing the prefix
     random        — target = uniform simplex sample
 
-Steering (add decoder(target) − decoder(encoder(act))):
+Steering (add decoder(target) − decoder(optimal_source_belief)):
     optimal, past_consistent, random
 
 Belief-subspace ablation (remove the belief-relevant component at all positions):
@@ -1998,8 +1998,7 @@ def main() -> None:
                 sd.patch_target_principled_offsets[(layer, k)] = patch_offsets
 
                 with torch.no_grad():
-                    source_beliefs = encoder(torch.from_numpy(clean_acts_k).float())
-                    dec_source = decoder(source_beliefs)
+                    dec_source = decoder(torch.from_numpy(eta_optimal).float())
                     steer_optimal = (dec_optimal - dec_source).unsqueeze(0)
                     steer_past = [
                         (dp - dec_source).unsqueeze(0)
