@@ -188,7 +188,7 @@ def train_tuned_lens(
     layers: list[int],
     target_final_resid: np.ndarray,
     n_epochs: int = 50,
-    lr: float = 1e-3,
+    lr: float = 1e-5,
     batch_size: int = 512,
     optimizer_name: str = "adam",
     use_bf16: bool = False,
@@ -217,8 +217,8 @@ def train_tuned_lens(
     device = model.unembed.W_U.device
     d_model = model.cfg.d_model
 
-    W_U = model.unembed.W_U.detach()
-    b_U = model.unembed.b_U.detach()
+    W_U = model.unembed.W_U.detach().to(torch.float32)
+    b_U = model.unembed.b_U.detach().to(torch.float32)
 
     # Cache final residual on GPU once (small: N * d_model * 4 bytes).
     target_resid_gpu = torch.from_numpy(target_final_resid).to(
@@ -306,7 +306,7 @@ def train_tuned_lens_concept(
     target_concept_values: np.ndarray,
     target_is_probs: bool = False,
     n_epochs: int = 50,
-    lr: float = 1e-3,
+    lr: float = 1e-5,
     batch_size: int = 512,
     optimizer_name: str = "adam",
     use_bf16: bool = False,
@@ -327,8 +327,8 @@ def train_tuned_lens_concept(
     device = model.unembed.W_U.device
     d_model = model.cfg.d_model
 
-    W_c = model.unembed.W_U[:, concept_ids].detach().to(device)
-    b_c = model.unembed.b_U[concept_ids].detach().to(device)
+    W_c = model.unembed.W_U[:, concept_ids].detach().to(device=device, dtype=torch.float32)
+    b_c = model.unembed.b_U[concept_ids].detach().to(device=device, dtype=torch.float32)
 
     target = torch.as_tensor(target_concept_values, dtype=torch.float32)
     target_probs = (target if target_is_probs else F.softmax(target, dim=-1)).to(device)
@@ -496,8 +496,8 @@ def apply_tuned_lens_full_logits(
     logits : (N, vocab_size)
     """
     device = model.unembed.W_U.device
-    W_U = model.unembed.W_U.detach()
-    b_U = model.unembed.b_U.detach()
+    W_U = model.unembed.W_U.detach().to(torch.float32)
+    b_U = model.unembed.b_U.detach().to(torch.float32)
     translator_dev = translator.to(device)
 
     acts_t = torch.from_numpy(np.ascontiguousarray(activations)).to(torch.float32)
