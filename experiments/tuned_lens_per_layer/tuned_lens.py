@@ -193,6 +193,7 @@ def train_tuned_lens(
     optimizer_name: str = "adam",
     use_bf16: bool = False,
     layer_chunk: int = 4,
+    device: torch.device | str | None = None,
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
     """Train one TunedLensTranslator per layer (full-vocabulary KL target).
 
@@ -205,13 +206,17 @@ def train_tuned_lens(
     (shared by all layers), and the lens forward is run in chunks of
     ``layer_chunk`` layers to bound peak memory on the (L, B, V) tensor.
 
-    For Qwen3.5-9B at N=30K positions / V=248K / L=32 on A40:
+    The function deepcopies ``model.ln_final`` and moves it (plus W_U/b_U)
+    to ``device``, so it is safe to call after ``model.cpu()`` — that frees
+    ~18 GB of backbone weights from GPU for the duration of training.
+
+    For Qwen3.5-9B at N=30K positions / V=248K / L=32 on A40 with backbone
+    moved to CPU before training:
       - acts stacked on GPU:       ~15 GB fp32  (~7.5 GB if use_bf16)
       - W_U fp32:                  ~4 GB
       - W (L,D,D) + Adam state:    ~6 GB
       - peak lens_logits/backward: ~4 GB at layer_chunk=4
-    Total ≈ 30 GB; fits with the backbone (~18 GB) on the same 48 GB device.
-    Drop ``layer_chunk`` if you OOM; raise it if you have headroom.
+    Total ≈ 30 GB; comfortable on a 48 GB A40.
 
     Parameters
     ----------
@@ -223,15 +228,24 @@ def train_tuned_lens(
     n_epochs, lr, batch_size, optimizer_name : training hyperparameters
     use_bf16 : if True, autocast translator forward + store activations in bf16
     layer_chunk : how many layers to forward+backward at once per batch
+    device : where to train; defaults to CUDA if available else CPU. Use this
+        to train on GPU even when the backbone has been moved to CPU to save
+        memory.
     """
-    device = model.unembed.W_U.device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
     d_model = model.cfg.d_model
     L = len(layers)
 
-    # Unembed always in fp32 (precision matters for the V=248K log-softmax).
-    W_U = model.unembed.W_U.detach().to(torch.float32)
-    b_U = model.unembed.b_U.detach().to(torch.float32)
-    ln_final = model.ln_final
+    # Unembed + final-layer norm on the training device, in fp32. This is what
+    # makes train_tuned_lens robust to model.cpu() being called before training.
+    W_U = model.unembed.W_U.detach().to(device=device, dtype=torch.float32)
+    b_U = model.unembed.b_U.detach().to(device=device, dtype=torch.float32)
+    ln_final = copy.deepcopy(model.ln_final).to(device)
+    for p in ln_final.parameters():
+        p.requires_grad_(False)
 
     # Target residual on GPU once, fp32. (N * D * 4 bytes ≈ 0.5 GB.)
     target_resid_gpu = torch.from_numpy(target_final_resid).to(
@@ -368,12 +382,14 @@ def train_tuned_lens_concept(
     batch_size: int = 512,
     optimizer_name: str = "adam",
     use_bf16: bool = False,
+    device: torch.device | str | None = None,
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
     """Train one TunedLensTranslator per layer using concept-token logits only.
 
     Parallel-layers variant: all L translators are trained simultaneously as a
     single batched (L, D, D) tensor. The concept vocab is tiny (V_c≈3 for HMM),
-    so no layer chunking is needed.
+    so no layer chunking is needed. Robust to ``model.cpu()`` having been called
+    before training — see ``device`` parameter.
 
     Parameters
     ----------
@@ -385,11 +401,20 @@ def train_tuned_lens_concept(
         probabilities if target_is_probs=True
     target_is_probs : if True, target is already probabilities
     n_epochs, lr, batch_size, optimizer_name, use_bf16 : training hyperparameters
+    device : where to train; defaults to CUDA if available. Use this to train
+        on GPU even when the backbone has been moved to CPU to save memory.
     """
-    device = model.unembed.W_U.device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
     d_model = model.cfg.d_model
     L = len(layers)
-    ln_final = model.ln_final
+
+    # ln_final + concept unembed on the training device, in fp32.
+    ln_final = copy.deepcopy(model.ln_final).to(device)
+    for p in ln_final.parameters():
+        p.requires_grad_(False)
 
     # Concept-vocab columns of the unembed, always fp32.
     W_c = model.unembed.W_U[:, concept_ids].detach().to(device=device, dtype=torch.float32)
