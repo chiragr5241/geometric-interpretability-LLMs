@@ -192,111 +192,167 @@ def train_tuned_lens(
     batch_size: int = 512,
     optimizer_name: str = "adam",
     use_bf16: bool = False,
+    layer_chunk: int = 4,
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
-    """Train one TunedLensTranslator per layer (faithful full-vocabulary version).
+    """Train one TunedLensTranslator per layer (full-vocabulary KL target).
 
     Trains each translator so that:
         softmax(unembed(ln_final(T_l(h_l))))
     matches the model's full output distribution via KL(p_model || p_lens).
 
-    Memory-optimized: instead of pre-storing the full ``(N, vocab_size)``
-    target log-probabilities tensor (≈24 GB for Qwen-9B at 24K positions),
-    we cache the final-layer residual ``(N, d_model)`` (≈0.4 GB) and recompute
-    the target log_softmax per batch. The unembed matmul is cheap (~3 ms on
-    A40 for batch=512, vocab=248K) and removes the dominant memory footprint.
+    All L layers are trained in parallel as a single batched (L, D, D)
+    translator. Per training step, the target log-softmax is computed once
+    (shared by all layers), and the lens forward is run in chunks of
+    ``layer_chunk`` layers to bound peak memory on the (L, B, V) tensor.
+
+    For Qwen3.5-9B at N=30K positions / V=248K / L=32 on A40:
+      - acts stacked on GPU:       ~15 GB fp32  (~7.5 GB if use_bf16)
+      - W_U fp32:                  ~4 GB
+      - W (L,D,D) + Adam state:    ~6 GB
+      - peak lens_logits/backward: ~4 GB at layer_chunk=4
+    Total ≈ 30 GB; fits with the backbone (~18 GB) on the same 48 GB device.
+    Drop ``layer_chunk`` if you OOM; raise it if you have headroom.
 
     Parameters
     ----------
     activations_by_layer : dict mapping layer index -> (N, d_model) array
-    model : HookedTransformer
+    model : HookedTransformer-like (WrappedHFModel works too)
     layers : list of layer indices to train
     target_final_resid : (N, d_model) cached final-layer residual whose
         ``ln_final + unembed + softmax`` defines the target distribution
-    n_epochs, lr, batch_size : training hyperparameters
+    n_epochs, lr, batch_size, optimizer_name : training hyperparameters
+    use_bf16 : if True, autocast translator forward + store activations in bf16
+    layer_chunk : how many layers to forward+backward at once per batch
     """
     device = model.unembed.W_U.device
     d_model = model.cfg.d_model
+    L = len(layers)
 
-    # Cast to fp32: cached residuals/acts are fp32, so the matmul must be too
-    # (model weights may be bf16/fp16; without autocast that mismatches).
+    # Unembed always in fp32 (precision matters for the V=248K log-softmax).
     W_U = model.unembed.W_U.detach().to(torch.float32)
     b_U = model.unembed.b_U.detach().to(torch.float32)
+    ln_final = model.ln_final
 
-    # Cache final residual on GPU once (small: N * d_model * 4 bytes).
+    # Target residual on GPU once, fp32. (N * D * 4 bytes ≈ 0.5 GB.)
     target_resid_gpu = torch.from_numpy(target_final_resid).to(
-        device=device, dtype=torch.float32
+        device=device, dtype=torch.float32,
     )
     n = target_resid_gpu.shape[0]
 
+    # Stacked activations on GPU once: (L, N, D). bf16 if requested (halves memory).
+    act_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    acts_stacked = torch.empty((L, n, d_model), device=device, dtype=act_dtype)
+    for i, layer in enumerate(layers):
+        acts_stacked[i].copy_(
+            torch.from_numpy(activations_by_layer[layer]).to(device=device, dtype=act_dtype)
+        )
+
+    # Batched translator: identity-init W (L, D, D), zero bias (L, D), fp32.
+    W = (
+        torch.eye(d_model, device=device, dtype=torch.float32)
+        .unsqueeze(0).expand(L, -1, -1).contiguous().clone()
+    )
+    b = torch.zeros(L, d_model, device=device, dtype=torch.float32)
+    W.requires_grad_(True)
+    b.requires_grad_(True)
+
+    optimizer = _make_optimizer(optimizer_name, [W, b], lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    # Per-layer epoch losses for the existing loss_curves return shape.
+    epoch_losses = torch.zeros(L, n_epochs, device=device, dtype=torch.float32)
+
+    t_train = time.time()
+    for epoch in tqdm(range(n_epochs), desc="Training tuned lens (parallel)"):
+        perm = torch.randperm(n, device=device)
+        epoch_sum = torch.zeros(L, device=device, dtype=torch.float32)
+        n_batches = 0
+
+        for start in range(0, n, batch_size):
+            idx = perm[start : start + batch_size]
+            B = idx.shape[0]
+
+            # ── target log-softmax: ONCE per batch (no_grad, fp32) ────────────
+            with torch.no_grad():
+                tgt_resid = target_resid_gpu.index_select(0, idx)        # (B, D)
+                tgt_logits = ln_final(tgt_resid).to(torch.float32) @ W_U + b_U  # (B, V)
+                target_lp = F.log_softmax(tgt_logits, dim=-1)            # (B, V) fp32
+                target_p = target_lp.exp()                               # (B, V) fp32
+
+            optimizer.zero_grad(set_to_none=True)
+            batch_kl = torch.zeros(L, device=device, dtype=torch.float32)
+
+            # ── lens forward, chunked across layers ──────────────────────────
+            for cs in range(0, L, layer_chunk):
+                ce = min(cs + layer_chunk, L)
+                Lc = ce - cs
+
+                acts_chunk = acts_stacked[cs:ce].index_select(1, idx)    # (Lc, B, D)
+
+                # Translator forward: y[l] = acts[l] @ W[l].T + b[l]
+                # Done in act_dtype (bf16 with autocast if requested), else fp32.
+                if use_bf16:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        lens_h = (
+                            torch.bmm(acts_chunk, W[cs:ce].to(torch.bfloat16).transpose(-1, -2))
+                            + b[cs:ce].to(torch.bfloat16).unsqueeze(1)
+                        )                                                # (Lc, B, D) bf16
+                        lens_h_normed = ln_final(lens_h)                 # (Lc, B, D)
+                else:
+                    lens_h = (
+                        torch.bmm(acts_chunk, W[cs:ce].transpose(-1, -2))
+                        + b[cs:ce].unsqueeze(1)
+                    )                                                    # (Lc, B, D) fp32
+                    lens_h_normed = ln_final(lens_h)                     # (Lc, B, D)
+
+                # Unembed + log-softmax in fp32 (vocab is huge, precision matters).
+                lens_logits = lens_h_normed.to(torch.float32) @ W_U + b_U  # (Lc, B, V)
+                lens_lp = F.log_softmax(lens_logits, dim=-1)             # (Lc, B, V) fp32
+
+                # Per-layer batchmean KL(p_model || p_lens):
+                # sum_v p_model * (log p_model - log p_lens), mean over B.
+                chunk_kl = (
+                    target_p.unsqueeze(0) * (target_lp.unsqueeze(0) - lens_lp)
+                ).sum(dim=-1).mean(dim=-1)                               # (Lc,)
+                chunk_kl.sum().backward()                                # grads into W[cs:ce], b[cs:ce]
+                batch_kl[cs:ce] = chunk_kl.detach()
+
+                del acts_chunk, lens_h, lens_h_normed, lens_logits, lens_lp
+
+            optimizer.step()
+            epoch_sum += batch_kl
+            n_batches += 1
+
+        scheduler.step()
+        epoch_losses[:, epoch] = epoch_sum / max(n_batches, 1)
+
+    train_secs = time.time() - t_train
+    logger.info(
+        f"  Tuned lens trained on {L} layers x {n_epochs} epochs in "
+        f"{_fmt_secs(train_secs)} (parallel, layer_chunk={layer_chunk})"
+    )
+
+    # ── pack the batched W, b back into per-layer TunedLensTranslator dicts ──
     translators: dict[int, TunedLensTranslator] = {}
     loss_curves: dict[int, list[float]] = {}
-
-    for layer in tqdm(layers, desc="Training tuned lens"):
-        layer_t0 = time.time()
-        acts = torch.from_numpy(activations_by_layer[layer]).to(
-            device=device, dtype=torch.float32
-        )
-
-        translator = TunedLensTranslator(d_model).to(device)
-        optimizer = _make_optimizer(optimizer_name, translator.parameters(), lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-
-        epoch_losses = []
-        for epoch in range(n_epochs):
-            perm = torch.randperm(n, device=device)
-            epoch_loss = 0.0
-            n_batches = 0
-
-            for start in range(0, n, batch_size):
-                idx = perm[start : start + batch_size]
-                acts_batch = acts[idx]
-
-                # Compute target log-probs for this batch from cached residuals.
-                with torch.no_grad():
-                    target_resid_batch = target_resid_gpu[idx]
-                    normed_t = model.ln_final(target_resid_batch)
-                    target_logits = normed_t @ W_U + b_U
-                    target_log_probs_batch = F.log_softmax(
-                        target_logits.float(), dim=-1
-                    )
-
-                optimizer.zero_grad()
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                    h = translator(acts_batch)
-                    normed = model.ln_final(h)
-                    full_logits = normed @ W_U + b_U
-                # cast to float32 before log_softmax: bfloat16 lacks precision over large vocabs
-                log_probs = F.log_softmax(full_logits.float(), dim=-1)
-
-                loss = F.kl_div(
-                    log_probs, target_log_probs_batch,
-                    reduction="batchmean", log_target=True,
-                )
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                n_batches += 1
-
-            scheduler.step()
-            epoch_losses.append(epoch_loss / max(n_batches, 1))
-
-        translators[layer] = translator.cpu().eval()
-        for p in translators[layer].parameters():
+    W_cpu = W.detach().cpu()
+    b_cpu = b.detach().cpu()
+    losses_cpu = epoch_losses.detach().cpu().tolist()
+    for i, layer in enumerate(layers):
+        t = TunedLensTranslator(d_model)
+        t.linear.weight.data.copy_(W_cpu[i])
+        t.linear.bias.data.copy_(b_cpu[i])
+        t.eval()
+        for p in t.parameters():
             p.requires_grad = False
-        loss_curves[layer] = epoch_losses
-        del acts
-        torch.cuda.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        translators[layer] = t
+        loss_curves[layer] = losses_cpu[i]
+        logger.info(f"  Layer {layer:2d}: final KL = {losses_cpu[i][-1]:.4f}")
 
-        logger.info(
-            f"  Layer {layer:2d}: final KL = {epoch_losses[-1]:.4f}  "
-            f"(took {_fmt_secs(time.time() - layer_t0)})"
-        )
-
-    del target_resid_gpu
+    del W, b, acts_stacked, target_resid_gpu
     torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     return translators, loss_curves
 
 
@@ -315,82 +371,131 @@ def train_tuned_lens_concept(
 ) -> tuple[dict[int, TunedLensTranslator], dict[int, list[float]]]:
     """Train one TunedLensTranslator per layer using concept-token logits only.
 
+    Parallel-layers variant: all L translators are trained simultaneously as a
+    single batched (L, D, D) tensor. The concept vocab is tiny (V_c≈3 for HMM),
+    so no layer chunking is needed.
+
     Parameters
     ----------
     activations_by_layer : dict mapping layer index -> (N, d_model) array
-    model : HookedTransformer
+    model : HookedTransformer-like
     concept_ids : LLM token IDs for HMM emission symbols
     layers : list of layer indices to train
     target_concept_values : (N, n_concepts) — logits if target_is_probs=False,
         probabilities if target_is_probs=True
     target_is_probs : if True, target is already probabilities
-    n_epochs, lr, batch_size : training hyperparameters
+    n_epochs, lr, batch_size, optimizer_name, use_bf16 : training hyperparameters
     """
     device = model.unembed.W_U.device
     d_model = model.cfg.d_model
+    L = len(layers)
+    ln_final = model.ln_final
 
+    # Concept-vocab columns of the unembed, always fp32.
     W_c = model.unembed.W_U[:, concept_ids].detach().to(device=device, dtype=torch.float32)
     b_c = model.unembed.b_U[concept_ids].detach().to(device=device, dtype=torch.float32)
 
+    # Target probabilities, fp32.
     target = torch.as_tensor(target_concept_values, dtype=torch.float32)
     target_probs = (target if target_is_probs else F.softmax(target, dim=-1)).to(device)
+    n = target_probs.shape[0]
+
+    # Stacked activations (L, N, D) on GPU.
+    act_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    acts_stacked = torch.empty((L, n, d_model), device=device, dtype=act_dtype)
+    for i, layer in enumerate(layers):
+        acts_stacked[i].copy_(
+            torch.from_numpy(activations_by_layer[layer]).to(device=device, dtype=act_dtype)
+        )
+
+    # Batched translator: identity W (L, D, D), zero bias (L, D), fp32.
+    W = (
+        torch.eye(d_model, device=device, dtype=torch.float32)
+        .unsqueeze(0).expand(L, -1, -1).contiguous().clone()
+    )
+    b = torch.zeros(L, d_model, device=device, dtype=torch.float32)
+    W.requires_grad_(True)
+    b.requires_grad_(True)
+
+    optimizer = _make_optimizer(optimizer_name, [W, b], lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    epoch_losses = torch.zeros(L, n_epochs, device=device, dtype=torch.float32)
+
+    t_train = time.time()
+    for epoch in tqdm(range(n_epochs), desc="Training tuned lens (concept, parallel)"):
+        perm = torch.randperm(n, device=device)
+        epoch_sum = torch.zeros(L, device=device, dtype=torch.float32)
+        n_batches = 0
+
+        for start in range(0, n, batch_size):
+            idx = perm[start : start + batch_size]
+            B = idx.shape[0]
+
+            tgt_p = target_probs.index_select(0, idx)                    # (B, V_c)
+            acts_batch = acts_stacked.index_select(1, idx)               # (L, B, D)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            if use_bf16:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    lens_h = (
+                        torch.bmm(acts_batch, W.to(torch.bfloat16).transpose(-1, -2))
+                        + b.to(torch.bfloat16).unsqueeze(1)
+                    )                                                    # (L, B, D)
+                    lens_h_normed = ln_final(lens_h)
+            else:
+                lens_h = (
+                    torch.bmm(acts_batch, W.transpose(-1, -2))
+                    + b.unsqueeze(1)
+                )                                                        # (L, B, D)
+                lens_h_normed = ln_final(lens_h)
+
+            # Unembed and KL in fp32.
+            concept_logits = lens_h_normed.to(torch.float32) @ W_c + b_c  # (L, B, V_c)
+            log_probs = F.log_softmax(concept_logits, dim=-1)             # (L, B, V_c)
+
+            # Per-layer batchmean KL(target || lens).
+            kl_per_layer = F.kl_div(
+                log_probs,
+                tgt_p.unsqueeze(0).expand(L, -1, -1),
+                reduction="none",
+            ).sum(dim=-1).mean(dim=-1)                                    # (L,)
+            kl_per_layer.sum().backward()
+            optimizer.step()
+
+            epoch_sum += kl_per_layer.detach()
+            n_batches += 1
+
+        scheduler.step()
+        epoch_losses[:, epoch] = epoch_sum / max(n_batches, 1)
+
+    train_secs = time.time() - t_train
+    logger.info(
+        f"  Concept tuned lens trained on {L} layers x {n_epochs} epochs in "
+        f"{_fmt_secs(train_secs)} (parallel)"
+    )
 
     translators: dict[int, TunedLensTranslator] = {}
     loss_curves: dict[int, list[float]] = {}
-
-    for layer in tqdm(layers, desc="Training tuned lens (concept)"):
-        layer_t0 = time.time()
-        acts = torch.from_numpy(activations_by_layer[layer]).to(
-            device=device, dtype=torch.float32,
-        )
-        n = acts.shape[0]
-
-        translator = TunedLensTranslator(d_model).to(device)
-        optimizer = _make_optimizer(optimizer_name, translator.parameters(), lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-
-        epoch_losses = []
-        for epoch in range(n_epochs):
-            perm = torch.randperm(n, device=device)
-            epoch_loss = 0.0
-            n_batches = 0
-
-            for start in range(0, n, batch_size):
-                idx = perm[start : start + batch_size]
-                acts_batch = acts[idx]
-                target_batch = target_probs[idx]
-
-                optimizer.zero_grad()
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                    h = translator(acts_batch)
-                    normed = model.ln_final(h)
-                    concept_logit = normed @ W_c + b_c
-                log_probs = F.log_softmax(concept_logit.float(), dim=-1)
-
-                loss = F.kl_div(log_probs, target_batch.float(), reduction="batchmean")
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                n_batches += 1
-
-            scheduler.step()
-            epoch_losses.append(epoch_loss / max(n_batches, 1))
-
-        translators[layer] = translator.cpu().eval()
-        for p in translators[layer].parameters():
+    W_cpu = W.detach().cpu()
+    b_cpu = b.detach().cpu()
+    losses_cpu = epoch_losses.detach().cpu().tolist()
+    for i, layer in enumerate(layers):
+        t = TunedLensTranslator(d_model)
+        t.linear.weight.data.copy_(W_cpu[i])
+        t.linear.bias.data.copy_(b_cpu[i])
+        t.eval()
+        for p in t.parameters():
             p.requires_grad = False
-        loss_curves[layer] = epoch_losses
-        del acts
-        torch.cuda.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        translators[layer] = t
+        loss_curves[layer] = losses_cpu[i]
+        logger.info(f"  Layer {layer:2d}: final KL = {losses_cpu[i][-1]:.4f}")
 
-        logger.info(
-            f"  Layer {layer:2d}: final KL = {epoch_losses[-1]:.4f}  "
-            f"(took {_fmt_secs(time.time() - layer_t0)})"
-        )
-
+    del W, b, acts_stacked, target_probs
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     return translators, loss_curves
 
 
